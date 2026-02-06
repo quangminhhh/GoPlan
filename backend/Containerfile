@@ -1,0 +1,16 @@
+# -------- Base Image --------
+FROM python:3.12-slim
+
+# -------- Workspace Location --------
+WORKDIR /app
+
+# -------- Dependency Installation --------
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# -------- Project Files --------
+COPY . .
+
+# -------- Runtime Environment --------
+ENV PYTHONUNBUFFERED=1 \
+    DJANGO_SETTINGS_MODULE=configs.settings

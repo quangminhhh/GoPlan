@@ -1,0 +1,15 @@
+.github
+.vscode
+.DS_Store
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# Containers / DB data
+pgdata/

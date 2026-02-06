@@ -1,0 +1,21 @@
+{
+    // -------- Devcontainer Metadata --------
+    "name": "backend", // TODO: Change to match the backend service name in podman-compose.yml when you rename it
+
+    // -------- Compose Integration --------
+    "dockerComposeFile": "../podman-compose.yml", // VS Code will attach to the compose stack defined at the repo root
+    "service": "backend", // TODO: Keep in sync with the backend service key in podman-compose.yml
+
+    // -------- Workspace Location --------
+    "workspaceFolder": "/app", // /app is mounted from ./backend via podman-compose.yml
+
+    // -------- VS Code Extensions --------
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "donjayamanne.python-extension-pack",
+                "gruntfuggly.todo-tree"
+            ]
+        }
+    }
+}

@@ -1,0 +1,74 @@
+version: "3.9"
+name: skeleton # TODO: Replace with the project slug (keep consistent across services and backend/.env)
+
+services:
+  # -------- Database Service --------
+  postgresql-skeleton: # TODO: Rename to match project slug (update DB_HOST in backend/.env accordingly)
+    image: postgres:16-alpine
+    container_name: postgres-skeleton # TODO: Align with the new service name for easier debugging
+    env_file:
+      - ./backend/db.env
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB || exit 1",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # mongo:
+  #   image: mongo:7
+  #   container_name: mongodb
+  #   ports:
+  #     - "27017:27017"
+  #   volumes:
+  #     - mongodata:/data/db
+  #   healthcheck:
+  #     test: ["CMD", "mongosh --eval 'db.adminCommand({ ping: 1 })' || exit 1"]
+  #     interval: 5s
+  #     timeout: 3s
+  #     retries: 10
+
+  # redis-skeleton:
+  #   image: redis:7-alpine
+  #   container_name: redis-skeleton
+  #   volumes:
+  #     - redisdata:/data
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 5s
+  #     timeout: 3s
+  #     retries: 10
+
+  # -------- Django Backend Service --------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Containerfile
+    image: backend-skeleton:latest # TODO: Rename to match the backend image you want to push/tag
+    container_name: python-envs-skeleton # TODO: Rename to the container name you prefer during local dev
+    command: bash -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000" # Run "podman compose exec backend python manage.py makemigrations" when schema changes; swap the runserver part for "daphne -b 0.0.0.0 -p 8000 configs.asgi:application" if using ASGI
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app:Z
+    env_file:
+      - ./backend/.env
+    depends_on:
+      postgresql-skeleton: # TODO: Keep in sync with the database service key above
+        condition: service_healthy
+      # mongo:
+      #   condition: service_healthy
+      # redis-skeleton:
+      #   condition: service_healthy
+
+volumes:
+  pgdata: {}
+  # mongodata: {}
+  # redisdata: {}
