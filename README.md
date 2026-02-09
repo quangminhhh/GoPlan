@@ -1,37 +1,40 @@
-# Django Skeleton With Podman
+# GoPlan Backend Template
 
-This project is a very clean backend template using Django, Django REST Framework, and PostgreSQL. Everything runs inside Podman so you can clone the repo and start coding a new backend immediately.
+## Overview
 
-## What is inside
+This repository is a minimal backend starter for building new Django/DRF applications.
+It includes a ready-to-run local stack with PostgreSQL and Podman Compose.
+Use it as a clean foundation, then add your domain apps and APIs.
 
-- **Django 5 + DRF** with the most common settings ready.
-- **PostgreSQL 16** already wired by `backend/.env` and `backend/db.env`.
-- **Podman Compose** (`podman-compose.yml`) to start the database and the backend together.
-- **Devcontainer** (`.devcontainer/devcontainer.json`) so VS Code works inside the same Python environment as the container.
-- **Containerfile** to build a small Python 3.12 image with the packages from `requirements.txt`.
+## Tech Stack
 
-## How to start
+- Django
+- Django REST Framework
+- PostgreSQL
+- Podman Compose
 
-1. Install Podman on your machine and make sure it runs correctly.
-2. Update every TODO comment (service names, image names, database values, secret key, etc.) for your new project.
-3. Build and run the stack:
+## Quick Start
 
-   ```bash
-   podman compose up --build
-   ```
+```bash
+podman compose up --build
+```
 
-4. Open `http://localhost:8000` to check the backend.
+Backend health check:
 
-## Daily tips
+- Open `http://localhost:8000/`
 
-- **Environment files:** always review `backend/.env` and `backend/db.env` before starting the containers.
-- **Migrations:** when your models change, run `podman compose exec backend python manage.py makemigrations`, then restart or run `podman compose up` again so migrations are applied automatically.
-- **Optional packages:** uncomment JWT or Daphne in `requirements.txt` only when you really need them. This keeps the base image small.
-- **Frontend placeholder:** the `frontend/` folder is empty on purpose. Add your UI stack there if you need one.
+## Project Structure
 
-## When cloning for a new project
+- `backend/` -> Django project and apps
+- `podman-compose.yml` -> local services orchestration
+- `.devcontainer/` -> development container setup
+- `explain/` -> project explanation documents
 
-- Rename the services, image tags, and container names in `podman-compose.yml`.
-- Update database values in both `backend/.env` and `backend/db.env`.
-- Replace the secret key in `backend/.env`.
-- Enable extra services (MongoDB, Redis, Daphne/ASGI) when your project requires them.
+## Notes
+
+- Review environment files before running:
+  - `backend/.env`
+  - `backend/db.env`
+- Common migration commands:
+  - `podman compose exec backend python manage.py makemigrations`
+  - `podman compose exec backend python manage.py migrate`
