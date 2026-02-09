@@ -1,5 +1,7 @@
-from django.urls import path
+from django.urls import include, path
+
 
 # -------- API Routes --------
-# Add project-specific endpoints here, e.g. path('users/', UserView.as_view(), name='users')
-urlpatterns = []
+urlpatterns = [
+    path("auth/", include("accounts.urls")),
+]

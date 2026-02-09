@@ -1,12 +1,14 @@
-from pathlib import Path
 import os
+
+from datetime import timedelta
+from pathlib import Path
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # -------- Core Flags --------
 DEBUG = os.environ.get('DJANGO_DEBUG') == '1'
 SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
-# Keep hostnames in sync with DJANGO_ALLOWED_HOSTS in backend/.env (comma-separated, no spaces).
 ALLOWED_HOSTS = os.environ['DJANGO_ALLOWED_HOSTS'].split(',')
 
 # -------- Installed Apps --------
@@ -25,7 +27,9 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt.token_blacklist',
 
     # Local apps
-    'api'
+    'api',
+    'accounts',
+
 ]
 
 # -------- Middleware Chain --------
@@ -63,7 +67,6 @@ TEMPLATES = [
 ]
 
 # -------- Database (PostgreSQL) --------
-# Values must follow backend/db.env and podman-compose.yml service names.
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
@@ -106,26 +109,44 @@ if not DEBUG:
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# -------- Optional Config Blocks --------
-# Uncomment the snippets below when the project needs them and ensure requirements.txt matches.
-
 # REST Framework Defaults
-# REST_FRAMEWORK = {
-#     'DEFAULT_AUTHENTICATION_CLASSES': (
-#         'rest_framework_simplejwt.authentication.JWTAuthentication',
-#     )
-# }
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
+    ),
+    'DEFAULT_THROTTLE_CLASSES': (
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+        'rest_framework.throttling.ScopedRateThrottle',
+    ),
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '100/hour',
+        'user': '1000/hour',
+        'auth_login': '20/hour',
+        'auth_register': '10/hour',
+        'auth_refresh': '60/hour',
+        'auth_logout': '30/hour',
+    },
+}
 
 # JWT Settings
-# SIMPLE_JWT = {
-#     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
-#     'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
-#     'AUTH_HEADER_TYPES': ('Bearer',),
-#     'BLACKLIST_AFTER_ROTATION': True,
-# }
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=15),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
+    'UPDATE_LAST_LOGIN': True,
+    'AUTH_HEADER_TYPES': ('Bearer',),
+    'AUTH_TOKEN_CLASSES': ('rest_framework_simplejwt.tokens.AccessToken',),
+    'USER_ID_FIELD': 'id',
+    'USER_ID_CLAIM': 'user_id',
+}
 
 # Custom User Model
-# AUTH_USER_MODEL = 'accounts.User'
+AUTH_USER_MODEL = 'accounts.User'
 
 # MongoDB Integration
 # MONGO_URL = os.environ.get('MONGO_URL')
