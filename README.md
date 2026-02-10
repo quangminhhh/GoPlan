@@ -1,8 +1,9 @@
-# GoPlan Backend Template
+# GoPlan Starter Template
 
 ## Overview
 
-This repository is a minimal backend starter for building new Django/DRF applications.
+This repository is a minimal starter for new web applications with a Django/DRF backend
+and a Next.js frontend baseline.
 It includes a ready-to-run local stack with PostgreSQL and Podman Compose.
 Use it as a clean foundation, then add your domain apps and APIs.
 
@@ -10,6 +11,8 @@ Use it as a clean foundation, then add your domain apps and APIs.
 
 - Django
 - Django REST Framework
+- Next.js
+- Axios
 - PostgreSQL
 - Podman Compose
 
@@ -19,13 +22,15 @@ Use it as a clean foundation, then add your domain apps and APIs.
 podman compose up --build
 ```
 
-Backend health check:
+Health checks:
 
-- Open `http://localhost:8000/`
+- Backend API: `http://localhost:8000/api/health`
+- Frontend app: `http://localhost:3000`
 
 ## Project Structure
 
 - `backend/` -> Django project and apps
+- `frontend/` -> Next.js app and API client baseline
 - `podman-compose.yml` -> local services orchestration
 - `.devcontainer/` -> development container setup
 - `explain/` -> project explanation documents
@@ -35,6 +40,8 @@ Backend health check:
 - Review environment files before running:
   - `backend/.env`
   - `backend/db.env`
+- Frontend API base URL:
+  - `NEXT_PUBLIC_API_BASE_URL=http://localhost:8000`
 - Common migration commands:
   - `podman compose exec backend python manage.py makemigrations`
   - `podman compose exec backend python manage.py migrate`
