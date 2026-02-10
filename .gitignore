@@ -1,7 +1,7 @@
 .github
 .vscode
 .DS_Store
-
+CLAUDE.md
 # Python artifacts
 __pycache__/
 *.py[cod]
@@ -13,3 +13,13 @@ __pycache__/
 
 # Containers / DB data
 pgdata/
+
+# Local environment secrets (never commit)
+backend/.env
+backend/db.env
+frontend/.env.local
+
+# Keep template env files tracked
+!backend/.env.example
+!backend/db.env.example
+!frontend/.env.example

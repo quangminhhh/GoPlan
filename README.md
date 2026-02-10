@@ -37,9 +37,10 @@ Health checks:
 
 ## Notes
 
-- Review environment files before running:
-  - `backend/.env`
-  - `backend/db.env`
+- Create local env files from templates before running:
+  - `cp backend/.env.example backend/.env`
+  - `cp backend/db.env.example backend/db.env`
+- Never commit real secret values from local env files.
 - Frontend API base URL:
   - `NEXT_PUBLIC_API_BASE_URL=http://localhost:8000`
 - Common migration commands:
