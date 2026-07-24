@@ -1,10 +1,17 @@
 let mockParams: Record<string, string | string[] | undefined> = {};
+const mockRouter = { push: jest.fn() };
+const mockUseTimeline = jest.fn();
 
 jest.mock('expo-router', () => ({
+  Stack: { Screen: () => null },
   useLocalSearchParams: () => mockParams,
+  useRouter: () => mockRouter,
 }));
 
 jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
+jest.mock('../hooks/useTimeline', () => ({
+  useTimeline: (...args: unknown[]) => mockUseTimeline(...args),
+}));
 
 // eslint-disable-next-line import/first
 import { render, screen } from '@testing-library/react-native';
@@ -23,7 +30,26 @@ const ACTIVITY_ID = 'a11957b3-3329-4fcf-9c7b-673a51c1d8a7';
 
 describe('Timeline route screens', () => {
   beforeEach(() => {
+    jest.clearAllMocks();
     mockParams = {};
+    mockUseTimeline.mockReturnValue({
+      timeline: {
+        trip_timezone: 'UTC',
+        permissions: {
+          can_edit_timeline: false,
+          can_manage_custom_types: false,
+          can_create_sections: false,
+        },
+        system_types: [],
+        custom_types: [],
+        sections: [],
+      },
+      status: 'ready',
+      error: null,
+      refreshing: false,
+      refresh: jest.fn(),
+      invalidate: jest.fn(),
+    });
   });
 
   it('renders a neutral state for an invalid section form before mounting the valid shell', async () => {
@@ -67,6 +93,7 @@ describe('Timeline route screens', () => {
     mockParams = { tripId: [TRIP_ID] };
     const { rerender } = await render(<TimelineScreen />);
     expect(screen.getByText('Timeline unavailable')).toBeTruthy();
+    expect(mockUseTimeline).not.toHaveBeenCalled();
 
     mockParams = { tripId: 'not-a-uuid' };
     await rerender(<CustomTypeManagerScreen />);
@@ -75,5 +102,6 @@ describe('Timeline route screens', () => {
     mockParams = { tripId: TRIP_ID };
     await rerender(<TimelineScreen />);
     expect(screen.getByTestId('timeline-route-ready')).toBeTruthy();
+    expect(mockUseTimeline).toHaveBeenCalledWith(TRIP_ID);
   });
 });

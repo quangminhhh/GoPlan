@@ -162,6 +162,10 @@ export function TripDetailScreen() {
     router.push(`/trips/${tripId}/invite`);
   }, [router, tripId]);
 
+  const openTimeline = useCallback(() => {
+    router.push(`/trips/${tripId}/timeline`);
+  }, [router, tripId]);
+
   if (status === 'loading') {
     return <LoadingScreen />;
   }
@@ -254,6 +258,33 @@ export function TripDetailScreen() {
             <Text style={styles.refreshingText}>Updating trip…</Text>
           </View>
         ) : null}
+        <View style={styles.section}>
+          <Text accessibilityRole="header" style={styles.sectionTitle}>
+            Planning
+          </Text>
+          <View style={styles.card}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Open Timeline"
+              onPress={openTimeline}
+              style={({ pressed }) => [
+                styles.planningRow,
+                pressed ? styles.planningRowPressed : null,
+              ]}
+            >
+              <View style={styles.infoIcon}>
+                <Ionicons name="calendar-outline" size={18} color={colors.primary} />
+              </View>
+              <View style={styles.planningCopy}>
+                <Text style={styles.infoText}>Timeline</Text>
+                <Text style={styles.planningDescription}>
+                  Plan days, activities, and reminders
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={colors.textMuted} />
+            </Pressable>
+          </View>
+        </View>
         {trip.description ? (
           <View style={styles.section}>
             <Text accessibilityRole="header" style={styles.sectionTitle}>
@@ -393,6 +424,15 @@ const styles = StyleSheet.create({
   },
   rowDivider: { borderBottomWidth: 1, borderBottomColor: colors.border },
   infoText: { ...typography.body, color: colors.text, flexShrink: 1 },
+  planningRow: {
+    minHeight: 64,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+  },
+  planningRowPressed: { opacity: 0.55 },
+  planningCopy: { flex: 1, gap: spacing.xs },
+  planningDescription: { ...typography.caption, color: colors.textMuted },
   description: { ...typography.body, color: colors.text, paddingVertical: spacing.md },
   sectionTitle: { ...typography.heading, color: colors.text },
   muted: { ...typography.body, color: colors.textMuted, textAlign: 'center' },

@@ -158,7 +158,7 @@ describe('TripDetailScreen', () => {
 
     expect(await screen.findByText('Overview')).toBeTruthy();
     expect(mockStackScreen.mock.calls.some(([props]) => props.options.title === 'Da Lat escape')).toBe(true);
-    expect(screen.getByText('Planning')).toBeTruthy();
+    expect(screen.getAllByText('Planning')).toHaveLength(2);
     expect(screen.getByText('Da Lat, Vietnam')).toBeTruthy();
     expect(screen.getByText('Members (1)')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Start trip' })).toBeTruthy();
@@ -169,6 +169,24 @@ describe('TripDetailScreen', () => {
     expect(mockRouter.push).toHaveBeenCalledWith('/trips/trip-123/edit');
     await fireEvent.press(screen.getByRole('button', { name: 'Invite friends' }));
     expect(mockRouter.push).toHaveBeenCalledWith('/trips/trip-123/invite');
+  });
+
+  it('shows only the Timeline Planning entry to every readable trip', async () => {
+    mockUseTripDetail.mockReturnValue(
+      readyHook({
+        ...tripDetail,
+        trip: { ...tripDetail.trip, status: 'COMPLETED' },
+        my_membership: { ...tripDetail.my_membership, role: 'MEMBER' },
+      }),
+    );
+    await render(<TripDetailScreen />);
+
+    expect(screen.getByRole('header', { name: 'Planning' })).toBeTruthy();
+    expect(screen.getByText('Timeline')).toBeTruthy();
+    expect(screen.queryByText('Expenses')).toBeNull();
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Open Timeline' }));
+    expect(mockRouter.push).toHaveBeenCalledWith('/trips/trip-123/timeline');
   });
 
   it('shows only leave for an active member and no actions for a terminal trip', async () => {
