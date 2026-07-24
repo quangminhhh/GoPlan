@@ -14,6 +14,22 @@ export const colors = {
   border: '#D8DFE8',
   danger: '#C0392B',
   success: '#1E7A45',
+  sky: '#0369A1',
+  skySoft: '#E0F2FE',
+  amber: '#A16207',
+  amberSoft: '#FEF3C7',
+  rose: '#BE123C',
+  roseSoft: '#FFE4E6',
+  emerald: '#047857',
+  emeraldSoft: '#D1FAE5',
+  violet: '#6D28D9',
+  violetSoft: '#EDE9FE',
+  indigo: '#4338CA',
+  indigoSoft: '#E0E7FF',
+  teal: '#0F766E',
+  tealSoft: '#CCFBF1',
+  slate: '#475569',
+  slateSoft: '#E2E8F0',
 } as const;
 
 export const spacing = { xs: 4, sm: 8, md: 16, lg: 24, xl: 32 } as const;
