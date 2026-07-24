@@ -79,6 +79,54 @@ export default function TripsLayout() {
         }}
       />
       <Stack.Screen
+        name="[tripId]/timeline/index"
+        options={{
+          title: 'Timeline',
+        }}
+      />
+      <Stack.Screen
+        name="[tripId]/timeline/section-form"
+        options={{
+          title: 'Timeline Day',
+          presentation: 'formSheet',
+          headerLeft: () => (
+            <HeaderAction
+              label="Cancel"
+              accessibilityLabel="Cancel timeline day form"
+              onPress={leaveTripsRoute}
+            />
+          ),
+        }}
+      />
+      <Stack.Screen
+        name="[tripId]/timeline/activity-form"
+        options={{
+          title: 'Activity',
+          presentation: 'formSheet',
+          headerLeft: () => (
+            <HeaderAction
+              label="Cancel"
+              accessibilityLabel="Cancel timeline activity form"
+              onPress={leaveTripsRoute}
+            />
+          ),
+        }}
+      />
+      <Stack.Screen
+        name="[tripId]/timeline/custom-types"
+        options={{
+          title: 'Custom Types',
+          presentation: 'formSheet',
+          headerLeft: () => (
+            <HeaderAction
+              label="Close"
+              accessibilityLabel="Close custom types"
+              onPress={leaveTripsRoute}
+            />
+          ),
+        }}
+      />
+      <Stack.Screen
         name="[tripId]/edit"
         options={{
           title: 'Edit Trip',

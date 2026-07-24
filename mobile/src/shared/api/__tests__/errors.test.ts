@@ -36,20 +36,89 @@ describe('normalizeApiError', () => {
     });
   });
 
+  it('recursively flattens nested field objects to dotted keys', () => {
+    const result = normalizeApiError(
+      axiosErrorWith(400, {
+        place: {
+          provider_id: ['Select a valid place.'],
+          coordinates: {
+            lat: ['Enter a valid latitude.'],
+          },
+        },
+      }),
+    );
+    expect(result).toEqual({
+      kind: 'field',
+      message: 'Please fix the highlighted fields.',
+      fieldErrors: {
+        'place.provider_id': 'Select a valid place.',
+        'place.coordinates.lat': 'Enter a valid latitude.',
+      },
+      status: 400,
+    });
+  });
+
+  it.each([
+    {
+      place: { provider_id: ['Nested message.'] },
+      'place.provider_id': ['Explicit message.'],
+    },
+    {
+      'place.provider_id': ['Explicit message.'],
+      place: { provider_id: ['Nested message.'] },
+    },
+  ])('lets a top-level pre-dotted leaf win a nested collision regardless of key order', (data) => {
+    const result = normalizeApiError(axiosErrorWith(400, data));
+    expect(result.fieldErrors).toEqual({
+      'place.provider_id': 'Explicit message.',
+    });
+  });
+
+  it('keeps mixed flat, nested, and non-field errors while taking the first string array leaf', () => {
+    const result = normalizeApiError(
+      axiosErrorWith(400, {
+        location_label: [null, 'Enter a location.', 'Later location error.'],
+        place: {
+          title: ['Enter a place title.', 'Later title error.'],
+          non_field_errors: ['The place fields do not match.'],
+        },
+        non_field_errors: ['Review the form.'],
+      }),
+    );
+    expect(result).toEqual({
+      kind: 'field',
+      message: 'Please fix the highlighted fields.',
+      fieldErrors: {
+        location_label: 'Enter a location.',
+        'place.title': 'Enter a place title.',
+        'place.non_field_errors': 'The place fields do not match.',
+        non_field_errors: 'Review the form.',
+      },
+      status: 400,
+    });
+  });
+
   it('maps lone non_field_errors to a message error', () => {
     const result = normalizeApiError(axiosErrorWith(400, { non_field_errors: ['Something failed.'] }));
-    expect(result).toMatchObject({ kind: 'message', message: 'Something failed.' });
+    expect(result).toEqual({ kind: 'message', message: 'Something failed.', status: 400 });
   });
 
   it('maps 429 to throttled', () => {
     const result = normalizeApiError(axiosErrorWith(429, { detail: 'Request was throttled.' }));
-    expect(result.kind).toBe('throttled');
+    expect(result).toEqual({
+      kind: 'throttled',
+      message: 'Too many attempts. Please wait a moment and try again.',
+      status: 429,
+    });
   });
 
   it('maps missing response to network error', () => {
     const config = { headers: new AxiosHeaders() };
     const error = new AxiosError('Network Error', 'ERR_NETWORK', config, {});
-    expect(normalizeApiError(error).kind).toBe('network');
+    expect(normalizeApiError(error)).toEqual({
+      kind: 'network',
+      message: 'Cannot reach the server. Check your connection.',
+    });
   });
 
   it('maps unknown values to a generic message', () => {
