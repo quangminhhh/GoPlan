@@ -7,7 +7,11 @@ import { subscribeToTripEvents } from '../tripEvents';
 import type { Trip, TripDetailResponse, TripStatus } from '../types';
 
 export type TripDetailLoadStatus = 'loading' | 'ready' | 'error';
-export type TripDetailLoadMode = 'initial' | 'silent';
+export type TripDetailLoadMode = 'initial' | 'refresh' | 'silent';
+
+interface UseTripDetailOptions {
+  autoReconcile?: boolean;
+}
 
 const MISSING_TRIP_ERROR: ApiError = {
   kind: 'message',
@@ -16,7 +20,10 @@ const MISSING_TRIP_ERROR: ApiError = {
   status: 404,
 };
 
-export function useTripDetail(tripId: string | undefined) {
+export function useTripDetail(
+  tripId: string | undefined,
+  { autoReconcile = true }: UseTripDetailOptions = {},
+) {
   const [detail, setDetail] = useState<TripDetailResponse | null>(null);
   const [status, setStatus] = useState<TripDetailLoadStatus>('loading');
   const [error, setError] = useState<ApiError | null>(null);
@@ -44,6 +51,7 @@ export function useTripDetail(tripId: string | undefined) {
         setDetail(null);
         setError(MISSING_TRIP_ERROR);
         setStatus('error');
+        setRefreshing(false);
         return;
       }
 
@@ -53,7 +61,8 @@ export function useTripDetail(tripId: string | undefined) {
         detailRef.current = null;
         setError(null);
         setStatus('loading');
-      } else if (mode === 'silent') {
+        setRefreshing(false);
+      } else if (mode === 'refresh') {
         setRefreshing(true);
       }
 
@@ -126,8 +135,11 @@ export function useTripDetail(tripId: string | undefined) {
   );
 
   useEffect(
-    () =>
-      subscribeToTripEvents((event) => {
+    () => {
+      if (!autoReconcile) {
+        return undefined;
+      }
+      return subscribeToTripEvents((event) => {
         if (event.type === 'updated' && event.trip.id === tripId) {
           applyTrip(event.trip);
         } else if (event.type === 'statusChanged' && event.tripId === tripId) {
@@ -135,23 +147,28 @@ export function useTripDetail(tripId: string | undefined) {
         } else if (event.type === 'memberRemoved' && event.tripId === tripId) {
           applyMemberRemoved(event.userId);
         }
-      }),
-    [applyMemberRemoved, applyStatus, applyTrip, tripId],
+      });
+    },
+    [applyMemberRemoved, applyStatus, applyTrip, autoReconcile, tripId],
   );
 
   const reconcileOnForeground = useCallback(() => {
-    void refresh(detailRef.current?.trip.id === tripId ? 'silent' : 'initial');
-  }, [refresh, tripId]);
+    if (autoReconcile) {
+      void refresh(detailRef.current?.trip.id === tripId ? 'silent' : 'initial');
+    }
+  }, [autoReconcile, refresh, tripId]);
 
   useAppForegroundEffect(reconcileOnForeground);
 
   useFocusEffect(
     useCallback(() => {
-      void refresh(detailRef.current?.trip.id === tripId ? 'silent' : 'initial');
+      if (autoReconcile) {
+        void refresh(detailRef.current?.trip.id === tripId ? 'silent' : 'initial');
+      }
       return () => {
         requestIdRef.current += 1;
       };
-    }, [refresh, tripId]),
+    }, [autoReconcile, refresh, tripId]),
   );
 
   const stateMatchesTrip = stateTripId === tripId;
