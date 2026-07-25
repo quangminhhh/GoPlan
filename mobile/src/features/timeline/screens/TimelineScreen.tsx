@@ -17,13 +17,20 @@ import { normalizeApiError } from '@/shared/api/errors';
 import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
 import { Button } from '@/shared/ui/Button';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
-import { deleteSection as deleteTimelineSection } from '../api';
+import {
+  deleteActivity as deleteTimelineActivity,
+  deleteSection as deleteTimelineSection,
+  updateActivityStatus,
+} from '../api';
 import { ActivityRow } from '../components/ActivityRow';
 import { SectionGroup } from '../components/SectionGroup';
 import { useTimeline } from '../hooks/useTimeline';
 import { parseTimelineRouteIntent } from '../routeIntent';
 import { publishTimelineEvent } from '../timelineEvents';
-import type { TimelineSection } from '../types';
+import type {
+  TimelineActivityStatus,
+  TimelineSection,
+} from '../types';
 import {
   buildTimelineListSections,
   getDefaultFocusedSectionIndex,
@@ -43,6 +50,11 @@ interface ScrollFailureInfo {
   averageItemLength: number;
 }
 
+interface PendingActivityMutation {
+  activityId: string;
+  kind: 'delete' | 'status';
+}
+
 function TimelineContent({ tripId }: TimelineContentProps) {
   const router = useRouter();
   const {
@@ -58,6 +70,8 @@ function TimelineContent({ tripId }: TimelineContentProps) {
   const mountedRef = useRef(true);
   const deleteLockRef = useRef(false);
   const deleteStartedRef = useRef(false);
+  const activityLockRef = useRef(false);
+  const activityDeleteStartedRef = useRef(false);
   const lastScrollTripIdRef = useRef<string | null>(null);
   const scrollTargetRef = useRef<{
     tripId: string;
@@ -66,14 +80,18 @@ function TimelineContent({ tripId }: TimelineContentProps) {
   } | null>(null);
   const retryFrameRef = useRef<number | null>(null);
   const [sectionActionsLocked, setSectionActionsLocked] = useState(false);
+  const [activityActionsLocked, setActivityActionsLocked] = useState(false);
   const [deletingSectionId, setDeletingSectionId] = useState<string | null>(
     null,
   );
+  const [pendingActivityMutation, setPendingActivityMutation] =
+    useState<PendingActivityMutation | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const sections = useMemo(
     () => buildTimelineListSections(timeline?.sections ?? []),
     [timeline?.sections],
   );
+  const actionsLocked = sectionActionsLocked || activityActionsLocked;
 
   useEffect(() => {
     if (
@@ -159,15 +177,47 @@ function TimelineContent({ tripId }: TimelineContentProps) {
   );
 
   const openCreateDay = useCallback(() => {
+    if (deleteLockRef.current || activityLockRef.current) {
+      return;
+    }
     setMutationError(null);
     router.push(`/trips/${tripId}/timeline/section-form?mode=create`);
   }, [router, tripId]);
 
   const openEditSection = useCallback(
     (section: TimelineSection) => {
+      if (deleteLockRef.current || activityLockRef.current) {
+        return;
+      }
       setMutationError(null);
       router.push(
         `/trips/${tripId}/timeline/section-form?mode=edit&sectionId=${section.id}`,
+      );
+    },
+    [router, tripId],
+  );
+
+  const openCreateActivity = useCallback(
+    (sectionId: string) => {
+      if (deleteLockRef.current || activityLockRef.current) {
+        return;
+      }
+      setMutationError(null);
+      router.push(
+        `/trips/${tripId}/timeline/activity-form?mode=create&sectionId=${sectionId}`,
+      );
+    },
+    [router, tripId],
+  );
+
+  const openEditActivity = useCallback(
+    (activityId: string) => {
+      if (deleteLockRef.current || activityLockRef.current) {
+        return;
+      }
+      setMutationError(null);
+      router.push(
+        `/trips/${tripId}/timeline/activity-form?mode=edit&activityId=${activityId}`,
       );
     },
     [router, tripId],
@@ -219,7 +269,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
 
   const confirmDeleteSection = useCallback(
     (section: TimelineSection) => {
-      if (deleteLockRef.current) {
+      if (deleteLockRef.current || activityLockRef.current) {
         return;
       }
 
@@ -267,6 +317,156 @@ function TimelineContent({ tripId }: TimelineContentProps) {
     [performDeleteSection],
   );
 
+  const changeActivityStatus = useCallback(
+    async (
+      activityId: string,
+      nextStatus: TimelineActivityStatus,
+    ) => {
+      if (
+        !mountedRef.current ||
+        deleteLockRef.current ||
+        activityLockRef.current
+      ) {
+        return;
+      }
+
+      activityLockRef.current = true;
+      setActivityActionsLocked(true);
+      setPendingActivityMutation({ activityId, kind: 'status' });
+      invalidate();
+
+      try {
+        await updateActivityStatus(tripId, activityId, {
+          status: nextStatus,
+        });
+        await publishTimelineEvent({
+          type: 'timelineChanged',
+          tripId,
+        });
+      } catch (caught) {
+        if (mountedRef.current) {
+          const normalized = normalizeApiError(caught);
+          if (
+            normalized.status === 403 ||
+            normalized.status === 404 ||
+            normalized.status === 409
+          ) {
+            await refresh('silent');
+          }
+        }
+        throw caught;
+      } finally {
+        activityLockRef.current = false;
+        if (mountedRef.current) {
+          setPendingActivityMutation(null);
+          setActivityActionsLocked(false);
+        }
+      }
+    },
+    [invalidate, refresh, tripId],
+  );
+
+  const performDeleteActivity = useCallback(
+    async (activityId: string) => {
+      if (!mountedRef.current) {
+        activityDeleteStartedRef.current = false;
+        activityLockRef.current = false;
+        return;
+      }
+
+      setPendingActivityMutation({ activityId, kind: 'delete' });
+      setMutationError(null);
+      invalidate();
+
+      try {
+        await deleteTimelineActivity(tripId, activityId);
+        await publishTimelineEvent({
+          type: 'timelineChanged',
+          tripId,
+        });
+      } catch (caught) {
+        if (!mountedRef.current) {
+          return;
+        }
+
+        const normalized = normalizeApiError(caught);
+        setMutationError(normalized.message);
+        if (
+          normalized.status === 403 ||
+          normalized.status === 404 ||
+          normalized.status === 409
+        ) {
+          await refresh('silent');
+        }
+      } finally {
+        activityDeleteStartedRef.current = false;
+        activityLockRef.current = false;
+        if (mountedRef.current) {
+          setPendingActivityMutation(null);
+          setActivityActionsLocked(false);
+        }
+      }
+    },
+    [invalidate, refresh, tripId],
+  );
+
+  const confirmDeleteActivity = useCallback(
+    (activityId: string) => {
+      if (deleteLockRef.current || activityLockRef.current) {
+        return;
+      }
+
+      const activity = timeline?.sections
+        .flatMap((section) => section.activities)
+        .find((candidate) => candidate.id === activityId);
+      if (!activity) {
+        return;
+      }
+
+      activityLockRef.current = true;
+      activityDeleteStartedRef.current = false;
+      setActivityActionsLocked(true);
+      setMutationError(null);
+      const releasePrompt = () => {
+        if (activityDeleteStartedRef.current) {
+          return;
+        }
+        activityDeleteStartedRef.current = false;
+        activityLockRef.current = false;
+        if (mountedRef.current) {
+          setActivityActionsLocked(false);
+        }
+      };
+      Alert.alert(
+        'Delete activity?',
+        `Delete ${activity.title}? This cannot be undone.`,
+        [
+          {
+            text: 'Cancel',
+            style: 'cancel',
+            onPress: releasePrompt,
+          },
+          {
+            text: 'Delete',
+            style: 'destructive',
+            onPress: () => {
+              if (activityDeleteStartedRef.current) {
+                return;
+              }
+              activityDeleteStartedRef.current = true;
+              void performDeleteActivity(activity.id);
+            },
+          },
+        ],
+        {
+          cancelable: true,
+          onDismiss: releasePrompt,
+        },
+      );
+    },
+    [performDeleteActivity, timeline?.sections],
+  );
+
   const renderItem = useCallback(
     ({
       item,
@@ -286,9 +486,22 @@ function TimelineContent({ tripId }: TimelineContentProps) {
         return <Text style={styles.dayEmpty}>No activities yet.</Text>;
       }
 
-      return <ActivityRow activity={item.activity} />;
+      return (
+        <ActivityRow
+          activity={item.activity}
+          actionsDisabled={actionsLocked}
+          onEdit={openEditActivity}
+          onDelete={confirmDeleteActivity}
+          onChangeStatus={changeActivityStatus}
+        />
+      );
     },
-    [],
+    [
+      actionsLocked,
+      changeActivityStatus,
+      confirmDeleteActivity,
+      openEditActivity,
+    ],
   );
 
   const renderSectionHeader = useCallback(
@@ -297,15 +510,46 @@ function TimelineContent({ tripId }: TimelineContentProps) {
         section={section.section}
         canEdit={timeline?.permissions.can_edit_timeline === true}
         canDelete={timeline?.permissions.can_edit_timeline === true}
-        actionsDisabled={sectionActionsLocked}
+        actionsDisabled={actionsLocked}
         onEdit={openEditSection}
         onDelete={confirmDeleteSection}
       />
     ),
     [
       confirmDeleteSection,
+      actionsLocked,
       openEditSection,
-      sectionActionsLocked,
+      timeline?.permissions.can_edit_timeline,
+    ],
+  );
+
+  const renderSectionFooter = useCallback(
+    ({ section }: { section: TimelineListSection }) =>
+      timeline?.permissions.can_edit_timeline === true ? (
+        <View style={styles.sectionFooter}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Add activity to ${section.section.label}`}
+            accessibilityState={{ disabled: actionsLocked }}
+            disabled={actionsLocked}
+            onPress={() => openCreateActivity(section.section.id)}
+            style={({ pressed }) => [
+              styles.addActivityButton,
+              pressed || actionsLocked ? styles.pressed : null,
+            ]}
+          >
+            <Ionicons
+              name="add-circle-outline"
+              size={18}
+              color={colors.primary}
+            />
+            <Text style={styles.addActivityText}>Add activity</Text>
+          </Pressable>
+        </View>
+      ) : null,
+    [
+      actionsLocked,
+      openCreateActivity,
       timeline?.permissions.can_edit_timeline,
     ],
   );
@@ -355,6 +599,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
         keyExtractor={getTimelineRowKey}
         renderItem={renderItem}
         renderSectionHeader={renderSectionHeader}
+        renderSectionFooter={renderSectionFooter}
         onScrollToIndexFailed={recoverFailedInitialScroll}
         stickySectionHeadersEnabled
         contentInsetAdjustmentBehavior="automatic"
@@ -370,7 +615,10 @@ function TimelineContent({ tripId }: TimelineContentProps) {
           />
         }
         ListHeaderComponent={
-          error || mutationError || deletingSectionId ? (
+          error ||
+          mutationError ||
+          deletingSectionId ||
+          pendingActivityMutation ? (
             <View>
               {error ? (
                 <View accessibilityRole="alert" style={styles.inlineError}>
@@ -415,6 +663,24 @@ function TimelineContent({ tripId }: TimelineContentProps) {
                   </Text>
                 </View>
               ) : null}
+              {pendingActivityMutation ? (
+                <View
+                  accessibilityRole="progressbar"
+                  accessibilityLabel={
+                    pendingActivityMutation.kind === 'delete'
+                      ? 'Deleting activity'
+                      : 'Updating activity status'
+                  }
+                  style={styles.mutationProgress}
+                >
+                  <ActivityIndicator color={colors.primary} />
+                  <Text style={styles.mutationProgressText}>
+                    {pendingActivityMutation.kind === 'delete'
+                      ? 'Deleting activity…'
+                      : 'Updating activity status…'}
+                  </Text>
+                </View>
+              ) : null}
             </View>
           ) : null
         }
@@ -432,7 +698,11 @@ function TimelineContent({ tripId }: TimelineContentProps) {
               Add the first day to start planning this trip.
             </Text>
             {canCreateSections ? (
-              <Button title="Add day" onPress={openCreateDay} />
+              <Button
+                title="Add day"
+                disabled={actionsLocked}
+                onPress={openCreateDay}
+              />
             ) : null}
           </View>
         }
@@ -441,7 +711,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
             <View style={styles.footerAction}>
               <Button
                 title="Add day"
-                disabled={sectionActionsLocked}
+                disabled={actionsLocked}
                 onPress={openCreateDay}
               />
             </View>
@@ -524,6 +794,19 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     backgroundColor: colors.background,
   },
+  sectionFooter: {
+    alignItems: 'flex-end',
+    paddingHorizontal: spacing.md,
+    paddingBottom: spacing.md,
+  },
+  addActivityButton: {
+    minHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    paddingHorizontal: spacing.sm,
+  },
+  addActivityText: { ...typography.label, color: colors.primary },
   emptyState: {
     flex: 1,
     alignItems: 'center',

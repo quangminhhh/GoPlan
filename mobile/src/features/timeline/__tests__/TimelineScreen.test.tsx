@@ -2,6 +2,8 @@ let mockParams: Record<string, string | string[] | undefined> = {};
 const mockRouter = { push: jest.fn() };
 const mockUseTimeline = jest.fn();
 const mockDeleteSection = jest.fn();
+const mockDeleteActivity = jest.fn();
+const mockUpdateActivityStatus = jest.fn();
 const mockPublishTimelineEvent = jest.fn();
 
 jest.mock('expo-router', () => ({
@@ -16,6 +18,9 @@ jest.mock('../hooks/useTimeline', () => ({
 }));
 jest.mock('../api', () => ({
   deleteSection: (...args: unknown[]) => mockDeleteSection(...args),
+  deleteActivity: (...args: unknown[]) => mockDeleteActivity(...args),
+  updateActivityStatus: (...args: unknown[]) =>
+    mockUpdateActivityStatus(...args),
 }));
 jest.mock('../timelineEvents', () => ({
   publishTimelineEvent: (...args: unknown[]) =>
@@ -153,6 +158,8 @@ describe('TimelineScreen', () => {
     mockParams = { tripId: TRIP_ID };
     mockUseTimeline.mockReturnValue(hookState());
     mockDeleteSection.mockResolvedValue(undefined);
+    mockDeleteActivity.mockResolvedValue(undefined);
+    mockUpdateActivityStatus.mockResolvedValue(undefined);
     mockPublishTimelineEvent.mockResolvedValue(undefined);
     scrollSpy = jest
       .spyOn(SectionList.prototype, 'scrollToLocation')
@@ -404,6 +411,170 @@ describe('TimelineScreen', () => {
         screen.getByText('This timeline day changed on another device.'),
       ).toBeTruthy(),
     );
+    expect(state.refresh).toHaveBeenCalledWith('silent');
+    expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
+  });
+
+  it('opens create and edit activity forms from the authoritative section data', async () => {
+    mockUseTimeline.mockReturnValue(
+      hookState({
+        timeline: buildTimeline({
+          permissions: {
+            can_edit_timeline: true,
+            can_manage_custom_types: false,
+            can_create_sections: false,
+          },
+          sections: [
+            buildSection({
+              label: 'Arrival',
+              activities: [
+                buildActivity({
+                  title: 'Airport transfer',
+                  capabilities: {
+                    can_edit: true,
+                    can_delete: false,
+                    can_update_status: false,
+                  },
+                }),
+              ],
+            }),
+          ],
+        }),
+      }),
+    );
+    await render(<TimelineScreen />);
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Add activity to Arrival' }),
+    );
+    expect(mockRouter.push).toHaveBeenCalledWith(
+      `/trips/${TRIP_ID}/timeline/activity-form?mode=create&sectionId=section-1`,
+    );
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Edit Airport transfer' }),
+    );
+    expect(mockRouter.push).toHaveBeenLastCalledWith(
+      `/trips/${TRIP_ID}/timeline/activity-form?mode=edit&activityId=activity-1`,
+    );
+  });
+
+  it('deletes an activity only after confirmation and publishes one authoritative refresh event', async () => {
+    const state = hookState({
+      timeline: buildTimeline({
+        permissions: {
+          can_edit_timeline: true,
+          can_manage_custom_types: false,
+          can_create_sections: false,
+        },
+        sections: [
+          buildSection({
+            label: 'Arrival',
+            activities: [
+              buildActivity({
+                title: 'Airport transfer',
+                capabilities: {
+                  can_edit: false,
+                  can_delete: true,
+                  can_update_status: false,
+                },
+              }),
+            ],
+          }),
+        ],
+      }),
+    });
+    mockUseTimeline.mockReturnValue(state);
+    await render(<TimelineScreen />);
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Delete Airport transfer' }),
+    );
+    expect(alertSpy).toHaveBeenCalledWith(
+      'Delete activity?',
+      'Delete Airport transfer? This cannot be undone.',
+      expect.any(Array),
+      expect.objectContaining({ cancelable: true }),
+    );
+    const buttons = alertSpy.mock.calls[0]?.[2] as
+      | { text?: string; onPress?: () => void }[]
+      | undefined;
+    await act(async () => {
+      buttons?.find((button) => button.text === 'Delete')?.onPress?.();
+    });
+
+    await waitFor(() =>
+      expect(mockDeleteActivity).toHaveBeenCalledWith(
+        TRIP_ID,
+        'activity-1',
+      ),
+    );
+    expect(state.invalidate).toHaveBeenCalledTimes(1);
+    expect(mockPublishTimelineEvent).toHaveBeenCalledWith({
+      type: 'timelineChanged',
+      tripId: TRIP_ID,
+    });
+  });
+
+  it('updates status through the row capability and reconciles a rejected transition', async () => {
+    const conflict = new AxiosError(
+      'Conflict',
+      undefined,
+      undefined,
+      undefined,
+      {
+        status: 409,
+        statusText: 'Conflict',
+        headers: {},
+        config: {} as never,
+        data: {
+          detail: 'This status transition is no longer allowed.',
+          error_code: 'INVALID_STATUS_TRANSITION',
+        },
+      },
+    );
+    mockUpdateActivityStatus.mockRejectedValue(conflict);
+    const state = hookState({
+      timeline: buildTimeline({
+        sections: [
+          buildSection({
+            activities: [
+              buildActivity({
+                title: 'Airport transfer',
+                capabilities: {
+                  can_edit: false,
+                  can_delete: false,
+                  can_update_status: true,
+                },
+              }),
+            ],
+          }),
+        ],
+      }),
+    });
+    mockUseTimeline.mockReturnValue(state);
+    await render(<TimelineScreen />);
+
+    await fireEvent.press(
+      screen.getByRole('button', {
+        name: 'Expand Airport transfer details',
+      }),
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Start activity' }),
+    );
+
+    expect(
+      await screen.findByText(
+        'This status transition is no longer allowed.',
+      ),
+    ).toBeTruthy();
+    expect(mockUpdateActivityStatus).toHaveBeenCalledWith(
+      TRIP_ID,
+      'activity-1',
+      { status: 'IN_PROGRESS' },
+    );
+    expect(state.invalidate).toHaveBeenCalledTimes(1);
     expect(state.refresh).toHaveBeenCalledWith('silent');
     expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
   });

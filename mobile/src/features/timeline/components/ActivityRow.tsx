@@ -8,6 +8,7 @@ import {
   View,
 } from 'react-native';
 import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
+import { ActivityStatusControls } from './ActivityStatusControls';
 import { getTimelineIconName, getTimelineTokenColors } from '../tokenMaps';
 import type {
   TimelineActivity,
@@ -17,8 +18,13 @@ import { formatActivityTime } from '../viewModel';
 
 interface ActivityRowProps {
   activity: TimelineActivity;
+  actionsDisabled?: boolean;
   onEdit?: (activityId: string) => void;
   onDelete?: (activityId: string) => void;
+  onChangeStatus?: (
+    activityId: string,
+    nextStatus: TimelineActivityStatus,
+  ) => Promise<void>;
 }
 
 interface DetailLineProps {
@@ -87,8 +93,10 @@ function DetailLine({ icon, label, value }: DetailLineProps) {
 
 function ActivityRowComponent({
   activity,
+  actionsDisabled = false,
   onEdit,
   onDelete,
+  onChangeStatus,
 }: ActivityRowProps) {
   const [expanded, setExpanded] = useState(false);
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
@@ -163,6 +171,12 @@ function ActivityRowComponent({
   const deleteActivity = useCallback(() => {
     onDelete?.(activity.id);
   }, [activity.id, onDelete]);
+
+  const changeStatus = useCallback(
+    (nextStatus: TimelineActivityStatus) =>
+      onChangeStatus?.(activity.id, nextStatus) ?? Promise.resolve(),
+    [activity.id, onChangeStatus],
+  );
 
   return (
     <View
@@ -293,6 +307,13 @@ function ActivityRowComponent({
               <Ionicons name="open-outline" size={14} color={colors.primary} />
             </Pressable>
           ) : null}
+          {onChangeStatus ? (
+            <ActivityStatusControls
+              activity={activity}
+              disabled={actionsDisabled}
+              onChangeStatus={changeStatus}
+            />
+          ) : null}
         </View>
       ) : null}
 
@@ -310,10 +331,12 @@ function ActivityRowComponent({
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={`Edit ${activity.title}`}
+              accessibilityState={{ disabled: actionsDisabled }}
+              disabled={actionsDisabled}
               onPress={editActivity}
               style={({ pressed }) => [
                 styles.actionButton,
-                pressed ? styles.pressed : null,
+                pressed || actionsDisabled ? styles.pressed : null,
               ]}
             >
               <Ionicons name="create-outline" size={16} color={colors.primary} />
@@ -324,10 +347,12 @@ function ActivityRowComponent({
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={`Delete ${activity.title}`}
+              accessibilityState={{ disabled: actionsDisabled }}
+              disabled={actionsDisabled}
               onPress={deleteActivity}
               style={({ pressed }) => [
                 styles.actionButton,
-                pressed ? styles.pressed : null,
+                pressed || actionsDisabled ? styles.pressed : null,
               ]}
             >
               <Ionicons name="trash-outline" size={16} color={colors.danger} />

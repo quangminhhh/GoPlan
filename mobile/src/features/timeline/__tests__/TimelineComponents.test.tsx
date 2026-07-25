@@ -242,6 +242,60 @@ describe('ActivityRow', () => {
     );
     expect(onEdit).toHaveBeenCalledWith('activity-1');
   });
+
+  it('renders status controls in expanded details and forwards the activity id', async () => {
+    const onChangeStatus = jest.fn().mockResolvedValue(undefined);
+    await render(
+      <ActivityRow
+        activity={buildActivity()}
+        onChangeStatus={onChangeStatus}
+      />,
+    );
+
+    expect(
+      screen.queryByRole('button', { name: 'Start activity' }),
+    ).toBeNull();
+    await fireEvent.press(
+      screen.getByRole('button', {
+        name: 'Expand Airport transfer details',
+      }),
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Start activity' }),
+    );
+    await waitFor(() =>
+      expect(onChangeStatus).toHaveBeenCalledWith(
+        'activity-1',
+        'IN_PROGRESS',
+      ),
+    );
+  });
+
+  it('disables visible edit and delete controls during another mutation', async () => {
+    const onEdit = jest.fn();
+    const onDelete = jest.fn();
+    await render(
+      <ActivityRow
+        activity={buildActivity()}
+        actionsDisabled
+        onEdit={onEdit}
+        onDelete={onDelete}
+      />,
+    );
+
+    const edit = screen.getByRole('button', {
+      name: 'Edit Airport transfer',
+    });
+    const remove = screen.getByRole('button', {
+      name: 'Delete Airport transfer',
+    });
+    expect(edit.props.accessibilityState).toEqual({ disabled: true });
+    expect(remove.props.accessibilityState).toEqual({ disabled: true });
+    await fireEvent.press(edit);
+    await fireEvent.press(remove);
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(onDelete).not.toHaveBeenCalled();
+  });
 });
 
 describe('SectionGroup', () => {
