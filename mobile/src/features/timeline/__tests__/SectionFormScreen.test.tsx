@@ -341,6 +341,65 @@ describe('SectionFormScreen', () => {
     expect(screen.getByLabelText('Day label').props.value).toBe('My draft');
   });
 
+  it('keeps the draft mounted and read-only while authority is lost, then restores editing', async () => {
+    mockParams = {
+      tripId: TRIP_ID,
+      mode: 'edit',
+      sectionId: SECTION_ID,
+    };
+    const view = await render(<SectionFormScreen />);
+    await fireEvent.changeText(
+      screen.getByLabelText('Day label'),
+      'Authority-safe draft',
+    );
+
+    mockUseTimeline.mockReturnValue(
+      readyHook(
+        timeline({
+          can_create_sections: false,
+          can_edit_timeline: false,
+        }),
+      ),
+    );
+    await view.rerender(<SectionFormScreen />);
+
+    expect(
+      screen.getByText(
+        'You do not have permission to manage timeline days.',
+      ),
+    ).toBeTruthy();
+    expect(screen.getByLabelText('Day label').props.value).toBe(
+      'Authority-safe draft',
+    );
+    expect(screen.getByLabelText('Day label').props.editable).toBe(false);
+    expect(
+      screen.getByRole('button', { name: 'Save day' }).props
+        .accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    mockUseTimeline.mockReturnValue(
+      readyHook({
+        ...timeline(),
+        sections: [{ ...section, label: 'Server update' }, otherSection],
+      }),
+    );
+    await view.rerender(<SectionFormScreen />);
+
+    expect(
+      screen.queryByText(
+        'You do not have permission to manage timeline days.',
+      ),
+    ).toBeNull();
+    expect(screen.getByLabelText('Day label').props.value).toBe(
+      'Authority-safe draft',
+    );
+    expect(screen.getByLabelText('Day label').props.editable).toBe(true);
+    expect(
+      screen.getByRole('button', { name: 'Save day' }).props
+        .accessibilityState,
+    ).toMatchObject({ disabled: false });
+  });
+
   it('validates label and date, and blocks dates already used by another day', async () => {
     await render(<SectionFormScreen />);
 
@@ -556,6 +615,76 @@ describe('SectionFormScreen', () => {
 
     expect(
       screen.queryByText('This late failure must remain invisible.'),
+    ).toBeNull();
+    expect(mockRefresh).not.toHaveBeenCalled();
+    expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', {
+        name: 'Cancel timeline day form',
+      }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    await focusScreen();
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', {
+          name: 'Cancel timeline day form',
+        }).props.accessibilityState,
+      ).toMatchObject({ disabled: false }),
+    );
+    expect(mockLatestStackOptions?.gestureEnabled).toBe(true);
+    expect(
+      screen.queryByText('This late failure must remain invisible.'),
+    ).toBeNull();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('recovers pending UI when an old mutation settles after refocus', async () => {
+    const pending = deferred<TimelineSection>();
+    mockCreateSection.mockReturnValue(pending.promise);
+    await render(<SectionFormScreen />);
+    const blur = await focusScreen();
+    await fireEvent.changeText(
+      screen.getByLabelText('Day label'),
+      'Refocused failure',
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Add day' }),
+    );
+    await waitFor(() =>
+      expect(mockCreateSection).toHaveBeenCalledTimes(1),
+    );
+
+    await act(async () => {
+      blur?.();
+    });
+    await focusScreen();
+    expect(
+      screen.getByRole('button', {
+        name: 'Cancel timeline day form',
+      }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+    mockRefresh.mockClear();
+
+    await act(async () => {
+      pending.reject(
+        axiosErrorWith(409, {
+          detail: 'This stale generation must remain invisible.',
+        }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', {
+          name: 'Cancel timeline day form',
+        }).props.accessibilityState,
+      ).toMatchObject({ disabled: false }),
+    );
+    expect(mockLatestStackOptions?.gestureEnabled).toBe(true);
+    expect(
+      screen.queryByText('This stale generation must remain invisible.'),
     ).toBeNull();
     expect(mockRefresh).not.toHaveBeenCalled();
     expect(mockPublishTimelineEvent).not.toHaveBeenCalled();

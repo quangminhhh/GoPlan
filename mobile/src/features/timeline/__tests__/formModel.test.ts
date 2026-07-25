@@ -114,7 +114,7 @@ describe('activity draft hydration and immutable transitions', () => {
     expect(first).toEqual({
       title: '',
       time_mode: 'AT_TIME',
-      start_time: '',
+      start_time: '00:00',
       end_time: '',
       system_type: 'OTHER',
       custom_type_id: null,
@@ -199,6 +199,35 @@ describe('activity draft hydration and immutable transitions', () => {
     expect(manual.place).toBeNull();
     expect(draft.start_time).toBe('08:30');
     expect(draft.place).not.toBeNull();
+  });
+
+  it('keeps timed-mode defaults aligned with the native picker display', () => {
+    const untimed = validDraft({
+      time_mode: 'ALL_DAY',
+      start_time: '',
+      end_time: '',
+    });
+
+    expect(applyActivityTimeMode(untimed, 'AT_TIME')).toMatchObject({
+      time_mode: 'AT_TIME',
+      start_time: '00:00',
+      end_time: '',
+    });
+    expect(applyActivityTimeMode(untimed, 'TIME_RANGE')).toMatchObject({
+      time_mode: 'TIME_RANGE',
+      start_time: '00:00',
+      end_time: '01:00',
+    });
+    expect(
+      applyActivityTimeMode(
+        validDraft({ start_time: '08:30', end_time: '' }),
+        'TIME_RANGE',
+      ),
+    ).toMatchObject({
+      time_mode: 'TIME_RANGE',
+      start_time: '08:30',
+      end_time: '09:30',
+    });
   });
 });
 
@@ -320,6 +349,26 @@ describe('activity type, assignee, and location validation', () => {
       validateActivityDraft(both).fieldErrors.activity_type,
     ).toBeDefined();
     expect(validateActivityDraft(custom).isValid).toBe(true);
+  });
+
+  it('rejects a custom type that is no longer selectable', () => {
+    const custom = validDraft({
+      system_type: null,
+      custom_type_id: 'custom-1',
+    });
+
+    expect(
+      validateActivityDraft(custom, {
+        selectableCustomTypeIds: new Set(['custom-1']),
+      }).isValid,
+    ).toBe(true);
+    expect(
+      validateActivityDraft(custom, {
+        selectableCustomTypeIds: ['custom-2'],
+      }).fieldErrors.activity_type,
+    ).toBe(
+      'The selected custom type is no longer available. Choose another activity type.',
+    );
   });
 
   it('requires USER to reference an active member and forbids ids for other scopes', () => {

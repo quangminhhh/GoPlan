@@ -306,7 +306,7 @@ describe('TimelineScreen', () => {
     );
     expect(alertSpy).toHaveBeenCalledWith(
       'Delete timeline day?',
-      'Delete Arrival and all activities in it? This cannot be undone.',
+      'Delete Arrival? Only empty timeline days can be deleted. This cannot be undone.',
       expect.any(Array),
       expect.objectContaining({ cancelable: true }),
     );

@@ -134,6 +134,7 @@ const TRIP_ID = '123e4567-e89b-12d3-a456-426614174000';
 const SECTION_ID = '2c1dfd8d-9c7f-43c7-9b99-71f6d1edda55';
 const ACTIVITY_ID = 'a11957b3-3329-4fcf-9c7b-673a51c1d8a7';
 const OTHER_ACTIVITY_ID = '7191f7c4-16f0-4fc5-996f-3264a46e7761';
+const CUSTOM_TYPE_ID = '4f44f738-0f5c-4608-a0b8-fd4ca3ecacde';
 
 function activity(
   overrides: Partial<TimelineActivity> = {},
@@ -581,6 +582,64 @@ describe('ActivityFormScreen', () => {
     expect(currentFormProps().canSubmit).toBe(true);
   });
 
+  it('blocks a stale custom type selection locally after the type is deactivated', async () => {
+    mockParams = {
+      tripId: TRIP_ID,
+      mode: 'create',
+      sectionId: SECTION_ID,
+    };
+    const activeCustomType = {
+      id: CUSTOM_TYPE_ID,
+      name: 'Coffee stop',
+      normalized_name: 'coffee-stop',
+      color_token: 'amber',
+      icon_key: 'cafe',
+      is_active: true,
+    };
+    mockUseTimeline.mockReturnValue(
+      readyTimelineHook(
+        timeline({
+          custom_types: [activeCustomType],
+        }),
+      ),
+    );
+    const view = await render(<ActivityFormScreen />);
+    await changeDraft(
+      (draft) => ({
+        ...draft,
+        title: 'Draft with stale type',
+        start_time: '09:00',
+        system_type: null,
+        custom_type_id: CUSTOM_TYPE_ID,
+      }),
+      ['title', 'start_time', 'system_type', 'custom_type_id'],
+    );
+
+    mockUseTimeline.mockReturnValue(
+      readyTimelineHook(
+        timeline({
+          custom_types: [
+            {
+              ...activeCustomType,
+              is_active: false,
+            },
+          ],
+        }),
+      ),
+    );
+    await view.rerender(<ActivityFormScreen />);
+
+    expect(currentFormProps().draft.custom_type_id).toBe(CUSTOM_TYPE_ID);
+    await act(async () => {
+      currentFormProps().onSubmit();
+    });
+
+    expect(mockCreateActivity).not.toHaveBeenCalled();
+    expect(currentFormProps().localFieldErrors.activity_type).toBe(
+      'The selected custom type is no longer available. Choose another activity type.',
+    );
+  });
+
   it('creates with a full payload, locks duplicate submit and Cancel, then reconciles once before dismissing', async () => {
     const pending = deferred<TimelineActivity>();
     mockCreateActivity.mockReturnValue(pending.promise);
@@ -734,6 +793,111 @@ describe('ActivityFormScreen', () => {
     expect(mockRefreshTrip).toHaveBeenCalledTimes(1);
     expect(mockRefreshTimeline).toHaveBeenCalledWith('silent');
     expect(mockRefreshTrip).toHaveBeenCalledWith('silent');
+    expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('clears stale pending UI on refocus when the mutation settled while inactive', async () => {
+    const pending = deferred<TimelineActivity>();
+    mockCreateActivity.mockReturnValue(pending.promise);
+    mockParams = {
+      tripId: TRIP_ID,
+      mode: 'create',
+      sectionId: SECTION_ID,
+    };
+    await render(<ActivityFormScreen />);
+    const blur = await focusScreen();
+    await changeDraft(
+      (draft) => ({
+        ...draft,
+        title: 'Settles while inactive',
+        start_time: '10:30',
+      }),
+      ['title', 'start_time'],
+    );
+    await act(async () => {
+      currentFormProps().onSubmit();
+    });
+    await waitFor(() =>
+      expect(mockCreateActivity).toHaveBeenCalledTimes(1),
+    );
+
+    await act(async () => {
+      blur?.();
+      pending.reject(
+        axiosErrorWith(409, {
+          detail: 'This inactive failure must remain invisible.',
+        }),
+      );
+    });
+
+    expect(currentFormProps().submitting).toBe(true);
+    await focusScreen();
+    await waitFor(() =>
+      expect(currentFormProps().submitting).toBe(false),
+    );
+    expect(mockLatestStackOptions?.gestureEnabled).toBe(true);
+    expect(
+      screen.getByLabelText('Cancel timeline activity form').props
+        .accessibilityState,
+    ).toMatchObject({ disabled: false });
+    expect(currentFormProps().submitError).toBeNull();
+    expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('clears stale pending UI when the old mutation settles after refocus', async () => {
+    const pending = deferred<TimelineActivity>();
+    mockCreateActivity.mockReturnValue(pending.promise);
+    mockParams = {
+      tripId: TRIP_ID,
+      mode: 'create',
+      sectionId: SECTION_ID,
+    };
+    await render(<ActivityFormScreen />);
+    const blur = await focusScreen();
+    await changeDraft(
+      (draft) => ({
+        ...draft,
+        title: 'Settles after refocus',
+        start_time: '10:45',
+      }),
+      ['title', 'start_time'],
+    );
+    await act(async () => {
+      currentFormProps().onSubmit();
+    });
+    await waitFor(() =>
+      expect(mockCreateActivity).toHaveBeenCalledTimes(1),
+    );
+
+    await act(async () => {
+      blur?.();
+    });
+    await focusScreen();
+    expect(currentFormProps().submitting).toBe(true);
+    mockRefreshTimeline.mockClear();
+    mockRefreshTrip.mockClear();
+
+    await act(async () => {
+      pending.reject(
+        axiosErrorWith(409, {
+          detail: 'This stale generation must remain invisible.',
+        }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(currentFormProps().submitting).toBe(false),
+    );
+    expect(mockLatestStackOptions?.gestureEnabled).toBe(true);
+    expect(
+      screen.getByLabelText('Cancel timeline activity form').props
+        .accessibilityState,
+    ).toMatchObject({ disabled: false });
+    expect(currentFormProps().submitError).toBeNull();
+    expect(mockRefreshTimeline).not.toHaveBeenCalled();
+    expect(mockRefreshTrip).not.toHaveBeenCalled();
     expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
   });

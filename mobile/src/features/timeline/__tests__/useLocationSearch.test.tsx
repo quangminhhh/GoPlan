@@ -158,7 +158,7 @@ describe('useLocationSearch', () => {
     unmount();
   });
 
-  it('retains the current input and suggestions after a 429 response', async () => {
+  it('retains the current input but clears stale suggestions after a 429 response', async () => {
     mockSuggestLocations
       .mockResolvedValueOnce([suggestion])
       .mockRejectedValueOnce(
@@ -171,15 +171,31 @@ describe('useLocationSearch', () => {
     expect(result.current.suggestions).toEqual([suggestion]);
 
     await setQuery(result, 'Da Nang');
-    expect(result.current.suggestions).toEqual([suggestion]);
+    expect(result.current.suggestions).toEqual([]);
     await advanceDebounce();
 
     expect(result.current.query).toBe('Da Nang');
-    expect(result.current.suggestions).toEqual([suggestion]);
+    expect(result.current.suggestions).toEqual([]);
     expect(result.current.searchError).toMatchObject({
       kind: 'throttled',
       status: 429,
     });
+    unmount();
+  });
+
+  it('clears old suggestions as soon as a different searchable query is entered', async () => {
+    mockSuggestLocations.mockResolvedValue([suggestion]);
+    const { result, unmount } = await renderHook(() => useLocationSearch());
+
+    await setQuery(result, 'Da');
+    await advanceDebounce();
+    expect(result.current.suggestions).toEqual([suggestion]);
+
+    await setQuery(result, 'Hanoi');
+
+    expect(result.current.query).toBe('Hanoi');
+    expect(result.current.searchStatus).toBe('debouncing');
+    expect(result.current.suggestions).toEqual([]);
     unmount();
   });
 

@@ -174,6 +174,7 @@ export function useLocationSearch({
           }
 
           const nextError = normalizeApiError(caught);
+          setSuggestions([]);
           setSearchError(nextError);
           setSearchUnavailable(isLocationSearchUnavailable(nextError));
           setSearchStatus('error');
@@ -205,6 +206,7 @@ export function useLocationSearch({
       cancelSuggest();
       cancelLookup();
       setQueryValue(nextQuery);
+      setSuggestions([]);
       setSearchError(null);
       setSearchUnavailable(false);
       setLookupError(null);
@@ -212,7 +214,6 @@ export function useLocationSearch({
       setManualEntrySuggested(false);
 
       if (nextQuery.trim().length < 2) {
-        setSuggestions([]);
         setSearchStatus('idle');
       } else {
         setSearchStatus('debouncing');

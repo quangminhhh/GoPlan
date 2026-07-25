@@ -289,7 +289,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
       };
       Alert.alert(
         'Delete timeline day?',
-        `Delete ${section.label} and all activities in it? This cannot be undone.`,
+        `Delete ${section.label}? Only empty timeline days can be deleted. This cannot be undone.`,
         [
           {
             text: 'Cancel',

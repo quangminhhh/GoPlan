@@ -20,6 +20,8 @@ interface SectionFormProps {
   dateUnavailable: boolean;
   dirty: boolean;
   submitting: boolean;
+  disabled: boolean;
+  authorityMessage?: string;
   onChange: (changes: Partial<SectionFormDraft>) => void;
   onSubmit: () => void;
 }
@@ -40,6 +42,8 @@ export function SectionForm({
   dateUnavailable,
   dirty,
   submitting,
+  disabled,
+  authorityMessage,
   onChange,
   onSubmit,
 }: SectionFormProps) {
@@ -57,6 +61,11 @@ export function SectionForm({
       footer={
         <>
           <FormError error={submitError} />
+          {authorityMessage ? (
+            <Text accessibilityRole="alert" style={styles.authorityMessage}>
+              {authorityMessage}
+            </Text>
+          ) : null}
           {unchanged ? (
             <Text style={styles.submitHint}>Change the label or date to save.</Text>
           ) : null}
@@ -64,7 +73,7 @@ export function SectionForm({
             title={mode === 'create' ? 'Add day' : 'Save day'}
             onPress={onSubmit}
             loading={submitting}
-            disabled={dateUnavailable || unchanged}
+            disabled={disabled || dateUnavailable || unchanged}
           />
         </>
       }
@@ -82,13 +91,13 @@ export function SectionForm({
         accessibilityLabel="Day label"
         value={draft.label}
         onChangeText={(label) => onChange({ label })}
-        editable={!submitting}
+        editable={!submitting && !disabled}
         maxLength={120}
         error={labelError}
       />
       <View
-        pointerEvents={submitting ? 'none' : 'auto'}
-        style={submitting ? styles.disabledField : null}
+        pointerEvents={submitting || disabled ? 'none' : 'auto'}
+        style={submitting || disabled ? styles.disabledField : null}
       >
         <DateField
           label="Date *"
@@ -112,6 +121,11 @@ const styles = StyleSheet.create({
   title: { ...typography.heading, color: colors.text },
   body: { ...typography.body, color: colors.textMuted },
   disabledField: { opacity: 0.55 },
+  authorityMessage: {
+    ...typography.body,
+    color: colors.danger,
+    textAlign: 'center',
+  },
   submitHint: {
     ...typography.caption,
     color: colors.textMuted,

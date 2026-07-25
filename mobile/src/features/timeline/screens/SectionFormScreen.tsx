@@ -129,10 +129,14 @@ interface SectionFormEditorProps {
   intent: SectionFormRouteIntent;
   timeline: TimelineResponse;
   initialDraft: SectionFormDraft;
+  canManage: boolean;
   submitLockRef: { current: boolean };
+  submitting: boolean;
+  setSubmitting: (submitting: boolean) => void;
   invalidate: () => void;
   refresh: (mode?: TimelineLoadMode) => Promise<void>;
   getGeneration: () => number;
+  isScreenActive: () => boolean;
   isActiveGeneration: (generation: number) => boolean;
   onCancel: () => void;
   onConfirmedSuccess: () => void;
@@ -142,10 +146,14 @@ function SectionFormEditor({
   intent,
   timeline,
   initialDraft,
+  canManage,
   submitLockRef,
+  submitting,
+  setSubmitting,
   invalidate,
   refresh,
   getGeneration,
+  isScreenActive,
   isActiveGeneration,
   onCancel,
   onConfirmedSuccess,
@@ -159,7 +167,6 @@ function SectionFormEditor({
   const [fieldErrors, setFieldErrors] =
     useState<SectionFormFieldErrors>({});
   const [submitError, setSubmitError] = useState<ApiError | null>(null);
-  const [submitting, setSubmitting] = useState(false);
   const mountedRef = useRef(true);
   const editedSectionId =
     intent.mode === 'edit' ? intent.sectionId : undefined;
@@ -179,15 +186,18 @@ function SectionFormEditor({
 
   const changeDraft = useCallback(
     (changes: Partial<SectionFormDraft>) => {
+      if (submitLockRef.current || !canManage) {
+        return;
+      }
       setDraft((current) => ({ ...current, ...changes }));
       setFieldErrors({});
       setSubmitError(null);
     },
-    [],
+    [canManage, submitLockRef],
   );
 
   const submit = useCallback(async () => {
-    if (submitLockRef.current) {
+    if (submitLockRef.current || !canManage) {
       return;
     }
 
@@ -251,11 +261,12 @@ function SectionFormEditor({
       }
     } finally {
       submitLockRef.current = false;
-      if (mountedRef.current && isActiveGeneration(generation)) {
+      if (isScreenActive()) {
         setSubmitting(false);
       }
     }
   }, [
+    canManage,
     draft,
     editedSectionId,
     getGeneration,
@@ -263,8 +274,10 @@ function SectionFormEditor({
     intent,
     invalidate,
     isActiveGeneration,
+    isScreenActive,
     onConfirmedSuccess,
     refresh,
+    setSubmitting,
     submitLockRef,
     timeline.sections,
   ]);
@@ -293,6 +306,12 @@ function SectionFormEditor({
         dateUnavailable={dateUnavailable}
         dirty={dirty}
         submitting={submitting}
+        disabled={!canManage}
+        authorityMessage={
+          canManage
+            ? undefined
+            : 'You do not have permission to manage timeline days.'
+        }
         onChange={changeDraft}
         onSubmit={() => void submit()}
       />
@@ -313,8 +332,10 @@ function ValidSectionFormScreen({
     refresh,
     invalidate,
   } = useTimeline(intent.tripId, { autoReconcile: false });
+  const [submitting, setSubmitting] = useState(false);
   const submitLockRef = useRef(false);
   const activeRef = useRef(false);
+  const mountedRef = useRef(true);
   const generationRef = useRef(0);
   const hasRequestedInitialRef = useRef(false);
   const parentHref = `/trips/${intent.tripId}/timeline` as const;
@@ -339,6 +360,9 @@ function ValidSectionFormScreen({
     useCallback(() => {
       activeRef.current = true;
       generationRef.current += 1;
+      if (!submitLockRef.current) {
+        setSubmitting(false);
+      }
       void requestReconcile();
 
       return () => {
@@ -350,6 +374,7 @@ function ValidSectionFormScreen({
 
   useEffect(
     () => () => {
+      mountedRef.current = false;
       activeRef.current = false;
       generationRef.current += 1;
     },
@@ -381,8 +406,17 @@ function ValidSectionFormScreen({
       : timeline?.permissions.can_edit_timeline === true;
 
   const isActiveGeneration = useCallback((generation: number) => {
-    return activeRef.current && generationRef.current === generation;
+    return (
+      mountedRef.current &&
+      activeRef.current &&
+      generationRef.current === generation
+    );
   }, []);
+
+  const isScreenActive = useCallback(
+    () => mountedRef.current && activeRef.current,
+    [],
+  );
 
   const getGeneration = useCallback(() => generationRef.current, []);
 
@@ -400,9 +434,12 @@ function ValidSectionFormScreen({
         <Stack.Screen
           options={{
             title,
-            gestureEnabled: true,
+            gestureEnabled: !submitting,
             headerLeft: () => (
-              <HeaderCancelAction disabled={false} onPress={cancel} />
+              <HeaderCancelAction
+                disabled={submitting}
+                onPress={cancel}
+              />
             ),
           }}
         />
@@ -418,9 +455,12 @@ function ValidSectionFormScreen({
         <Stack.Screen
           options={{
             title,
-            gestureEnabled: true,
+            gestureEnabled: !submitting,
             headerLeft: () => (
-              <HeaderCancelAction disabled={false} onPress={cancel} />
+              <HeaderCancelAction
+                disabled={submitting}
+                onPress={cancel}
+              />
             ),
           }}
         />
@@ -446,37 +486,18 @@ function ValidSectionFormScreen({
         <Stack.Screen
           options={{
             title,
-            gestureEnabled: true,
+            gestureEnabled: !submitting,
             headerLeft: () => (
-              <HeaderCancelAction disabled={false} onPress={cancel} />
+              <HeaderCancelAction
+                disabled={submitting}
+                onPress={cancel}
+              />
             ),
           }}
         />
         <SectionFormState
           title="Day unavailable"
           message="This timeline day no longer exists."
-          actionTitle="Back to timeline"
-          onAction={cancel}
-        />
-      </>
-    );
-  }
-
-  if (!canManage) {
-    return (
-      <>
-        <Stack.Screen
-          options={{
-            title,
-            gestureEnabled: true,
-            headerLeft: () => (
-              <HeaderCancelAction disabled={false} onPress={cancel} />
-            ),
-          }}
-        />
-        <SectionFormState
-          title="Day management unavailable"
-          message="You do not have permission to manage timeline days."
           actionTitle="Back to timeline"
           onAction={cancel}
         />
@@ -502,10 +523,14 @@ function ValidSectionFormScreen({
         intent={intent}
         timeline={timeline}
         initialDraft={initialDraft}
+        canManage={canManage}
         submitLockRef={submitLockRef}
+        submitting={submitting}
+        setSubmitting={setSubmitting}
         invalidate={invalidate}
         refresh={refresh}
         getGeneration={getGeneration}
+        isScreenActive={isScreenActive}
         isActiveGeneration={isActiveGeneration}
         onCancel={cancel}
         onConfirmedSuccess={() => router.dismissTo(parentHref)}

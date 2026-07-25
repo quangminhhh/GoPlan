@@ -343,7 +343,7 @@ function ValidCustomTypeManagerScreen({ tripId }: { tripId: string }) {
         }
       } finally {
         mutationLockRef.current = false;
-        if (isActiveGeneration(generation)) {
+        if (mountedRef.current && activeRef.current) {
           setMutationKey(null);
         }
       }

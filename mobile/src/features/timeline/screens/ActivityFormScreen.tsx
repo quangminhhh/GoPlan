@@ -36,6 +36,7 @@ import {
   buildPatchActivityPayload,
   cloneActivityDraft,
   createActivityDraft,
+  getSelectableCustomTypes,
   hydrateActivityDraft,
   validateActivityDraft,
   type ActivityDraftField,
@@ -88,6 +89,10 @@ interface HydratedActivityFormProps {
   refreshAll: (mode: 'initial' | 'refresh' | 'silent') => Promise<void>;
   requestReconcile: (forceInitial?: boolean) => Promise<void>;
   invalidateTimeline: () => void;
+  submitLockRef: { current: boolean };
+  submitting: boolean;
+  setSubmitting: (submitting: boolean) => void;
+  isScreenActive: () => boolean;
   isActiveGeneration: (generation: number) => boolean;
   getGeneration: () => number;
   onCancel: () => void;
@@ -202,6 +207,10 @@ function HydratedActivityForm({
   refreshAll,
   requestReconcile,
   invalidateTimeline,
+  submitLockRef,
+  submitting,
+  setSubmitting,
+  isScreenActive,
   isActiveGeneration,
   getGeneration,
   onCancel,
@@ -220,8 +229,6 @@ function HydratedActivityForm({
   const [localFieldErrors, setLocalFieldErrors] =
     useState<ActivityFormFieldErrors>({});
   const [submitError, setSubmitError] = useState<ApiError | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const submitLockRef = useRef(false);
   const parentHref = `/trips/${intent.tripId}/timeline` as const;
 
   const terminal =
@@ -256,6 +263,18 @@ function HydratedActivityForm({
     () => new Set(detail.members.map((member) => member.user.id)),
     [detail.members],
   );
+  const selectableCustomTypeIds = useMemo(
+    () =>
+      new Set(
+        getSelectableCustomTypes(
+          timeline.custom_types,
+          initialState.kind === 'ready'
+            ? initialState.initialActivity
+            : undefined,
+        ).map((customType) => customType.id),
+      ),
+    [initialState, timeline.custom_types],
+  );
 
   const changeDraft = useCallback(
     (
@@ -276,14 +295,14 @@ function HydratedActivityForm({
       setLocalFieldErrors({});
       setSubmitError(null);
     },
-    [],
+    [submitLockRef],
   );
 
   const manageCustomTypes = useCallback(() => {
     if (!submitLockRef.current && canManageCustomTypes) {
       router.push(`/trips/${intent.tripId}/timeline/custom-types`);
     }
-  }, [canManageCustomTypes, intent.tripId, router]);
+  }, [canManageCustomTypes, intent.tripId, router, submitLockRef]);
 
   const submit = useCallback(async () => {
     if (
@@ -297,6 +316,7 @@ function HydratedActivityForm({
 
     const validation = validateActivityDraft(draft, {
       activeAssigneeIds,
+      selectableCustomTypeIds,
     });
     setLocalFieldErrors(validation.fieldErrors);
     setSubmitError(null);
@@ -306,7 +326,10 @@ function HydratedActivityForm({
 
     const createPayload =
       intent.mode === 'create'
-        ? buildCreateActivityPayload(draft, { activeAssigneeIds })
+        ? buildCreateActivityPayload(draft, {
+            activeAssigneeIds,
+            selectableCustomTypeIds,
+          })
         : null;
     const patchPayload =
       intent.mode === 'edit'
@@ -314,7 +337,10 @@ function HydratedActivityForm({
             initialState.initialDraft,
             draft,
             dirtyFields,
-            { activeAssigneeIds },
+            {
+              activeAssigneeIds,
+              selectableCustomTypeIds,
+            },
           )
         : null;
 
@@ -366,7 +392,7 @@ function HydratedActivityForm({
       }
     } finally {
       submitLockRef.current = false;
-      if (isActiveGeneration(generation)) {
+      if (isScreenActive()) {
         setSubmitting(false);
       }
     }
@@ -380,9 +406,13 @@ function HydratedActivityForm({
     intent,
     invalidateTimeline,
     isActiveGeneration,
+    isScreenActive,
     parentHref,
     refreshAll,
     router,
+    selectableCustomTypeIds,
+    setSubmitting,
+    submitLockRef,
   ]);
 
   const pullToRefresh = useCallback(() => {
@@ -484,6 +514,8 @@ function ValidActivityFormScreen({
   } = useTripDetail(intent.tripId, {
     autoReconcile: false,
   });
+  const [submitting, setSubmitting] = useState(false);
+  const submitLockRef = useRef(false);
   const activeRef = useRef(false);
   const mountedRef = useRef(true);
   const generationRef = useRef(0);
@@ -513,6 +545,9 @@ function ValidActivityFormScreen({
     useCallback(() => {
       activeRef.current = true;
       generationRef.current += 1;
+      if (!submitLockRef.current) {
+        setSubmitting(false);
+      }
       void requestReconcile();
 
       return () => {
@@ -571,10 +606,17 @@ function ValidActivityFormScreen({
     );
   }, []);
 
+  const isScreenActive = useCallback(
+    () => mountedRef.current && activeRef.current,
+    [],
+  );
+
   const getGeneration = useCallback(() => generationRef.current, []);
 
   const cancel = useCallback(() => {
-    router.dismissTo(parentHref);
+    if (!submitLockRef.current) {
+      router.dismissTo(parentHref);
+    }
   }, [parentHref, router]);
 
   const retryInitial = useCallback(() => {
@@ -604,9 +646,12 @@ function ValidActivityFormScreen({
         <Stack.Screen
           options={{
             title,
-            gestureEnabled: true,
+            gestureEnabled: !submitting,
             headerLeft: () => (
-              <HeaderCancelAction disabled={false} onPress={cancel} />
+              <HeaderCancelAction
+                disabled={submitting}
+                onPress={cancel}
+              />
             ),
           }}
         />
@@ -636,6 +681,10 @@ function ValidActivityFormScreen({
       refreshAll={refreshAll}
       requestReconcile={requestReconcile}
       invalidateTimeline={invalidateTimeline}
+      submitLockRef={submitLockRef}
+      submitting={submitting}
+      setSubmitting={setSubmitting}
+      isScreenActive={isScreenActive}
       isActiveGeneration={isActiveGeneration}
       getGeneration={getGeneration}
       onCancel={cancel}

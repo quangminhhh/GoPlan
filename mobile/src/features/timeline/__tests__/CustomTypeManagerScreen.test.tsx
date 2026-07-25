@@ -207,8 +207,17 @@ function destructiveAlertAction() {
   return action.onPress;
 }
 
+async function renderManager() {
+  const view = await render(<CustomTypeManagerScreen />);
+  await act(async () => {
+    jest.runOnlyPendingTimers();
+  });
+  return view;
+}
+
 describe('CustomTypeManagerScreen', () => {
   beforeEach(() => {
+    jest.useFakeTimers();
     jest.clearAllMocks();
     mockRouter.canGoBack.mockReturnValue(true);
     mockParams = { tripId: TRIP_ID };
@@ -240,10 +249,17 @@ describe('CustomTypeManagerScreen', () => {
     );
   });
 
+  afterEach(async () => {
+    await act(async () => {
+      jest.runOnlyPendingTimers();
+    });
+    jest.useRealTimers();
+  });
+
   it('rejects malformed trip routes before loading or mutating', async () => {
     mockParams = { tripId: [TRIP_ID] };
 
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
 
     expect(screen.getByText('Custom types unavailable')).toBeTruthy();
     expect(mockUseTimeline).not.toHaveBeenCalled();
@@ -255,7 +271,7 @@ describe('CustomTypeManagerScreen', () => {
   it('gates direct links with aggregate custom-type authority', async () => {
     mockUseTimeline.mockReturnValue(readyHook(timeline(false)));
 
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
 
     expect(
       screen.getByText(
@@ -271,7 +287,7 @@ describe('CustomTypeManagerScreen', () => {
   });
 
   it('closes back to the calling activity form when navigation history exists', async () => {
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
 
     await fireEvent.press(
       screen.getByRole('button', { name: 'Close custom types' }),
@@ -283,7 +299,7 @@ describe('CustomTypeManagerScreen', () => {
 
   it('falls back to the Timeline route when opened without navigation history', async () => {
     mockRouter.canGoBack.mockReturnValue(false);
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
 
     await fireEvent.press(
       screen.getByRole('button', { name: 'Close custom types' }),
@@ -296,7 +312,7 @@ describe('CustomTypeManagerScreen', () => {
   });
 
   it('keeps active, inactive, and unknown-token types visible and manageable', async () => {
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
 
     expect(screen.getByText('Coffee')).toBeTruthy();
     expect(screen.getByText('Relax')).toBeTruthy();
@@ -312,7 +328,7 @@ describe('CustomTypeManagerScreen', () => {
   it('creates from finite picker values with a global ref lock and one event-owned reconcile', async () => {
     const pending = deferred<TimelineCustomTypeMeta>();
     mockCreateCustomType.mockReturnValue(pending.promise);
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
     await focusScreen();
     mockRefresh.mockClear();
 
@@ -379,7 +395,7 @@ describe('CustomTypeManagerScreen', () => {
   });
 
   it('renames with a minimal PATCH while preserving unknown raw tokens', async () => {
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
     await focusScreen();
     mockRefresh.mockClear();
     await fireEvent.press(
@@ -414,7 +430,7 @@ describe('CustomTypeManagerScreen', () => {
   });
 
   it('patches unknown color and icon only after explicit supported replacements', async () => {
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
     await focusScreen();
     await fireEvent.press(
       screen.getByRole('button', { name: 'Edit Legacy' }),
@@ -447,7 +463,7 @@ describe('CustomTypeManagerScreen', () => {
   ])(
     'handles %s with a minimal active-state PATCH',
     async (actionLabel, typeId, isActive, message) => {
-      await render(<CustomTypeManagerScreen />);
+      await renderManager();
       await focusScreen();
       mockRefresh.mockClear();
 
@@ -469,7 +485,7 @@ describe('CustomTypeManagerScreen', () => {
   );
 
   it('confirms and deletes exactly once before publishing and reconciling', async () => {
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
     await focusScreen();
     mockRefresh.mockClear();
 
@@ -509,7 +525,7 @@ describe('CustomTypeManagerScreen', () => {
         error_code: 'CUSTOM_TYPE_IN_USE',
       }),
     );
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
     await focusScreen();
     mockRefresh.mockClear();
 
@@ -550,7 +566,7 @@ describe('CustomTypeManagerScreen', () => {
       mockPatchCustomType.mockRejectedValueOnce(
         axiosErrorWith(status, { detail }),
       );
-      await render(<CustomTypeManagerScreen />);
+      await renderManager();
       await focusScreen();
       mockRefresh.mockClear();
 
@@ -571,7 +587,7 @@ describe('CustomTypeManagerScreen', () => {
         name: ['Use a different custom type name.'],
       }),
     );
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
     await focusScreen();
     await fireEvent.changeText(
       screen.getByLabelText('New custom type name'),
@@ -589,7 +605,7 @@ describe('CustomTypeManagerScreen', () => {
   it('ignores late inactive failure state, navigation, event, and reconcile effects', async () => {
     const pending = deferred<TimelineCustomTypeMeta>();
     mockCreateCustomType.mockReturnValue(pending.promise);
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
     const blur = await focusScreen();
     mockRefresh.mockClear();
     await fireEvent.changeText(
@@ -615,12 +631,78 @@ describe('CustomTypeManagerScreen', () => {
     expect(mockRefresh).not.toHaveBeenCalled();
     expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', { name: 'Close custom types' }).props
+        .accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    await focusScreen();
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Close custom types' }).props
+          .accessibilityState,
+      ).toMatchObject({ disabled: false }),
+    );
+    expect(mockLatestStackOptions?.gestureEnabled).toBe(true);
+    expect(
+      screen.queryByText('This late failure must remain invisible.'),
+    ).toBeNull();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('recovers pending UI when an old mutation settles after refocus', async () => {
+    const pending = deferred<TimelineCustomTypeMeta>();
+    mockCreateCustomType.mockReturnValue(pending.promise);
+    await renderManager();
+    const blur = await focusScreen();
+    await fireEvent.changeText(
+      screen.getByLabelText('New custom type name'),
+      'Refocused failure',
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Add custom type' }),
+    );
+    await waitFor(() =>
+      expect(mockCreateCustomType).toHaveBeenCalledTimes(1),
+    );
+
+    await act(async () => {
+      blur?.();
+    });
+    await focusScreen();
+    expect(
+      screen.getByRole('button', { name: 'Close custom types' }).props
+        .accessibilityState,
+    ).toMatchObject({ disabled: true });
+    mockRefresh.mockClear();
+
+    await act(async () => {
+      pending.reject(
+        axiosErrorWith(409, {
+          detail: 'This stale generation must remain invisible.',
+        }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Close custom types' }).props
+          .accessibilityState,
+      ).toMatchObject({ disabled: false }),
+    );
+    expect(mockLatestStackOptions?.gestureEnabled).toBe(true);
+    expect(
+      screen.queryByText('This stale generation must remain invisible.'),
+    ).toBeNull();
+    expect(mockRefresh).not.toHaveBeenCalled();
+    expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
   });
 
   it('publishes one late confirmed success without inactive UI, reconcile, or navigation', async () => {
     const pending = deferred<TimelineCustomTypeMeta>();
     mockCreateCustomType.mockReturnValue(pending.promise);
-    await render(<CustomTypeManagerScreen />);
+    await renderManager();
     const blur = await focusScreen();
     mockRefresh.mockClear();
     await fireEvent.changeText(

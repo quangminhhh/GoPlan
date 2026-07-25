@@ -137,6 +137,7 @@ export type SectionFormFieldErrors = Partial<
 
 export interface ActivityValidationOptions {
   activeAssigneeIds?: ReadonlySet<string> | readonly string[];
+  selectableCustomTypeIds?: ReadonlySet<string> | readonly string[];
 }
 
 export interface FormValidationResult<TField extends string> {
@@ -148,7 +149,7 @@ export function createActivityDraft(): ActivityFormDraft {
   return {
     title: '',
     time_mode: 'AT_TIME',
-    start_time: '',
+    start_time: '00:00',
     end_time: '',
     system_type: 'OTHER',
     custom_type_id: null,
@@ -222,7 +223,17 @@ export function applyActivityTimeMode(
   next.time_mode = timeMode;
 
   if (timeMode === 'AT_TIME') {
+    if (!isValidTime(next.start_time)) {
+      next.start_time = '00:00';
+    }
     next.end_time = '';
+  } else if (timeMode === 'TIME_RANGE') {
+    if (!isValidTime(next.start_time)) {
+      next.start_time = '00:00';
+    }
+    if (!isValidTime(next.end_time)) {
+      next.end_time = defaultRangeEndTime(next.start_time);
+    }
   } else if (timeMode === 'ALL_DAY' || timeMode === 'FLEXIBLE') {
     next.start_time = '';
     next.end_time = '';
@@ -307,7 +318,7 @@ export function validateActivityDraft(
   }
 
   validateTimeFields(draft, fieldErrors);
-  validateActivityType(draft, fieldErrors);
+  validateActivityType(draft, options, fieldErrors);
   validateAssignee(draft, options, fieldErrors);
   validateLocation(draft, fieldErrors);
   validateActivityTextFields(draft, fieldErrors);
@@ -586,6 +597,7 @@ function validateTimeFields(
 
 function validateActivityType(
   draft: ActivityFormDraft,
+  options: ActivityValidationOptions,
   fieldErrors: ActivityFormFieldErrors,
 ): void {
   const hasSystem = draft.system_type !== null;
@@ -604,6 +616,22 @@ function validateActivityType(
 
   if (hasSystem && !SYSTEM_TYPE_CODES.has(draft.system_type ?? '')) {
     addError(fieldErrors, 'activity_type', 'Choose a valid activity type.');
+    return;
+  }
+
+  if (
+    hasCustom &&
+    options.selectableCustomTypeIds &&
+    !containsId(
+      options.selectableCustomTypeIds,
+      normalizeText(draft.custom_type_id ?? ''),
+    )
+  ) {
+    addError(
+      fieldErrors,
+      'activity_type',
+      'The selected custom type is no longer available. Choose another activity type.',
+    );
   }
 }
 
@@ -974,6 +1002,13 @@ function isValidTime(value: string): boolean {
 function timeToMinutes(value: string): number {
   const [hour, minute] = value.split(':').map(Number);
   return hour * 60 + minute;
+}
+
+function defaultRangeEndTime(startTime: string): string {
+  const minutes = Math.min(timeToMinutes(startTime) + 60, 23 * 60 + 59);
+  const hours = String(Math.floor(minutes / 60)).padStart(2, '0');
+  const remainder = String(minutes % 60).padStart(2, '0');
+  return `${hours}:${remainder}`;
 }
 
 function isValidIsoDate(value: string): boolean {
