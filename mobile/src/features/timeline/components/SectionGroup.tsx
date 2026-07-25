@@ -9,6 +9,7 @@ interface SectionGroupProps {
   section: TimelineSection;
   canEdit?: boolean;
   canDelete?: boolean;
+  actionsDisabled?: boolean;
   onEdit?: (section: TimelineSection) => void;
   onDelete?: (section: TimelineSection) => void;
 }
@@ -17,6 +18,7 @@ function SectionGroupComponent({
   section,
   canEdit = false,
   canDelete = false,
+  actionsDisabled = false,
   onEdit,
   onDelete,
 }: SectionGroupProps) {
@@ -63,11 +65,13 @@ function SectionGroupComponent({
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={`Edit ${section.label}`}
+              accessibilityState={{ disabled: actionsDisabled }}
+              disabled={actionsDisabled}
               hitSlop={spacing.sm}
               onPress={editSection}
               style={({ pressed }) => [
                 styles.actionButton,
-                pressed ? styles.pressed : null,
+                pressed || actionsDisabled ? styles.pressed : null,
               ]}
             >
               <Ionicons name="create-outline" size={18} color={colors.primary} />
@@ -77,11 +81,13 @@ function SectionGroupComponent({
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={`Delete ${section.label}`}
+              accessibilityState={{ disabled: actionsDisabled }}
+              disabled={actionsDisabled}
               hitSlop={spacing.sm}
               onPress={deleteSection}
               style={({ pressed }) => [
                 styles.actionButton,
-                pressed ? styles.pressed : null,
+                pressed || actionsDisabled ? styles.pressed : null,
               ]}
             >
               <Ionicons name="trash-outline" size={18} color={colors.danger} />

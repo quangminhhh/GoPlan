@@ -285,12 +285,18 @@ describe('useTimeline', () => {
     await waitFor(() => expect(result.current.status).toBe('ready'));
 
     await act(async () => {
-      publishTimelineEvent({ type: 'timelineChanged', tripId: 'trip-2' });
+      await publishTimelineEvent({
+        type: 'timelineChanged',
+        tripId: 'trip-2',
+      });
     });
     expect(mockGetTimeline).toHaveBeenCalledTimes(1);
 
     await act(async () => {
-      publishTimelineEvent({ type: 'timelineChanged', tripId: 'trip-1' });
+      await publishTimelineEvent({
+        type: 'timelineChanged',
+        tripId: 'trip-1',
+      });
     });
     await waitFor(() =>
       expect(result.current.timeline?.sections[0]?.label).toBe('Event update'),
@@ -308,7 +314,10 @@ describe('useTimeline', () => {
     await act(async () => {
       latestFocusCallback()();
       latestForegroundCallback()();
-      publishTimelineEvent({ type: 'timelineChanged', tripId: 'trip-1' });
+      await publishTimelineEvent({
+        type: 'timelineChanged',
+        tripId: 'trip-1',
+      });
     });
     expect(mockGetTimeline).not.toHaveBeenCalled();
 

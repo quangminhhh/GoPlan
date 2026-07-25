@@ -3,19 +3,21 @@ export type TimelineEvent = {
   tripId: string;
 };
 
-type TimelineEventListener = (event: TimelineEvent) => void;
+type TimelineEventListener = (
+  event: TimelineEvent,
+) => void | Promise<void>;
 
 const listenersByTripId = new Map<string, Set<TimelineEventListener>>();
 
-export function publishTimelineEvent(event: TimelineEvent): void {
+export async function publishTimelineEvent(event: TimelineEvent): Promise<void> {
   const listeners = listenersByTripId.get(event.tripId);
   if (!listeners) {
     return;
   }
 
-  for (const listener of listeners) {
-    listener(event);
-  }
+  await Promise.all(
+    Array.from(listeners, (listener) => listener(event)),
+  );
 }
 
 export function subscribeToTimelineEvents(

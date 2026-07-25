@@ -1,7 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
+  Alert,
   Pressable,
   RefreshControl,
   SectionList,
@@ -11,13 +13,17 @@ import {
   type SectionListRenderItemInfo,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { normalizeApiError } from '@/shared/api/errors';
 import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
 import { Button } from '@/shared/ui/Button';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
+import { deleteSection as deleteTimelineSection } from '../api';
 import { ActivityRow } from '../components/ActivityRow';
 import { SectionGroup } from '../components/SectionGroup';
 import { useTimeline } from '../hooks/useTimeline';
 import { parseTimelineRouteIntent } from '../routeIntent';
+import { publishTimelineEvent } from '../timelineEvents';
+import type { TimelineSection } from '../types';
 import {
   buildTimelineListSections,
   getDefaultFocusedSectionIndex,
@@ -39,9 +45,19 @@ interface ScrollFailureInfo {
 
 function TimelineContent({ tripId }: TimelineContentProps) {
   const router = useRouter();
-  const { timeline, status, error, refreshing, refresh } = useTimeline(tripId);
+  const {
+    timeline,
+    status,
+    error,
+    refreshing,
+    refresh,
+    invalidate,
+  } = useTimeline(tripId);
   const listRef =
     useRef<SectionList<TimelineListRow, TimelineListSection>>(null);
+  const mountedRef = useRef(true);
+  const deleteLockRef = useRef(false);
+  const deleteStartedRef = useRef(false);
   const lastScrollTripIdRef = useRef<string | null>(null);
   const scrollTargetRef = useRef<{
     tripId: string;
@@ -49,6 +65,11 @@ function TimelineContent({ tripId }: TimelineContentProps) {
     retried: boolean;
   } | null>(null);
   const retryFrameRef = useRef<number | null>(null);
+  const [sectionActionsLocked, setSectionActionsLocked] = useState(false);
+  const [deletingSectionId, setDeletingSectionId] = useState<string | null>(
+    null,
+  );
+  const [mutationError, setMutationError] = useState<string | null>(null);
   const sections = useMemo(
     () => buildTimelineListSections(timeline?.sections ?? []),
     [timeline?.sections],
@@ -88,6 +109,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
 
   useEffect(
     () => () => {
+      mountedRef.current = false;
       if (retryFrameRef.current !== null) {
         cancelAnimationFrame(retryFrameRef.current);
         retryFrameRef.current = null;
@@ -137,8 +159,113 @@ function TimelineContent({ tripId }: TimelineContentProps) {
   );
 
   const openCreateDay = useCallback(() => {
+    setMutationError(null);
     router.push(`/trips/${tripId}/timeline/section-form?mode=create`);
   }, [router, tripId]);
+
+  const openEditSection = useCallback(
+    (section: TimelineSection) => {
+      setMutationError(null);
+      router.push(
+        `/trips/${tripId}/timeline/section-form?mode=edit&sectionId=${section.id}`,
+      );
+    },
+    [router, tripId],
+  );
+
+  const performDeleteSection = useCallback(
+    async (section: TimelineSection) => {
+      if (!mountedRef.current) {
+        deleteStartedRef.current = false;
+        deleteLockRef.current = false;
+        return;
+      }
+
+      setDeletingSectionId(section.id);
+      setMutationError(null);
+      invalidate();
+
+      try {
+        await deleteTimelineSection(tripId, section.id);
+        await publishTimelineEvent({
+          type: 'timelineChanged',
+          tripId,
+        });
+      } catch (caught) {
+        if (!mountedRef.current) {
+          return;
+        }
+
+        const normalized = normalizeApiError(caught);
+        setMutationError(normalized.message);
+        if (
+          normalized.status === 403 ||
+          normalized.status === 404 ||
+          normalized.status === 409
+        ) {
+          await refresh('silent');
+        }
+      } finally {
+        deleteStartedRef.current = false;
+        deleteLockRef.current = false;
+        if (mountedRef.current) {
+          setDeletingSectionId(null);
+          setSectionActionsLocked(false);
+        }
+      }
+    },
+    [invalidate, refresh, tripId],
+  );
+
+  const confirmDeleteSection = useCallback(
+    (section: TimelineSection) => {
+      if (deleteLockRef.current) {
+        return;
+      }
+
+      deleteLockRef.current = true;
+      deleteStartedRef.current = false;
+      setSectionActionsLocked(true);
+      setMutationError(null);
+      const releasePrompt = () => {
+        if (deleteStartedRef.current) {
+          return;
+        }
+        deleteStartedRef.current = false;
+        deleteLockRef.current = false;
+        if (mountedRef.current) {
+          setSectionActionsLocked(false);
+        }
+      };
+      Alert.alert(
+        'Delete timeline day?',
+        `Delete ${section.label} and all activities in it? This cannot be undone.`,
+        [
+          {
+            text: 'Cancel',
+            style: 'cancel',
+            onPress: releasePrompt,
+          },
+          {
+            text: 'Delete',
+            style: 'destructive',
+            onPress: () => {
+              if (deleteStartedRef.current) {
+                return;
+              }
+              deleteStartedRef.current = true;
+              void performDeleteSection(section);
+            },
+          },
+        ],
+        {
+          cancelable: true,
+          onDismiss: releasePrompt,
+        },
+      );
+    },
+    [performDeleteSection],
+  );
 
   const renderItem = useCallback(
     ({
@@ -166,9 +293,21 @@ function TimelineContent({ tripId }: TimelineContentProps) {
 
   const renderSectionHeader = useCallback(
     ({ section }: { section: TimelineListSection }) => (
-      <SectionGroup section={section.section} />
+      <SectionGroup
+        section={section.section}
+        canEdit={timeline?.permissions.can_edit_timeline === true}
+        canDelete={timeline?.permissions.can_edit_timeline === true}
+        actionsDisabled={sectionActionsLocked}
+        onEdit={openEditSection}
+        onDelete={confirmDeleteSection}
+      />
     ),
-    [],
+    [
+      confirmDeleteSection,
+      openEditSection,
+      sectionActionsLocked,
+      timeline?.permissions.can_edit_timeline,
+    ],
   );
 
   if (status === 'loading') {
@@ -231,25 +370,51 @@ function TimelineContent({ tripId }: TimelineContentProps) {
           />
         }
         ListHeaderComponent={
-          error ? (
-            <View accessibilityRole="alert" style={styles.inlineError}>
-              <Ionicons
-                name="alert-circle-outline"
-                size={20}
-                color={colors.danger}
-              />
-              <Text style={styles.inlineErrorText}>{error.message}</Text>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Retry refreshing timeline"
-                onPress={retryBackgroundLoad}
-                style={({ pressed }) => [
-                  styles.retryButton,
-                  pressed ? styles.pressed : null,
-                ]}
-              >
-                <Text style={styles.retryText}>Retry</Text>
-              </Pressable>
+          error || mutationError || deletingSectionId ? (
+            <View>
+              {error ? (
+                <View accessibilityRole="alert" style={styles.inlineError}>
+                  <Ionicons
+                    name="alert-circle-outline"
+                    size={20}
+                    color={colors.danger}
+                  />
+                  <Text style={styles.inlineErrorText}>{error.message}</Text>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Retry refreshing timeline"
+                    onPress={retryBackgroundLoad}
+                    style={({ pressed }) => [
+                      styles.retryButton,
+                      pressed ? styles.pressed : null,
+                    ]}
+                  >
+                    <Text style={styles.retryText}>Retry</Text>
+                  </Pressable>
+                </View>
+              ) : null}
+              {mutationError ? (
+                <View accessibilityRole="alert" style={styles.inlineError}>
+                  <Ionicons
+                    name="alert-circle-outline"
+                    size={20}
+                    color={colors.danger}
+                  />
+                  <Text style={styles.inlineErrorText}>{mutationError}</Text>
+                </View>
+              ) : null}
+              {deletingSectionId ? (
+                <View
+                  accessibilityRole="progressbar"
+                  accessibilityLabel="Deleting timeline day"
+                  style={styles.mutationProgress}
+                >
+                  <ActivityIndicator color={colors.primary} />
+                  <Text style={styles.mutationProgressText}>
+                    Deleting timeline day…
+                  </Text>
+                </View>
+              ) : null}
             </View>
           ) : null
         }
@@ -271,6 +436,17 @@ function TimelineContent({ tripId }: TimelineContentProps) {
             ) : null}
           </View>
         }
+        ListFooterComponent={
+          sections.length > 0 && canCreateSections ? (
+            <View style={styles.footerAction}>
+              <Button
+                title="Add day"
+                disabled={sectionActionsLocked}
+                onPress={openCreateDay}
+              />
+            </View>
+          ) : null
+        }
       />
     </SafeAreaView>
   );
@@ -289,7 +465,7 @@ export function TimelineScreen() {
     );
   }
 
-  return <TimelineContent tripId={intent.tripId} />;
+  return <TimelineContent key={intent.tripId} tripId={intent.tripId} />;
 }
 
 const styles = StyleSheet.create({
@@ -354,6 +530,24 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: spacing.md,
     padding: spacing.lg,
+  },
+  mutationProgress: {
+    minHeight: 56,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    marginHorizontal: spacing.md,
+    marginBottom: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radii.md,
+    backgroundColor: colors.background,
+  },
+  mutationProgressText: { ...typography.caption, color: colors.textMuted },
+  footerAction: {
+    paddingHorizontal: spacing.md,
+    paddingTop: spacing.sm,
   },
   pressed: { opacity: 0.55 },
 });

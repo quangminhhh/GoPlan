@@ -1,6 +1,8 @@
 let mockParams: Record<string, string | string[] | undefined> = {};
 const mockRouter = { push: jest.fn() };
 const mockUseTimeline = jest.fn();
+const mockDeleteSection = jest.fn();
+const mockPublishTimelineEvent = jest.fn();
 
 jest.mock('expo-router', () => ({
   Stack: { Screen: () => null },
@@ -12,16 +14,26 @@ jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
 jest.mock('../hooks/useTimeline', () => ({
   useTimeline: (...args: unknown[]) => mockUseTimeline(...args),
 }));
+jest.mock('../api', () => ({
+  deleteSection: (...args: unknown[]) => mockDeleteSection(...args),
+}));
+jest.mock('../timelineEvents', () => ({
+  publishTimelineEvent: (...args: unknown[]) =>
+    mockPublishTimelineEvent(...args),
+}));
 
 // eslint-disable-next-line import/first
-import { SectionList } from 'react-native';
+import { Alert, SectionList } from 'react-native';
 // eslint-disable-next-line import/first
 import {
+  act,
   fireEvent,
   render,
   screen,
   waitFor,
 } from '@testing-library/react-native';
+// eslint-disable-next-line import/first
+import { AxiosError } from 'axios';
 // eslint-disable-next-line import/first
 import { TimelineScreen } from '../screens/TimelineScreen';
 // eslint-disable-next-line import/first
@@ -134,18 +146,25 @@ function hookState({
 
 describe('TimelineScreen', () => {
   let scrollSpy: jest.SpyInstance;
+  let alertSpy: jest.SpyInstance;
 
   beforeEach(() => {
     jest.clearAllMocks();
     mockParams = { tripId: TRIP_ID };
     mockUseTimeline.mockReturnValue(hookState());
+    mockDeleteSection.mockResolvedValue(undefined);
+    mockPublishTimelineEvent.mockResolvedValue(undefined);
     scrollSpy = jest
       .spyOn(SectionList.prototype, 'scrollToLocation')
+      .mockImplementation(() => undefined);
+    alertSpy = jest
+      .spyOn(Alert, 'alert')
       .mockImplementation(() => undefined);
   });
 
   afterEach(() => {
     scrollSpy.mockRestore();
+    alertSpy.mockRestore();
   });
 
   it('renders the first-load spinner without mounting ready content', async () => {
@@ -230,6 +249,163 @@ describe('TimelineScreen', () => {
 
     expect(screen.getByText('No days yet')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Add day' })).toBeNull();
+  });
+
+  it('wires section controls and the non-empty add-day action from aggregate permissions', async () => {
+    mockUseTimeline.mockReturnValue(
+      hookState({
+        timeline: buildTimeline({
+          permissions: {
+            can_edit_timeline: true,
+            can_manage_custom_types: false,
+            can_create_sections: true,
+          },
+          sections: [buildSection({ label: 'Arrival' })],
+        }),
+      }),
+    );
+    await render(<TimelineScreen />);
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Edit Arrival' }),
+    );
+    expect(mockRouter.push).toHaveBeenCalledWith(
+      `/trips/${TRIP_ID}/timeline/section-form?mode=edit&sectionId=section-1`,
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Add day' }));
+    expect(mockRouter.push).toHaveBeenLastCalledWith(
+      `/trips/${TRIP_ID}/timeline/section-form?mode=create`,
+    );
+  });
+
+  it('cancels section deletion without calling the API', async () => {
+    mockUseTimeline.mockReturnValue(
+      hookState({
+        timeline: buildTimeline({
+          permissions: {
+            can_edit_timeline: true,
+            can_manage_custom_types: false,
+            can_create_sections: false,
+          },
+          sections: [buildSection({ label: 'Arrival' })],
+        }),
+      }),
+    );
+    await render(<TimelineScreen />);
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Delete Arrival' }),
+    );
+    expect(alertSpy).toHaveBeenCalledWith(
+      'Delete timeline day?',
+      'Delete Arrival and all activities in it? This cannot be undone.',
+      expect.any(Array),
+      expect.objectContaining({ cancelable: true }),
+    );
+    const buttons = alertSpy.mock.calls[0]?.[2] as
+      | { text?: string; onPress?: () => void }[]
+      | undefined;
+    await act(async () => {
+      buttons?.find((button) => button.text === 'Cancel')?.onPress?.();
+    });
+
+    expect(mockDeleteSection).not.toHaveBeenCalled();
+  });
+
+  it('invalidates, deletes, publishes, and keeps a ref lock across duplicate confirmation', async () => {
+    let resolveDelete: (() => void) | undefined;
+    mockDeleteSection.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveDelete = resolve;
+        }),
+    );
+    const state = hookState({
+      timeline: buildTimeline({
+        permissions: {
+          can_edit_timeline: true,
+          can_manage_custom_types: false,
+          can_create_sections: false,
+        },
+        sections: [buildSection({ label: 'Arrival' })],
+      }),
+    });
+    mockUseTimeline.mockReturnValue(state);
+    await render(<TimelineScreen />);
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Delete Arrival' }),
+    );
+    const buttons = alertSpy.mock.calls[0]?.[2] as
+      | { text?: string; onPress?: () => void }[]
+      | undefined;
+    const confirm = buttons?.find((button) => button.text === 'Delete');
+    await act(async () => {
+      confirm?.onPress?.();
+      confirm?.onPress?.();
+    });
+
+    expect(state.invalidate).toHaveBeenCalledTimes(1);
+    expect(mockDeleteSection).toHaveBeenCalledTimes(1);
+    expect(mockDeleteSection).toHaveBeenCalledWith(TRIP_ID, 'section-1');
+
+    await act(async () => {
+      resolveDelete?.();
+    });
+    await waitFor(() =>
+      expect(mockPublishTimelineEvent).toHaveBeenCalledWith({
+        type: 'timelineChanged',
+        tripId: TRIP_ID,
+      }),
+    );
+  });
+
+  it('shows a verbatim conflict and silently reconciles after delete failure', async () => {
+    const conflict = new AxiosError(
+      'Conflict',
+      undefined,
+      undefined,
+      undefined,
+      {
+        status: 409,
+        statusText: 'Conflict',
+        headers: {},
+        config: {} as never,
+        data: { detail: 'This timeline day changed on another device.' },
+      },
+    );
+    mockDeleteSection.mockRejectedValue(conflict);
+    const state = hookState({
+      timeline: buildTimeline({
+        permissions: {
+          can_edit_timeline: true,
+          can_manage_custom_types: false,
+          can_create_sections: false,
+        },
+        sections: [buildSection({ label: 'Arrival' })],
+      }),
+    });
+    mockUseTimeline.mockReturnValue(state);
+    await render(<TimelineScreen />);
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Delete Arrival' }),
+    );
+    const buttons = alertSpy.mock.calls[0]?.[2] as
+      | { text?: string; onPress?: () => void }[]
+      | undefined;
+    await act(async () => {
+      buttons?.find((button) => button.text === 'Delete')?.onPress?.();
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByText('This timeline day changed on another device.'),
+      ).toBeTruthy(),
+    );
+    expect(state.refresh).toHaveBeenCalledWith('silent');
+    expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
   });
 
   it('keeps rows visible with an inline error and retries silently', async () => {

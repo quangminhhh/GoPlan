@@ -285,4 +285,28 @@ describe('SectionGroup', () => {
       expect.objectContaining({ id: 'section-1' }),
     );
   });
+
+  it('disables all visible section actions while a mutation is locked', async () => {
+    const onEdit = jest.fn();
+    const onDelete = jest.fn();
+    await render(
+      <SectionGroup
+        section={buildSection()}
+        canEdit
+        canDelete
+        actionsDisabled
+        onEdit={onEdit}
+        onDelete={onDelete}
+      />,
+    );
+
+    const edit = screen.getByRole('button', { name: 'Edit Arrival' });
+    const remove = screen.getByRole('button', { name: 'Delete Arrival' });
+    expect(edit.props.accessibilityState).toEqual({ disabled: true });
+    expect(remove.props.accessibilityState).toEqual({ disabled: true });
+    await fireEvent.press(edit);
+    await fireEvent.press(remove);
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(onDelete).not.toHaveBeenCalled();
+  });
 });

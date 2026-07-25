@@ -5,7 +5,7 @@ import {
 } from '../timelineEvents';
 
 describe('timeline events', () => {
-  it('publishes only to listeners keyed to the changed trip', () => {
+  it('publishes only to listeners keyed to the changed trip', async () => {
     const tripOneListener = jest.fn();
     const tripTwoListener = jest.fn();
     const unsubscribeTripOne = subscribeToTimelineEvents(
@@ -21,7 +21,7 @@ describe('timeline events', () => {
       tripId: 'trip-1',
     };
 
-    publishTimelineEvent(event);
+    await publishTimelineEvent(event);
 
     expect(tripOneListener).toHaveBeenCalledTimes(1);
     expect(tripOneListener).toHaveBeenCalledWith(event);
@@ -31,7 +31,7 @@ describe('timeline events', () => {
     unsubscribeTripTwo();
   });
 
-  it('notifies every listener for one trip and stops after unsubscribe', () => {
+  it('notifies every listener for one trip and stops after unsubscribe', async () => {
     const firstListener = jest.fn();
     const secondListener = jest.fn();
     const unsubscribeFirst = subscribeToTimelineEvents(
@@ -47,14 +47,40 @@ describe('timeline events', () => {
       tripId: 'trip-1',
     };
 
-    publishTimelineEvent(event);
+    await publishTimelineEvent(event);
     unsubscribeFirst();
-    publishTimelineEvent(event);
+    await publishTimelineEvent(event);
     unsubscribeFirst();
     unsubscribeSecond();
-    publishTimelineEvent(event);
+    await publishTimelineEvent(event);
 
     expect(firstListener).toHaveBeenCalledTimes(1);
     expect(secondListener).toHaveBeenCalledTimes(2);
+  });
+
+  it('waits for asynchronous listeners before resolving', async () => {
+    let resolveListener: () => void = () => undefined;
+    const listener = jest.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveListener = resolve;
+        }),
+    );
+    const unsubscribe = subscribeToTimelineEvents('trip-1', listener);
+    let settled = false;
+
+    const published = publishTimelineEvent({
+      type: 'timelineChanged',
+      tripId: 'trip-1',
+    }).then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    resolveListener();
+    await published;
+    expect(settled).toBe(true);
+    unsubscribe();
   });
 });

@@ -137,9 +137,7 @@ export function useTimeline(
       return undefined;
     }
 
-    return subscribeToTimelineEvents(tripId, () => {
-      void refresh('silent');
-    });
+    return subscribeToTimelineEvents(tripId, () => refresh('silent'));
   }, [autoReconcile, refresh, tripId]);
 
   const reconcileOnForeground = useCallback(() => {
