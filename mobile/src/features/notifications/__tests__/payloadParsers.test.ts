@@ -74,4 +74,23 @@ describe('notification payload parsers', () => {
     expect(getTripTarget(pending)).toBeNull();
     expect(getTripTarget(accepted)).toBe('trip-1');
   });
+
+  it.each([
+    ['an empty location', { location_label: '' }],
+    ['an omitted location', {}],
+  ])('keeps a timeline reminder with %s actionable', (_label, locationFields) => {
+    const parsed = parseNotificationPayload('TRIP_TIMELINE_REMINDER', {
+      trip_id: 'trip-1',
+      trip_name: 'Da Lat escape',
+      activity_id: 'activity-1',
+      activity_title: 'Cable car',
+      section_label: 'Day 1',
+      activity_date: '2026-08-01',
+      activity_time: '09:00',
+      ...locationFields,
+    });
+
+    expect(parsed.kind).toBe('tripTimelineReminder');
+    expect(getTripTarget(parsed)).toBe('trip-1');
+  });
 });

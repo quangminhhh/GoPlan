@@ -241,7 +241,11 @@ function ValidCustomTypeManagerScreen({ tripId }: { tripId: string }) {
 
   const close = useCallback(() => {
     if (!mutationLockRef.current) {
-      router.dismissTo(parentHref);
+      if (router.canGoBack()) {
+        router.back();
+      } else {
+        router.dismissTo(parentHref);
+      }
     }
   }, [parentHref, router]);
 

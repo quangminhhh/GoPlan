@@ -16,6 +16,14 @@ function readString(record: Record<string, unknown>, key: string): string | null
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
+function readOptionalString(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  if (value === undefined) {
+    return '';
+  }
+  return typeof value === 'string' ? value : null;
+}
+
 function isInvitationStatus(value: unknown): value is InvitationStatus {
   return value === 'PENDING' || value === 'ACCEPTED' || value === 'DECLINED' || value === 'CANCELLED';
 }
@@ -74,8 +82,8 @@ function parseTimelineReminderPayload(raw: unknown): TripTimelineReminderPayload
   const sectionLabel = readString(raw, 'section_label');
   const activityDate = readString(raw, 'activity_date');
   const activityTime = readString(raw, 'activity_time');
-  const locationLabel = readString(raw, 'location_label');
-  if (!activityId || !activityTitle || !sectionLabel || !activityDate || !activityTime || !locationLabel) {
+  const locationLabel = readOptionalString(raw, 'location_label');
+  if (!activityId || !activityTitle || !sectionLabel || !activityDate || !activityTime || locationLabel === null) {
     return null;
   }
   return {

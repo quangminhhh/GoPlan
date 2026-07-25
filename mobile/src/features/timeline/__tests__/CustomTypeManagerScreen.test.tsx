@@ -2,7 +2,11 @@ import type { ReactNode } from 'react';
 import { Alert, View } from 'react-native';
 
 let mockParams: Record<string, string | string[] | undefined> = {};
-const mockRouter = { dismissTo: jest.fn() };
+const mockRouter = {
+  back: jest.fn(),
+  canGoBack: jest.fn(),
+  dismissTo: jest.fn(),
+};
 const mockUseFocusEffect = jest.fn();
 const mockUseAppForegroundEffect = jest.fn();
 const mockUseTimeline = jest.fn();
@@ -206,6 +210,7 @@ function destructiveAlertAction() {
 describe('CustomTypeManagerScreen', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockRouter.canGoBack.mockReturnValue(true);
     mockParams = { tripId: TRIP_ID };
     mockTimelineListener = undefined;
     mockLatestStackOptions = undefined;
@@ -263,6 +268,31 @@ describe('CustomTypeManagerScreen', () => {
     expect(
       screen.queryByTestId('custom-type-manager-list'),
     ).toBeNull();
+  });
+
+  it('closes back to the calling activity form when navigation history exists', async () => {
+    await render(<CustomTypeManagerScreen />);
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Close custom types' }),
+    );
+
+    expect(mockRouter.back).toHaveBeenCalledTimes(1);
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the Timeline route when opened without navigation history', async () => {
+    mockRouter.canGoBack.mockReturnValue(false);
+    await render(<CustomTypeManagerScreen />);
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Close custom types' }),
+    );
+
+    expect(mockRouter.back).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith(
+      `/trips/${TRIP_ID}/timeline`,
+    );
   });
 
   it('keeps active, inactive, and unknown-token types visible and manageable', async () => {
