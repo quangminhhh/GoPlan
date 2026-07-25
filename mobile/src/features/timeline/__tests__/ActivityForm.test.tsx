@@ -315,6 +315,47 @@ describe('ActivityForm', () => {
     );
   });
 
+  it('commits a settled lookup fallback as manual text without retaining a place', async () => {
+    const onDraftChange = jest.fn();
+    await renderForm({
+      draft: validDraft({
+        location_mode: 'STRUCTURED',
+        location_label: 'Old verified place',
+        place: {
+          provider: 'here',
+          provider_id: 'canonical-id',
+          title: 'Old verified place',
+          address: 'Da Nang',
+          lat: 16,
+          lng: 108,
+        },
+      }),
+      onDraftChange,
+      renderStructuredLocationEditor: ({ onUseManual }) => (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Use failed lookup fallback"
+          onPress={() => onUseManual('Unverified suggestion')}
+        >
+          <Text>Use failed lookup fallback</Text>
+        </Pressable>
+      ),
+    }).view;
+
+    await fireEvent.press(
+      screen.getByLabelText('Use failed lookup fallback'),
+    );
+
+    expect(onDraftChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        location_mode: 'MANUAL',
+        location_label: 'Unverified suggestion',
+        place: null,
+      }),
+      ['location_mode', 'location_label', 'place'],
+    );
+  });
+
   it('renders location_label and every nested place error inline', async () => {
     await renderForm({
       draft: validDraft({

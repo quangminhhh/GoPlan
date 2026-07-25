@@ -50,10 +50,11 @@ const TIME_MODE_OPTIONS: readonly {
 
 export interface StructuredLocationEditorProps {
   value: StructuredLocationValue | null;
+  locationLabel: string;
   disabled: boolean;
   fieldErrors: Readonly<Record<string, string>>;
   onChange: (value: StructuredLocationValue) => void;
-  onUseManual: () => void;
+  onUseManual: (locationLabel?: string) => void;
 }
 
 interface ActivityFormProps {
@@ -320,12 +321,21 @@ export function ActivityForm({
     [draft, onDraftChange],
   );
 
-  const useManualLocation = useCallback(() => {
-    onDraftChange(applyActivityLocationMode(draft, 'MANUAL'), [
-      'location_mode',
-      'place',
-    ]);
-  }, [draft, onDraftChange]);
+  const useManualLocation = useCallback(
+    (locationLabel?: string) => {
+      const nextDraft = applyActivityLocationMode(draft, 'MANUAL');
+      if (locationLabel !== undefined) {
+        nextDraft.location_label = locationLabel;
+      }
+      onDraftChange(
+        nextDraft,
+        locationLabel === undefined
+          ? ['location_mode', 'place']
+          : ['location_mode', 'location_label', 'place'],
+      );
+    },
+    [draft, onDraftChange],
+  );
 
   const commitStructuredLocation = useCallback(
     (value: StructuredLocationValue) => {
@@ -388,6 +398,7 @@ export function ActivityForm({
 
   const structuredEditorProps: StructuredLocationEditorProps = {
     value: structuredValue,
+    locationLabel: draft.location_label,
     disabled,
     fieldErrors: fieldErrors as Readonly<Record<string, string>>,
     onChange: commitStructuredLocation,
@@ -594,9 +605,11 @@ export function ActivityForm({
               <InlineError message={fieldErrors.location_label} />
             ) : null}
 
-            {placeErrors.map((message) => (
-              <InlineError key={message} message={message} />
-            ))}
+            {!renderStructuredLocationEditor
+              ? placeErrors.map((message) => (
+                  <InlineError key={message} message={message} />
+                ))
+              : null}
 
             <TextField
               label="Location note"
@@ -759,7 +772,7 @@ function DefaultStructuredLocation({
         accessibilityLabel="Use manual location"
         accessibilityState={{ disabled }}
         disabled={disabled}
-        onPress={onUseManual}
+        onPress={() => onUseManual()}
         style={({ pressed }) => [
           styles.manualAction,
           disabled ? styles.disabled : null,

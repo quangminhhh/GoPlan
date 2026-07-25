@@ -1,6 +1,7 @@
 import type { ComponentProps, ReactNode } from 'react';
 import { View } from 'react-native';
 import type { ActivityForm } from '../components/ActivityForm';
+import type { PlacePicker } from '../components/PlacePicker';
 
 let mockParams: Record<string, string | string[] | undefined> = {};
 const mockRouter = {
@@ -18,6 +19,7 @@ const mockPublishTimelineEvent = jest.fn();
 const mockSubscribeToTimelineEvents = jest.fn();
 const mockSubscribeToTripEvents = jest.fn();
 let mockActivityFormProps: unknown;
+let mockPlacePickerProps: unknown;
 let mockTimelineListener:
   | ((event: { type: 'timelineChanged'; tripId: string }) =>
       void | Promise<void>)
@@ -53,6 +55,11 @@ function mockRenderActivityForm(props: unknown) {
   return <View testID="mock-activity-form" />;
 }
 
+function mockRenderPlacePicker(props: unknown) {
+  mockPlacePickerProps = props;
+  return <View testID="mock-place-picker" />;
+}
+
 jest.mock('expo-router', () => ({
   Stack: { Screen: mockRenderStackScreen },
   useFocusEffect: (effect: () => (() => void) | void) =>
@@ -74,6 +81,9 @@ jest.mock('@/features/trips/hooks/useTripDetail', () => ({
 }));
 jest.mock('../components/ActivityForm', () => ({
   ActivityForm: mockRenderActivityForm,
+}));
+jest.mock('../components/PlacePicker', () => ({
+  PlacePicker: mockRenderPlacePicker,
 }));
 jest.mock('../api', () => ({
   createActivity: jest.fn(),
@@ -324,6 +334,13 @@ function currentFormProps(): ComponentProps<typeof ActivityForm> {
   return mockActivityFormProps as ComponentProps<typeof ActivityForm>;
 }
 
+function currentPlacePickerProps(): ComponentProps<typeof PlacePicker> {
+  if (!mockPlacePickerProps) {
+    throw new Error('Expected PlacePicker to be rendered.');
+  }
+  return mockPlacePickerProps as ComponentProps<typeof PlacePicker>;
+}
+
 function latestFocusCallback(): () => (() => void) | void {
   const callback = mockUseFocusEffect.mock.calls.at(-1)?.[0] as
     | (() => (() => void) | void)
@@ -365,6 +382,7 @@ describe('ActivityFormScreen', () => {
       activityId: ACTIVITY_ID,
     };
     mockActivityFormProps = undefined;
+    mockPlacePickerProps = undefined;
     mockTimelineListener = undefined;
     mockTripListener = undefined;
     mockLatestStackOptions = undefined;
@@ -427,6 +445,64 @@ describe('ActivityFormScreen', () => {
     expect(mockUseTripDetail).not.toHaveBeenCalled();
     expect(mockCreateActivity).not.toHaveBeenCalled();
     expect(mockPatchActivity).not.toHaveBeenCalled();
+  });
+
+  it('bridges canonical and failed lookups into the ActivityForm draft contract', async () => {
+    await render(<ActivityFormScreen />);
+    const editor = currentFormProps().renderStructuredLocationEditor;
+    const onChange = jest.fn();
+    const onUseManual = jest.fn();
+
+    await render(
+      <View>
+        {editor?.({
+          value: null,
+          locationLabel: 'Existing manual label',
+          disabled: false,
+          fieldErrors: {
+            'place.provider_id': 'Provider id is invalid.',
+          },
+          onChange,
+          onUseManual,
+        })}
+      </View>,
+    );
+
+    const picker = currentPlacePickerProps();
+    expect(picker.value).toEqual({
+      location_label: 'Existing manual label',
+      place: null,
+    });
+    expect(picker.error).toBe('Provider id is invalid.');
+
+    picker.onSelectLocation({
+      location_mode: 'STRUCTURED',
+      location_label: 'Canonical place',
+      place: {
+        provider: 'here',
+        provider_id: 'canonical-id',
+        title: 'Canonical place',
+        address: 'Da Nang',
+        lat: 16,
+        lng: 108,
+      },
+    });
+    expect(onChange).toHaveBeenCalledWith({
+      location_label: 'Canonical place',
+      place: expect.objectContaining({ provider_id: 'canonical-id' }),
+    });
+
+    picker.onLookupFailure({
+      location_mode: 'MANUAL',
+      location_label: 'Unverified suggestion',
+      place: null,
+      error: {
+        kind: 'network',
+        message: 'Cannot reach the server.',
+      },
+      guidance: 'Enter the location manually.',
+    });
+    expect(onUseManual).toHaveBeenCalledWith('Unverified suggestion');
   });
 
   it.each(['timeline-first', 'trip-first'] as const)(

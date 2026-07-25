@@ -26,7 +26,11 @@ import { colors, spacing, typography } from '@/shared/theme/tokens';
 import { Button } from '@/shared/ui/Button';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 import { createActivity, patchActivity } from '../api';
-import { ActivityForm } from '../components/ActivityForm';
+import {
+  ActivityForm,
+  type StructuredLocationEditorProps,
+} from '../components/ActivityForm';
+import { PlacePicker } from '../components/PlacePicker';
 import {
   buildCreateActivityPayload,
   buildPatchActivityPayload,
@@ -87,6 +91,50 @@ interface HydratedActivityFormProps {
   isActiveGeneration: (generation: number) => boolean;
   getGeneration: () => number;
   onCancel: () => void;
+}
+
+function getPlaceEditorError(
+  fieldErrors: Readonly<Record<string, string>>,
+): string | undefined {
+  const messages = new Set<string>();
+  for (const [field, message] of Object.entries(fieldErrors)) {
+    if ((field === 'place' || field.startsWith('place.')) && message) {
+      messages.add(message);
+    }
+  }
+  return messages.size > 0 ? [...messages].join(' ') : undefined;
+}
+
+function renderStructuredLocationEditor({
+  value,
+  locationLabel,
+  disabled,
+  fieldErrors,
+  onChange,
+  onUseManual,
+}: StructuredLocationEditorProps) {
+  return (
+    <PlacePicker
+      value={{
+        location_label: locationLabel,
+        place: value?.place ?? null,
+      }}
+      disabled={disabled}
+      error={getPlaceEditorError(fieldErrors)}
+      onSelectLocation={(selection) =>
+        onChange({
+          location_label: selection.location_label,
+          place: selection.place,
+        })
+      }
+      onUseManualEntry={(manual) =>
+        onUseManual(manual.location_label)
+      }
+      onLookupFailure={(failure) =>
+        onUseManual(failure.location_label)
+      }
+    />
+  );
 }
 
 function HeaderCancelAction({
@@ -405,6 +453,7 @@ function HydratedActivityForm({
         onRefresh={pullToRefresh}
         onRetryBackground={retryBackground}
         onManageCustomTypes={manageCustomTypes}
+        renderStructuredLocationEditor={renderStructuredLocationEditor}
       />
     </>
   );
