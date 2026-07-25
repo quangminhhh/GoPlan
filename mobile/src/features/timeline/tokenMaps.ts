@@ -18,6 +18,7 @@ export const TIMELINE_COLOR_TOKENS = [
 ] as const;
 
 export type TimelineColorToken = (typeof TIMELINE_COLOR_TOKENS)[number];
+export const DEFAULT_TIMELINE_COLOR_TOKEN: TimelineColorToken = 'slate';
 
 export interface TimelineTokenColors {
   color: string;
@@ -45,7 +46,13 @@ export function getTimelineTokenColors(value: string | null | undefined): Timeli
   if (value && hasOwn(COLOR_MAP, value)) {
     return COLOR_MAP[value];
   }
-  return COLOR_MAP.slate;
+  return COLOR_MAP[DEFAULT_TIMELINE_COLOR_TOKEN];
+}
+
+export function isTimelineColorToken(
+  value: string,
+): value is TimelineColorToken {
+  return hasOwn(COLOR_MAP, value);
 }
 
 export const TIMELINE_ICON_KEYS = [
@@ -61,6 +68,7 @@ export const TIMELINE_ICON_KEYS = [
 
 export type TimelineIconKey = (typeof TIMELINE_ICON_KEYS)[number];
 export type TimelineIconName = ComponentProps<typeof Ionicons>['name'];
+export const DEFAULT_TIMELINE_ICON_KEY: TimelineIconKey = 'tag';
 
 const ICON_MAP: Record<TimelineIconKey, TimelineIconName> = {
   bus: 'bus-outline',
@@ -94,5 +102,11 @@ export function getTimelineIconName(value: string | null | undefined): TimelineI
   if (value && hasOwn(ICON_MAP, value)) {
     return ICON_MAP[value];
   }
-  return ICON_MAP.tag;
+  return ICON_MAP[DEFAULT_TIMELINE_ICON_KEY];
+}
+
+export function isTimelineIconKey(
+  value: string,
+): value is TimelineIconKey {
+  return hasOwn(ICON_MAP, value);
 }
