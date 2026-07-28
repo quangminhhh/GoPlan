@@ -31,7 +31,9 @@ export interface TripDestinationFields {
  *
  * The rebuilt place is display-only: it drives the "Selected place" card and the
  * initial label, and never reaches a payload unless the user re-picks. A stored
- * trip has no separate address, so that field stays empty.
+ * trip has no separate address, so that field stays empty, and `provider` is the
+ * only value ResolvedPlace admits — a row written by an older provider still
+ * renders correctly, and re-picking replaces the whole place from a fresh lookup.
  */
 export function destinationValueFromTrip(trip: Trip): TripDestinationValue {
   if (trip.destination_provider_id === '') {

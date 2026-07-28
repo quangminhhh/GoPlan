@@ -4,6 +4,18 @@ const mockParams = { tripId: 'trip-123' };
 const mockRouter = { dismissTo: jest.fn() };
 const mockUseTripDetail = jest.fn();
 const mockPublishTripEvent = jest.fn();
+let mockPlacePickerProps: unknown;
+
+function mockRenderPlacePicker(props: unknown) {
+  mockPlacePickerProps = props;
+  return null;
+}
+
+// The picker's own debounce/abort/HTTP behaviour is proven in
+// src/shared/location; this suite is about what the PATCH carries.
+jest.mock('@/shared/location/PlacePicker', () => ({
+  PlacePicker: mockRenderPlacePicker,
+}));
 
 jest.mock('expo-router', () => ({
   Stack: { Screen: () => null },
@@ -35,9 +47,15 @@ function MockDateField({ label, onChange, error }: MockDateFieldProps) {
 jest.mock('@/shared/ui/DateField', () => ({ DateField: MockDateField }));
 
 // eslint-disable-next-line import/first
+import type { ComponentProps } from 'react';
+// eslint-disable-next-line import/first
 import { AxiosError, AxiosHeaders } from 'axios';
 // eslint-disable-next-line import/first
-import { fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+// eslint-disable-next-line import/first
+import type { PlacePicker } from '@/shared/location/PlacePicker';
+// eslint-disable-next-line import/first
+import type { ResolvedPlace } from '@/shared/location/types';
 // eslint-disable-next-line import/first
 import { updateTrip } from '../api';
 // eslint-disable-next-line import/first
@@ -95,14 +113,41 @@ function readyHook(nextDetail: TripDetailResponse = detail) {
   };
 }
 
+const DESTINATION_KEYS = [
+  'destination',
+  'destination_provider',
+  'destination_provider_id',
+  'destination_lat',
+  'destination_lng',
+  'destination_country_code',
+] as const;
+
+const verifiedPlace: ResolvedPlace = {
+  provider: 'here',
+  provider_id: 'canonical-here-id',
+  label: 'Hội An, Quảng Nam',
+  address: 'Hội An, Quảng Nam, Việt Nam',
+  lat: 15.8801,
+  lng: 108.338,
+  country_code: 'VN',
+};
+
 async function save(): Promise<void> {
   await fireEvent.press(screen.getByText('Save changes'));
+}
+
+function currentPickerProps(): ComponentProps<typeof PlacePicker> {
+  if (!mockPlacePickerProps) {
+    throw new Error('Expected PlacePicker to be rendered.');
+  }
+  return mockPlacePickerProps as ComponentProps<typeof PlacePicker>;
 }
 
 describe('EditTripScreen', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockParams.tripId = 'trip-123';
+    mockPlacePickerProps = undefined;
     mockUseTripDetail.mockReturnValue(readyHook());
   });
 
@@ -139,13 +184,64 @@ describe('EditTripScreen', () => {
     expect(mockRouter.dismissTo).toHaveBeenCalledWith('/trips/trip-123');
   });
 
+  it('keeps the stored destination when only the name changes', async () => {
+    mockUpdateTrip.mockResolvedValue(detail.trip);
+    await render(<EditTripScreen />);
+    await fireEvent.changeText(screen.getByLabelText('Trip name'), 'Renamed trip');
+    await save();
+
+    await waitFor(() => expect(mockUpdateTrip).toHaveBeenCalled());
+    const payload = mockUpdateTrip.mock.calls[0]?.[1];
+    expect(payload).toMatchObject({ name: 'Renamed trip' });
+    // A PATCH that mentions no destination key cannot clear the stored
+    // coordinates the web client also writes.
+    for (const key of DESTINATION_KEYS) {
+      expect(payload).not.toHaveProperty(key);
+    }
+  });
+
   it('does not clear destination metadata when the destination is unchanged', async () => {
     mockUpdateTrip.mockResolvedValue(detail.trip);
     await render(<EditTripScreen />);
     await save();
 
     await waitFor(() => expect(mockUpdateTrip).toHaveBeenCalled());
-    expect(mockUpdateTrip.mock.calls[0]?.[1]).not.toHaveProperty('destination_provider');
+    const payload = mockUpdateTrip.mock.calls[0]?.[1];
+    for (const key of DESTINATION_KEYS) {
+      expect(payload).not.toHaveProperty(key);
+    }
+  });
+
+  it('writes all six destination keys after re-picking a place', async () => {
+    mockUpdateTrip.mockResolvedValue(detail.trip);
+    await render(<EditTripScreen />);
+    await act(async () => {
+      currentPickerProps().onSelectPlace(verifiedPlace);
+    });
+    await save();
+
+    await waitFor(() =>
+      expect(mockUpdateTrip).toHaveBeenCalledWith(
+        'trip-123',
+        expect.objectContaining({
+          destination: 'Hội An, Quảng Nam',
+          destination_provider: 'here',
+          destination_provider_id: 'canonical-here-id',
+          destination_lat: 15.8801,
+          destination_lng: 108.338,
+          destination_country_code: 'VN',
+        }),
+      ),
+    );
+  });
+
+  it('hydrates the picker from the stored structured destination', async () => {
+    await render(<EditTripScreen />);
+
+    expect(currentPickerProps().value).toEqual({
+      label: 'Da Lat, Vietnam',
+      place: { title: 'Da Lat, Vietnam', address: '' },
+    });
   });
 
   it('blocks duplicate submission while the PATCH is pending', async () => {

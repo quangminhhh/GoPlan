@@ -12,7 +12,13 @@ import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 import { Screen } from '@/shared/ui/Screen';
 import { TextField } from '@/shared/ui/TextField';
 import { updateTrip } from '../api';
+import { DestinationField } from '../components/DestinationField';
 import { formatDateParam, parseDateOnly } from '../dates';
+import {
+  destinationFields,
+  destinationValueFromTrip,
+  type TripDestinationValue,
+} from '../destination';
 import { useTripDetail } from '../hooks/useTripDetail';
 import { getTimezoneOptions, TRIP_CURRENCY_CODES } from '../options';
 import { publishTripEvent } from '../tripEvents';
@@ -46,7 +52,10 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
   const router = useRouter();
   const original = detail.trip;
   const [name, setName] = useState(original.name);
-  const [destination, setDestination] = useState(original.destination);
+  const [destination, setDestination] = useState<TripDestinationValue>(() =>
+    destinationValueFromTrip(original),
+  );
+  const [destinationTouched, setDestinationTouched] = useState(false);
   const [startDate, setStartDate] = useState(() => parseDateOnly(original.start_date));
   const [endDate, setEndDate] = useState(() => parseDateOnly(original.end_date));
   const [description, setDescription] = useState(original.description);
@@ -58,7 +67,12 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
   const [submitting, setSubmitting] = useState(false);
   const submitLockRef = useRef(false);
   const timezoneOptions = getTimezoneOptions(original.timezone);
-  const canSubmit = Boolean(name.trim() && destination.trim());
+  const canSubmit = Boolean(name.trim() && destination.label.trim());
+
+  function onDestinationChange(next: TripDestinationValue) {
+    setDestinationTouched(true);
+    setDestination(next);
+  }
 
   function onStartDateChange(date: Date) {
     setStartDate(date);
@@ -82,11 +96,9 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
       return;
     }
 
-    const trimmedDestination = destination.trim();
     const trimmedBudget = budget.trim();
     const input: UpdateTripInput = {
       name: name.trim(),
-      destination: trimmedDestination,
       start_date: start,
       end_date: end,
       description: description.trim(),
@@ -94,12 +106,11 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
       currency_code: currency,
       timezone,
     };
-    if (trimmedDestination !== original.destination) {
-      input.destination_provider = '';
-      input.destination_provider_id = '';
-      input.destination_lat = null;
-      input.destination_lng = null;
-      input.destination_country_code = '';
+    // Destination is omitted entirely unless the user changed it. A PATCH that
+    // never mentions destination cannot clear the stored coordinates, which is
+    // the one failure mode here that produces no error and no visible symptom.
+    if (destinationTouched) {
+      Object.assign(input, destinationFields(destination));
     }
 
     submitLockRef.current = true;
@@ -137,12 +148,9 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
           maxLength={120}
           error={error?.fieldErrors?.name}
         />
-        <TextField
-          label="Destination *"
-          accessibilityLabel="Destination"
+        <DestinationField
           value={destination}
-          onChangeText={setDestination}
-          maxLength={200}
+          onChange={onDestinationChange}
           error={error?.fieldErrors?.destination}
         />
       </FormSection>
