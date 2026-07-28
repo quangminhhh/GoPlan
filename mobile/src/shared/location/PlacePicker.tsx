@@ -10,30 +10,39 @@ import {
 } from 'react-native';
 import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
 import { TextField } from '@/shared/ui/TextField';
+import type { PlaceSuggestion, ResolvedPlace } from './types';
 import {
   MANUAL_LOCATION_GUIDANCE,
   PLACE_SEARCH_UNAVAILABLE_MESSAGE,
-  type ManualLocationValue,
-  type PlacePickerValue,
-  type SettledLocationLookupFailure,
-  type StructuredLocationSelection,
+  type ManualPlaceEntry,
+  type PlaceLookupFailure,
   useLocationSearch,
-} from '../hooks/useLocationSearch';
-import type { LocationSuggestion } from '../types';
+} from './useLocationSearch';
+
+export interface PlacePickerValue {
+  /** The label the form currently holds, whether verified or manual. */
+  label: string;
+  /**
+   * Present only while the form holds a verified place. This is a display
+   * shape, not a ResolvedPlace: the card renders a title and an address and
+   * nothing else, and no caller stores the full place in that shape.
+   */
+  place: { title: string; address: string } | null;
+}
 
 export interface PlacePickerProps {
   value: PlacePickerValue | null;
   disabled?: boolean;
   error?: string;
-  onSelectLocation: (selection: StructuredLocationSelection) => void;
-  onUseManualEntry: (value: ManualLocationValue) => void;
-  onLookupFailure: (failure: SettledLocationLookupFailure) => void;
+  onSelectPlace: (place: ResolvedPlace) => void;
+  onUseManualEntry: (entry: ManualPlaceEntry) => void;
+  onLookupFailure: (failure: PlaceLookupFailure) => void;
 }
 
 interface SuggestionChoiceProps {
-  suggestion: LocationSuggestion;
+  suggestion: PlaceSuggestion;
   disabled: boolean;
-  onSelect: (suggestion: LocationSuggestion) => void;
+  onSelect: (suggestion: PlaceSuggestion) => void;
 }
 
 const SuggestionChoice = memo(function SuggestionChoice({
@@ -75,7 +84,7 @@ export function PlacePicker({
   value,
   disabled = false,
   error,
-  onSelectLocation,
+  onSelectPlace,
   onUseManualEntry,
   onLookupFailure,
 }: PlacePickerProps) {
@@ -96,27 +105,27 @@ export function PlacePicker({
   const lookupPending = lookupStatus === 'loading';
 
   const chooseSuggestion = useCallback(
-    (suggestion: LocationSuggestion) => {
+    (suggestion: PlaceSuggestion) => {
       void selectSuggestion(suggestion).then((result) => {
         if (result.kind === 'success') {
-          onSelectLocation(result.selection);
+          onSelectPlace(result.place);
           clear();
         } else if (result.kind === 'failure') {
           onLookupFailure(result.fallback);
         }
       });
     },
-    [clear, onLookupFailure, onSelectLocation, selectSuggestion],
+    [clear, onLookupFailure, onSelectPlace, selectSuggestion],
   );
 
   const useManualEntry = useCallback(() => {
-    const manualValue = createManualValue(value?.location_label ?? '');
+    const manualValue = createManualValue(value?.label ?? '');
     clear();
     onUseManualEntry(manualValue);
-  }, [clear, createManualValue, onUseManualEntry, value?.location_label]);
+  }, [clear, createManualValue, onUseManualEntry, value?.label]);
 
   const renderSuggestion = useCallback(
-    ({ item }: ListRenderItemInfo<LocationSuggestion>) => (
+    ({ item }: ListRenderItemInfo<PlaceSuggestion>) => (
       <SuggestionChoice
         suggestion={item}
         disabled={disabled || lookupPending}
@@ -134,12 +143,12 @@ export function PlacePicker({
     <View style={styles.wrap}>
       {value?.place ? (
         <View
-          accessibilityLabel={`Selected place ${value.location_label}`}
+          accessibilityLabel={`Selected place ${value.label}`}
           style={styles.selected}
         >
           <Text style={styles.selectedEyebrow}>Selected place</Text>
           <Text style={styles.selectedTitle}>
-            {value.place.title || value.location_label}
+            {value.place.title || value.label}
           </Text>
           {value.place.address ? (
             <Text style={styles.selectedAddress}>{value.place.address}</Text>
@@ -227,7 +236,7 @@ export function PlacePicker({
   );
 }
 
-function suggestionKey(suggestion: LocationSuggestion): string {
+function suggestionKey(suggestion: PlaceSuggestion): string {
   return suggestion.provider_id;
 }
 
