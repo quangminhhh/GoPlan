@@ -127,6 +127,32 @@ export default function TripsLayout() {
         }}
       />
       <Stack.Screen
+        name="[tripId]/expenses/index"
+        options={{
+          title: 'Expenses',
+        }}
+      />
+      <Stack.Screen
+        name="[tripId]/expenses/[expenseId]"
+        options={{
+          title: 'Expense',
+        }}
+      />
+      <Stack.Screen
+        name="[tripId]/expenses/expense-form"
+        options={{
+          title: 'Expense',
+          presentation: 'formSheet',
+          headerLeft: () => (
+            <HeaderAction
+              label="Cancel"
+              accessibilityLabel="Cancel expense form"
+              onPress={leaveTripsRoute}
+            />
+          ),
+        }}
+      />
+      <Stack.Screen
         name="[tripId]/edit"
         options={{
           title: 'Edit Trip',

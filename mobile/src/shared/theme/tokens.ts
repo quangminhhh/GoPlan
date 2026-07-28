@@ -14,6 +14,8 @@ export const colors = {
   border: '#D8DFE8',
   danger: '#C0392B',
   success: '#1E7A45',
+  warning: '#A16207',
+  warningSoft: '#FEF3C7',
   sky: '#0369A1',
   skySoft: '#E0F2FE',
   amber: '#A16207',
