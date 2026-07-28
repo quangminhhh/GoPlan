@@ -3,21 +3,12 @@ import { memo, useMemo } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { resolveMediaUrl } from '@/shared/api/base-url';
 import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
+import { getInitials } from '@/shared/ui/initials';
 
 export interface FriendAvatarProps {
   displayName: string;
   identifyTag: string;
   avatarUrl: string | null;
-}
-
-function getInitials(displayName: string): string {
-  const names = displayName.trim().split(/\s+/).filter(Boolean);
-  if (names.length === 0) {
-    return '?';
-  }
-  const first = Array.from(names[0])[0] ?? '';
-  const last = names.length > 1 ? (Array.from(names[names.length - 1])[0] ?? '') : '';
-  return `${first}${last}`.toLocaleUpperCase();
 }
 
 export const FriendAvatar = memo(function FriendAvatar({
