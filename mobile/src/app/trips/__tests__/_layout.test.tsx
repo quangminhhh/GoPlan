@@ -59,6 +59,30 @@ describe('TripsLayout header actions', () => {
     );
   });
 
+  it('registers Timeline as a push route and its management routes as form sheets', async () => {
+    await render(<TripsLayout />);
+
+    expect(mockRegisterScreen).toHaveBeenCalledWith(
+      '[tripId]/timeline/index',
+      expect.objectContaining({ title: 'Timeline' }),
+    );
+    expect(mockRegisterScreen).toHaveBeenCalledWith(
+      '[tripId]/timeline/section-form',
+      expect.objectContaining({ title: 'Timeline Day', presentation: 'formSheet' }),
+    );
+    expect(mockRegisterScreen).toHaveBeenCalledWith(
+      '[tripId]/timeline/activity-form',
+      expect.objectContaining({ title: 'Activity', presentation: 'formSheet' }),
+    );
+    expect(mockRegisterScreen).toHaveBeenCalledWith(
+      '[tripId]/timeline/custom-types',
+      expect.objectContaining({ title: 'Custom Types', presentation: 'formSheet' }),
+    );
+    expect(screen.getByLabelText('Cancel timeline day form')).toBeTruthy();
+    expect(screen.getByLabelText('Cancel timeline activity form')).toBeTruthy();
+    expect(screen.getByLabelText('Close custom types')).toBeTruthy();
+  });
+
   it('returns to the previous route from the trip detail header when history exists', async () => {
     mockRouter.canGoBack.mockReturnValue(true);
     await render(<TripsLayout />);
@@ -71,6 +95,9 @@ describe('TripsLayout header actions', () => {
     ['Cancel trip creation'],
     ['Cancel trip editing'],
     ['Cancel member invitation'],
+    ['Cancel timeline day form'],
+    ['Cancel timeline activity form'],
+    ['Close custom types'],
   ])('returns to tabs from %s when there is no navigation history', async (label) => {
     mockRouter.canGoBack.mockReturnValue(false);
     await render(<TripsLayout />);

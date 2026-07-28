@@ -78,10 +78,12 @@ function axiosErrorWith(status: number, data: unknown): AxiosError {
 
 function deferred<T>() {
   let resolve: (value: T) => void = () => undefined;
-  const promise = new Promise<T>((nextResolve) => {
+  let reject: (reason?: unknown) => void = () => undefined;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
     resolve = nextResolve;
+    reject = nextReject;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function latestFocusCallback(): () => (() => void) | void {
@@ -106,7 +108,10 @@ describe('useTripDetail', () => {
   });
 
   it('loads on focus then silently refreshes while retaining the detail', async () => {
-    mockGetTripDetail.mockResolvedValue(tripDetail);
+    const silentRefresh = deferred<typeof tripDetail>();
+    mockGetTripDetail
+      .mockResolvedValueOnce(tripDetail)
+      .mockReturnValueOnce(silentRefresh.promise);
     const { result, unmount } = await renderHook(() => useTripDetail('trip-1'));
 
     await act(async () => {
@@ -121,6 +126,166 @@ describe('useTripDetail', () => {
     expect(mockGetTripDetail).toHaveBeenCalledTimes(2);
     expect(result.current.status).toBe('ready');
     expect(result.current.refreshing).toBe(false);
+    await act(async () => {
+      silentRefresh.resolve(tripDetail);
+    });
+    unmount();
+  });
+
+  it('sets refreshing only for an explicit refresh and clears it on completion', async () => {
+    const explicitRefresh = deferred<typeof tripDetail>();
+    mockGetTripDetail
+      .mockResolvedValueOnce(tripDetail)
+      .mockReturnValueOnce(explicitRefresh.promise);
+    const { result, unmount } = await renderHook(() => useTripDetail('trip-1'));
+
+    await act(async () => {
+      latestFocusCallback()();
+    });
+    await waitFor(() => expect(result.current.detail).toEqual(tripDetail));
+
+    await act(async () => {
+      void result.current.refresh('refresh');
+    });
+    expect(result.current.refreshing).toBe(true);
+    expect(result.current.detail).toEqual(tripDetail);
+
+    await act(async () => {
+      explicitRefresh.resolve(tripDetail);
+    });
+    expect(result.current.refreshing).toBe(false);
+    unmount();
+  });
+
+  it('lets a newer silent request own stale refresh completion and spinner cleanup', async () => {
+    const explicitRefresh = deferred<typeof tripDetail>();
+    const silentRefresh = deferred<typeof tripDetail>();
+    mockGetTripDetail
+      .mockResolvedValueOnce(tripDetail)
+      .mockReturnValueOnce(explicitRefresh.promise)
+      .mockReturnValueOnce(silentRefresh.promise);
+    const { result, unmount } = await renderHook(() => useTripDetail('trip-1'));
+
+    await act(async () => {
+      latestFocusCallback()();
+    });
+    await waitFor(() => expect(result.current.detail).toEqual(tripDetail));
+
+    await act(async () => {
+      void result.current.refresh('refresh');
+    });
+    expect(result.current.refreshing).toBe(true);
+
+    await act(async () => {
+      void result.current.refresh('silent');
+    });
+    await act(async () => {
+      explicitRefresh.resolve({
+        ...tripDetail,
+        trip: { ...trip, name: 'Stale refresh' },
+      });
+    });
+    expect(result.current.refreshing).toBe(true);
+    expect(result.current.detail?.trip.name).toBe('Da Lat escape');
+
+    await act(async () => {
+      silentRefresh.resolve({
+        ...tripDetail,
+        trip: { ...trip, name: 'Latest silent result' },
+      });
+    });
+    expect(result.current.refreshing).toBe(false);
+    expect(result.current.detail?.trip.name).toBe('Latest silent result');
+    unmount();
+  });
+
+  it('ignores a stale refresh failure across catch and finally', async () => {
+    const staleRefresh = deferred<typeof tripDetail>();
+    const latestRefresh = deferred<typeof tripDetail>();
+    mockGetTripDetail
+      .mockResolvedValueOnce(tripDetail)
+      .mockReturnValueOnce(staleRefresh.promise)
+      .mockReturnValueOnce(latestRefresh.promise);
+    const { result, unmount } = await renderHook(() => useTripDetail('trip-1'));
+
+    await act(async () => {
+      latestFocusCallback()();
+    });
+    await waitFor(() => expect(result.current.detail).toEqual(tripDetail));
+
+    await act(async () => {
+      void result.current.refresh('refresh');
+      void result.current.refresh('silent');
+    });
+    await act(async () => {
+      staleRefresh.reject(
+        axiosErrorWith(500, { detail: 'Stale refresh failed.' }),
+      );
+    });
+
+    expect(result.current.error).toBeNull();
+    expect(result.current.refreshing).toBe(true);
+
+    await act(async () => {
+      latestRefresh.resolve(tripDetail);
+    });
+    expect(result.current.error).toBeNull();
+    expect(result.current.refreshing).toBe(false);
+    unmount();
+  });
+
+  it('does not own focus, foreground, or trip-event reconciliation when disabled', async () => {
+    mockGetTripDetail.mockResolvedValue(tripDetail);
+    const { result, unmount } = await renderHook(() =>
+      useTripDetail('trip-1', { autoReconcile: false }),
+    );
+
+    await act(async () => {
+      latestFocusCallback()();
+      latestForegroundCallback()();
+      publishTripEvent({
+        type: 'updated',
+        trip: { ...trip, name: 'Event update' },
+      });
+    });
+
+    expect(mockGetTripDetail).not.toHaveBeenCalled();
+    expect(result.current.detail).toBeNull();
+
+    await act(async () => {
+      await result.current.refresh('initial');
+    });
+    expect(result.current.detail).toEqual(tripDetail);
+
+    await act(async () => {
+      publishTripEvent({
+        type: 'updated',
+        trip: { ...trip, name: 'Ignored event update' },
+      });
+    });
+    expect(result.current.detail?.trip.name).toBe('Da Lat escape');
+    unmount();
+  });
+
+  it('invalidates a coordinator-owned request when a non-reconciling screen blurs', async () => {
+    const pendingRequest = deferred<typeof tripDetail>();
+    mockGetTripDetail.mockReturnValue(pendingRequest.promise);
+    const { result, unmount } = await renderHook(() =>
+      useTripDetail('trip-1', { autoReconcile: false }),
+    );
+
+    let cleanup: (() => void) | void = undefined;
+    await act(async () => {
+      cleanup = latestFocusCallback()();
+      void result.current.refresh('initial');
+    });
+    await act(async () => {
+      cleanup?.();
+      pendingRequest.resolve(tripDetail);
+    });
+
+    expect(result.current.detail).toBeNull();
+    expect(result.current.status).toBe('loading');
     unmount();
   });
 
@@ -207,6 +372,39 @@ describe('useTripDetail', () => {
     });
 
     await waitFor(() => expect(result.current.detail?.trip.name).toBe('Da Lat escape'));
+    unmount();
+  });
+
+  it('hides the previous trip immediately when the resource key changes', async () => {
+    const secondTripDetail = {
+      ...tripDetail,
+      trip: { ...trip, id: 'trip-2', name: 'Second trip' },
+    };
+    const secondRequest = deferred<typeof secondTripDetail>();
+    mockGetTripDetail
+      .mockResolvedValueOnce(tripDetail)
+      .mockReturnValueOnce(secondRequest.promise);
+    const { result, rerender, unmount } = await renderHook(
+      ({ tripId }: { tripId: string }) => useTripDetail(tripId),
+      { initialProps: { tripId: 'trip-1' } },
+    );
+
+    await act(async () => {
+      latestFocusCallback()();
+    });
+    await waitFor(() => expect(result.current.detail).toEqual(tripDetail));
+
+    await rerender({ tripId: 'trip-2' });
+    expect(result.current.detail).toBeNull();
+    expect(result.current.status).toBe('loading');
+
+    await act(async () => {
+      latestFocusCallback()();
+    });
+    await act(async () => {
+      secondRequest.resolve(secondTripDetail);
+    });
+    expect(result.current.detail).toEqual(secondTripDetail);
     unmount();
   });
 
