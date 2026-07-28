@@ -108,6 +108,48 @@ describe('useAvatarUpdate', () => {
     expect(result.current.status).toBe('idle');
   });
 
+  it('ignores a second tap that lands before the first upload finishes', async () => {
+    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPreprocess.mockResolvedValue(processed);
+    mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
+
+    const { result } = await renderHook(useAvatarUpdate);
+    // Both taps are dispatched before React can re-render and disable the
+    // button, which is exactly what a fast double tap produces on device.
+    await act(async () => {
+      await Promise.all([result.current.changeAvatar(), result.current.changeAvatar()]);
+    });
+
+    expect(mockPick).toHaveBeenCalledTimes(1);
+    expect(mockUpload).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a remove tap that lands while an upload is running', async () => {
+    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPreprocess.mockResolvedValue(processed);
+    mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
+
+    const { result } = await renderHook(useAvatarUpdate);
+    await act(async () => {
+      await Promise.all([result.current.changeAvatar(), result.current.removeAvatar()]);
+    });
+
+    expect(mockUpload).toHaveBeenCalledTimes(1);
+    expect(mockDelete).not.toHaveBeenCalled();
+  });
+
+  it('releases the lock so a later change still runs', async () => {
+    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPreprocess.mockResolvedValue(processed);
+    mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
+
+    const { result } = await renderHook(useAvatarUpdate);
+    await act(async () => { await result.current.changeAvatar(); });
+    await act(async () => { await result.current.changeAvatar(); });
+
+    expect(mockUpload).toHaveBeenCalledTimes(2);
+  });
+
   it('dismissError clears a previous failure', async () => {
     mockPick.mockResolvedValue({ status: 'picked', image: picked });
     mockPreprocess.mockRejectedValue(new ImagePreprocessError('UNREADABLE', 'internal'));

@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { nativeImageCodec } from '@/shared/media/imageCodec';
 import { pickImage } from '@/shared/media/pickImage';
 import { preprocessImage } from '@/shared/media/preprocessImage';
@@ -20,8 +20,19 @@ export function useAvatarUpdate(): AvatarUpdate {
   const { updateUser } = useSession();
   const [status, setStatus] = useState<AvatarStatus>('idle');
   const [error, setError] = useState<string | null>(null);
+  /**
+   * `status` only disables the buttons once React has re-rendered, so a fast
+   * double tap can enter these callbacks twice and run two uploads whose
+   * responses race — the later one silently wins. This ref closes the window
+   * synchronously, the same lock the account screens use.
+   */
+  const busyRef = useRef(false);
 
   const changeAvatar = useCallback(async () => {
+    if (busyRef.current) {
+      return;
+    }
+    busyRef.current = true;
     setError(null);
     setStatus('picking');
     try {
@@ -39,10 +50,16 @@ export function useAvatarUpdate(): AvatarUpdate {
     } catch (caught) {
       setStatus('idle');
       setError(describeAvatarError(caught));
+    } finally {
+      busyRef.current = false;
     }
   }, [updateUser]);
 
   const removeAvatar = useCallback(async () => {
+    if (busyRef.current) {
+      return;
+    }
+    busyRef.current = true;
     setError(null);
     setStatus('removing');
     try {
@@ -51,6 +68,8 @@ export function useAvatarUpdate(): AvatarUpdate {
     } catch (caught) {
       setStatus('idle');
       setError(describeAvatarError(caught));
+    } finally {
+      busyRef.current = false;
     }
   }, [updateUser]);
 
