@@ -1,5 +1,7 @@
 import { apiClient } from '@/shared/api/client';
 import { extractCursor, type CursorPaginatedResponse } from '@/shared/api/pagination';
+import type { UploadableFile } from '@/shared/media/types';
+import { uploadFile } from '@/shared/media/uploadFile';
 import type {
   CreateTripInput,
   InvitableFriend,
@@ -86,4 +88,14 @@ export async function sendTripInvitations(
 
 export async function removeTripMember(tripId: string, userId: string): Promise<void> {
   await apiClient.delete(`/trips/${tripId}/members/${userId}`);
+}
+
+/**
+ * The upload does not attach itself to a trip; the returned `/media/...` path is
+ * an input to the next trip create or update.
+ */
+export async function uploadTripCover(file: UploadableFile): Promise<string> {
+  // Field name is `file` — /api/auth/avatar uses `avatar`, this endpoint does not.
+  const data = await uploadFile<{ url: string }>('/media/trip-covers', 'file', file, 'post');
+  return data.url;
 }
