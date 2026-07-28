@@ -9,6 +9,7 @@ export default function RootLayout() {
         <Stack.Screen name="(tabs)" />
         <Stack.Screen name="trips" />
         <Stack.Screen name="friends" />
+        <Stack.Screen name="account" />
       </Stack>
     </SessionProvider>
   );

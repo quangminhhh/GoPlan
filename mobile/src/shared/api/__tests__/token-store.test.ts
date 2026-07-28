@@ -10,6 +10,8 @@ import {
 jest.mock('expo-secure-store', () => {
   const store = new Map<string, string>();
   return {
+    // Exposed so a test can hold one write open and still let it commit later.
+    __store: store,
     getItemAsync: jest.fn(async (key: string) => store.get(key) ?? null),
     setItemAsync: jest.fn(async (key: string, value: string) => {
       store.set(key, value);
@@ -19,6 +21,26 @@ jest.mock('expo-secure-store', () => {
     }),
   };
 });
+
+const secureStore = (SecureStore as unknown as { __store: Map<string, string> }).__store;
+
+/**
+ * Replaces the next SecureStore write with one that only commits when the
+ * returned function is called, so a later write can be issued while it is open.
+ */
+function holdNextWrite(): () => void {
+  let commit: (() => void) | null = null;
+  (SecureStore.setItemAsync as jest.Mock).mockImplementationOnce(
+    (key: string, value: string) =>
+      new Promise<void>((resolve) => {
+        commit = () => {
+          secureStore.set(key, value);
+          resolve();
+        };
+      }),
+  );
+  return () => commit?.();
+}
 
 describe('token store', () => {
   beforeEach(async () => {
@@ -51,5 +73,38 @@ describe('token store', () => {
     await clearTokens();
     expect(getAccessToken()).toBeNull();
     await expect(getRefreshToken()).resolves.toBeNull();
+  });
+
+  describe('overlapping writes', () => {
+    it('commits in call order even when the earlier write is the slower one', async () => {
+      const commitFirst = holdNextWrite();
+
+      const first = setRefreshToken('refresh-first');
+      const second = setRefreshToken('refresh-second');
+      commitFirst();
+      await Promise.all([first, second]);
+
+      await expect(getRefreshToken()).resolves.toBe('refresh-second');
+    });
+
+    it('does not let a write already in flight survive a sign-out', async () => {
+      const commitWrite = holdNextWrite();
+
+      const write = setRefreshToken('refresh-1');
+      const signOut = clearTokens();
+      commitWrite();
+      await Promise.all([write, signOut]);
+
+      await expect(getRefreshToken()).resolves.toBeNull();
+    });
+
+    it('serves later writes after one of them fails', async () => {
+      (SecureStore.setItemAsync as jest.Mock).mockRejectedValueOnce(new Error('keychain unavailable'));
+
+      await expect(setRefreshToken('doomed')).rejects.toThrow('keychain unavailable');
+      await setRefreshToken('refresh-2');
+
+      await expect(getRefreshToken()).resolves.toBe('refresh-2');
+    });
   });
 });

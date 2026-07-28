@@ -63,6 +63,9 @@ export function LoginScreen() {
       />
       <FormError error={error} />
       <Button title="Sign in" onPress={onSubmit} loading={submitting} disabled={!email.trim() || !password} />
+      <Link href="/(auth)/forgot-password" style={styles.forgotLink}>
+        Forgot password?
+      </Link>
       <View style={styles.footer}>
         <Text style={styles.footerText}>New to GoPlan?</Text>
         <Link href="/(auth)/register" style={styles.footerLink}>
@@ -76,6 +79,7 @@ export function LoginScreen() {
 const styles = StyleSheet.create({
   title: { ...typography.title, color: colors.text, marginTop: spacing.xl },
   subtitle: { ...typography.body, color: colors.textMuted, marginBottom: spacing.md },
+  forgotLink: { ...typography.body, color: colors.primary, textAlign: 'center', marginTop: spacing.sm },
   footer: { flexDirection: 'row', gap: spacing.xs, justifyContent: 'center', marginTop: spacing.md },
   footerText: { ...typography.body, color: colors.textMuted },
   footerLink: { ...typography.body, color: colors.primary, fontWeight: '600' },

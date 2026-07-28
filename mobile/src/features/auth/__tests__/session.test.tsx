@@ -12,6 +12,7 @@ jest.mock('expo-secure-store', () => {
 });
 jest.mock('@/shared/api/refresh', () => ({
   refreshTokens: jest.fn(),
+  rotateTokens: jest.fn(),
   setOnRefreshFailed: jest.fn(),
 }));
 jest.mock('../api', () => ({
@@ -24,7 +25,7 @@ import { act, renderHook, waitFor } from '@testing-library/react-native';
 // eslint-disable-next-line import/first
 import type { PropsWithChildren } from 'react';
 // eslint-disable-next-line import/first
-import { refreshTokens } from '@/shared/api/refresh';
+import { refreshTokens, rotateTokens } from '@/shared/api/refresh';
 // eslint-disable-next-line import/first
 import { getAccessToken, getRefreshToken, setRefreshToken } from '@/shared/api/token-store';
 // eslint-disable-next-line import/first
@@ -113,5 +114,45 @@ describe('SessionProvider', () => {
       resolveRefresh('access-1');
     });
     await waitFor(() => expect(result.current.status).toBe('signedIn'));
+  });
+
+  it('rotateSession adopts the new pair and replaces the session user', async () => {
+    mockRefresh.mockResolvedValue('access-1');
+    mockFetchMe.mockResolvedValue(user);
+    (rotateTokens as jest.Mock).mockResolvedValue(undefined);
+    const { result } = await renderHook(useSession, { wrapper });
+    await waitFor(() => expect(result.current.status).toBe('signedIn'));
+
+    const rotated = { ...user, display_name: 'Rotated' } as AuthUser;
+    let outcome: 'rotated' | 'signedOut' | undefined;
+    await act(async () => {
+      outcome = await result.current.rotateSession({
+        user: rotated,
+        tokens: { access: 'access-2', refresh: 'refresh-2', token_type: 'Bearer' },
+      });
+    });
+
+    expect(outcome).toBe('rotated');
+    expect(rotateTokens).toHaveBeenCalledWith({ access: 'access-2', refresh: 'refresh-2', token_type: 'Bearer' });
+    expect(result.current.user).toEqual(rotated);
+    expect(result.current.status).toBe('signedIn');
+  });
+
+  it('rotateSession forces a sign-out when the secure write fails', async () => {
+    mockRefresh.mockResolvedValue('access-1');
+    mockFetchMe.mockResolvedValue(user);
+    (rotateTokens as jest.Mock).mockRejectedValue(new Error('keychain unavailable'));
+    const { result } = await renderHook(useSession, { wrapper });
+    await waitFor(() => expect(result.current.status).toBe('signedIn'));
+
+    let outcome: 'rotated' | 'signedOut' | undefined;
+    await act(async () => {
+      outcome = await result.current.rotateSession(authResponse);
+    });
+
+    expect(outcome).toBe('signedOut');
+    expect(result.current.status).toBe('signedOut');
+    expect(result.current.user).toBeNull();
+    await expect(getRefreshToken()).resolves.toBeNull();
   });
 });

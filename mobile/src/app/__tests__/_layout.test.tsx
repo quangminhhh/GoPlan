@@ -31,4 +31,10 @@ describe('RootLayout', () => {
 
     expect(mockStackScreen).toHaveBeenCalledWith('friends');
   });
+
+  it('registers the guarded Account native stack', async () => {
+    await render(<RootLayout />);
+
+    expect(mockStackScreen).toHaveBeenCalledWith('account');
+  });
 });

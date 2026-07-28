@@ -15,9 +15,12 @@
     "expo-constants": "~57.0.3",
     "expo-dev-client": "~57.0.5",
     "expo-device": "~57.0.0",
+    "expo-file-system": "57.0.0",
     "expo-font": "~57.0.0",
     "expo-glass-effect": "~57.0.0",
     "expo-image": "~57.0.0",
+    "expo-image-manipulator": "57.0.2",
+    "expo-image-picker": "57.0.2",
     "expo-linking": "~57.0.1",
     "expo-router": "~57.0.3",
     "expo-secure-store": "~57.0.0",
@@ -68,6 +71,7 @@
       "node_modules/(?!(\\.pnpm|((jest-)?react-native|@react-native(-community)?)|expo(nent)?|@expo(nent)?/.*|@expo-google-fonts/.*|react-navigation|@react-navigation/.*|react-native-svg|@testing-library/react-native|test-renderer))"
     ],
     "moduleNameMapper": {
+      "^@test/(.*)$": "<rootDir>/test/$1",
       "^@/assets/(.*)$": "<rootDir>/assets/$1",
       "^@/(.*)$": "<rootDir>/src/$1"
     }

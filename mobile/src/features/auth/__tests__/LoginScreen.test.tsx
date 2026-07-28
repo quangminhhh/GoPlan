@@ -4,10 +4,15 @@ jest.mock('expo-secure-store', () => ({
   deleteItemAsync: jest.fn(),
 }));
 const mockRouter = { replace: jest.fn(), push: jest.fn(), back: jest.fn() };
-jest.mock('expo-router', () => ({
-  useRouter: () => mockRouter,
-  Link: () => null,
-}));
+jest.mock('expo-router', () => {
+  const React = jest.requireActual<typeof import('react')>('react');
+  const { Text } = jest.requireActual<typeof import('react-native')>('react-native');
+  return {
+    useRouter: () => mockRouter,
+    // Renders its children so link copy is assertable; href routing is Expo Router's.
+    Link: ({ children }: { children: import('react').ReactNode }) => React.createElement(Text, null, children),
+  };
+});
 jest.mock('../api', () => ({
   loginRequest: jest.fn(),
 }));
@@ -81,5 +86,11 @@ describe('LoginScreen', () => {
     await fireEvent.press(screen.getByText('Sign in'));
 
     expect(await screen.findByText('Invalid email or password.')).toBeTruthy();
+  });
+
+  it('offers a route to the forgot password screen', async () => {
+    await render(<LoginScreen />);
+
+    expect(screen.getByText('Forgot password?')).toBeTruthy();
   });
 });

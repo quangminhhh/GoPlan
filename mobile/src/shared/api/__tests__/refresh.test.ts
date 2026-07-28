@@ -1,6 +1,8 @@
 jest.mock('expo-secure-store', () => {
   const store = new Map<string, string>();
   return {
+    // Exposed so a test can hold one write open and still let it commit later.
+    __store: store,
     getItemAsync: jest.fn(async (key: string) => store.get(key) ?? null),
     setItemAsync: jest.fn(async (key: string, value: string) => {
       store.set(key, value);
@@ -12,9 +14,22 @@ jest.mock('expo-secure-store', () => {
 });
 
 // eslint-disable-next-line import/first
-import { refreshHttp, refreshTokens, setOnRefreshFailed } from '../refresh';
+import { AxiosHeaders } from 'axios';
 // eslint-disable-next-line import/first
-import { clearTokens, getAccessToken, getRefreshToken, setRefreshToken } from '../token-store';
+import * as SecureStore from 'expo-secure-store';
+// eslint-disable-next-line import/first
+import { apiClient } from '../client';
+// eslint-disable-next-line import/first
+import { refreshHttp, refreshTokens, rotateTokens, setOnRefreshFailed } from '../refresh';
+// eslint-disable-next-line import/first
+import { clearTokens, getAccessToken, getRefreshToken, setAccessToken, setRefreshToken } from '../token-store';
+
+const secureStore = (SecureStore as unknown as { __store: Map<string, string> }).__store;
+
+/** Lets every pending microtask settle without depending on how many there are. */
+function settle(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 describe('refreshTokens', () => {
   beforeEach(async () => {
@@ -61,5 +76,168 @@ describe('refreshTokens', () => {
     expect(getAccessToken()).toBeNull();
     await expect(getRefreshToken()).resolves.toBeNull();
     expect(onFailed).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('rotateTokens', () => {
+  beforeEach(async () => {
+    await clearTokens();
+    setOnRefreshFailed(null);
+    jest.restoreAllMocks();
+  });
+
+  it('persists the refresh token before exposing the new access token', async () => {
+    setAccessToken('old-access');
+    let releaseWrite: () => void = () => undefined;
+    (SecureStore.setItemAsync as jest.Mock).mockImplementationOnce(
+      () => new Promise<void>((resolve) => { releaseWrite = resolve; }),
+    );
+
+    const rotation = rotateTokens({ access: 'new-access', refresh: 'new-refresh' });
+    expect(getAccessToken()).toBe('old-access');
+
+    releaseWrite();
+    await rotation;
+    expect(getAccessToken()).toBe('new-access');
+  });
+
+  it('propagates a SecureStore failure and clears the revoked access token', async () => {
+    setAccessToken('old-access');
+    (SecureStore.setItemAsync as jest.Mock).mockRejectedValueOnce(new Error('keychain unavailable'));
+
+    await expect(rotateTokens({ access: 'new-access', refresh: 'new-refresh' })).rejects.toThrow();
+    expect(getAccessToken()).toBeNull();
+  });
+
+  it('is the token the next authenticated request actually sends', async () => {
+    await rotateTokens({ access: 'rotated-access', refresh: 'rotated-refresh' });
+
+    const originalAdapter = apiClient.defaults.adapter;
+    let seenAuth: string | undefined;
+    apiClient.defaults.adapter = async (config) => {
+      seenAuth = new AxiosHeaders(config.headers).get('Authorization') as string | undefined;
+      return { status: 200, statusText: 'OK', headers: {}, config, data: {} };
+    };
+    try {
+      await apiClient.get('/auth/me');
+    } finally {
+      apiClient.defaults.adapter = originalAdapter;
+    }
+
+    expect(seenAuth).toBe('Bearer rotated-access');
+    await expect(getRefreshToken()).resolves.toBe('rotated-refresh');
+  });
+
+  it('does not sign the user out when it supersedes a failing in-flight refresh', async () => {
+    await setRefreshToken('revoked-refresh');
+    setAccessToken('revoked-access');
+    const onFailed = jest.fn();
+    setOnRefreshFailed(onFailed);
+    let rejectRefresh: (error: Error) => void = () => undefined;
+    jest.spyOn(refreshHttp, 'post').mockImplementation(
+      () => new Promise((_resolve, reject) => { rejectRefresh = reject; }),
+    );
+
+    const refreshing = refreshTokens();
+    await rotateTokens({ access: 'rotated-access', refresh: 'rotated-refresh' });
+    rejectRefresh(new Error('401'));
+
+    await expect(refreshing).resolves.toBe('rotated-access');
+    expect(onFailed).not.toHaveBeenCalled();
+    expect(getAccessToken()).toBe('rotated-access');
+    await expect(getRefreshToken()).resolves.toBe('rotated-refresh');
+  });
+
+  it('does not let a late-succeeding refresh overwrite the rotated pair', async () => {
+    await setRefreshToken('revoked-refresh');
+    let resolveRefresh: (value: { data: { access: string; refresh: string } }) => void = () => undefined;
+    jest.spyOn(refreshHttp, 'post').mockImplementation(
+      () => new Promise((resolve) => { resolveRefresh = resolve; }),
+    );
+
+    const refreshing = refreshTokens();
+    await rotateTokens({ access: 'rotated-access', refresh: 'rotated-refresh' });
+    resolveRefresh({ data: { access: 'stale-access', refresh: 'stale-refresh' } });
+
+    await expect(refreshing).resolves.toBe('rotated-access');
+    expect(getAccessToken()).toBe('rotated-access');
+    await expect(getRefreshToken()).resolves.toBe('rotated-refresh');
+  });
+
+  it('holds a stale refresh behind the barrier while the SecureStore write is pending', async () => {
+    await setRefreshToken('revoked-refresh');
+    setAccessToken('revoked-access');
+    let resolveRefresh: (value: { data: { access: string; refresh: string } }) => void = () => undefined;
+    jest.spyOn(refreshHttp, 'post').mockImplementation(
+      () => new Promise((resolve) => { resolveRefresh = resolve; }),
+    );
+    let releaseWrite: () => void = () => undefined;
+    (SecureStore.setItemAsync as jest.Mock).mockImplementationOnce(
+      () => new Promise<void>((resolve) => { releaseWrite = resolve; }),
+    );
+
+    const refreshing = refreshTokens();
+    const rotation = rotateTokens({ access: 'rotated-access', refresh: 'rotated-refresh' });
+    resolveRefresh({ data: { access: 'stale-access', refresh: 'stale-refresh' } });
+
+    let refreshSettled = false;
+    void refreshing.then(() => { refreshSettled = true; });
+    await Promise.resolve();
+    expect(refreshSettled).toBe(false);
+    expect(getAccessToken()).toBe('revoked-access');
+
+    releaseWrite();
+    await rotation;
+    await expect(refreshing).resolves.toBe('rotated-access');
+  });
+
+  it('wins over a refresh whose own SecureStore write was still in flight', async () => {
+    // The narrow window the generation guard alone does not cover: the refresh
+    // response arrives and passes its check, and only then does the password
+    // change land — while the refresh's write to the same key is still open.
+    await setRefreshToken('old-refresh');
+    jest
+      .spyOn(refreshHttp, 'post')
+      .mockResolvedValue({ data: { access: 'chain-access', refresh: 'chain-refresh' } });
+
+    let commitChainWrite: (() => void) | null = null;
+    (SecureStore.setItemAsync as jest.Mock).mockImplementationOnce(
+      (key: string, value: string) =>
+        new Promise<void>((resolve) => {
+          commitChainWrite = () => {
+            secureStore.set(key, value);
+            resolve();
+          };
+        }),
+    );
+
+    const refreshing = refreshTokens();
+    await settle();
+    expect(commitChainWrite).not.toBeNull();
+
+    const rotation = rotateTokens({ access: 'rotated-access', refresh: 'rotated-refresh' });
+    commitChainWrite!();
+    await rotation;
+
+    // The rotated pair is authoritative even though the older write committed
+    // last, and the superseded refresh reports the token that still works.
+    await expect(getRefreshToken()).resolves.toBe('rotated-refresh');
+    expect(getAccessToken()).toBe('rotated-access');
+    await expect(refreshing).resolves.toBe('rotated-access');
+  });
+
+  it('does not send a refresh read from a generation that was superseded during SecureStore access', async () => {
+    let releaseRead: (value: string | null) => void = () => undefined;
+    (SecureStore.getItemAsync as jest.Mock).mockImplementationOnce(
+      () => new Promise<string | null>((resolve) => { releaseRead = resolve; }),
+    );
+    const post = jest.spyOn(refreshHttp, 'post');
+
+    const refreshing = refreshTokens();
+    await rotateTokens({ access: 'rotated-access', refresh: 'rotated-refresh' });
+    releaseRead('rotated-refresh');
+
+    await expect(refreshing).resolves.toBe('rotated-access');
+    expect(post).not.toHaveBeenCalled();
   });
 });
