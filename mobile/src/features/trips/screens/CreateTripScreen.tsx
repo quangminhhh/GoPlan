@@ -9,9 +9,11 @@ import { FormError } from '@/shared/ui/FormError';
 import { Screen } from '@/shared/ui/Screen';
 import { TextField } from '@/shared/ui/TextField';
 import { createTrip } from '../api';
+import { CoverImageField } from '../components/CoverImageField';
 import { DestinationField } from '../components/DestinationField';
 import { formatDateParam } from '../dates';
 import { destinationFields, type TripDestinationValue } from '../destination';
+import { useTripCoverUpload } from '../hooks/useTripCoverUpload';
 import { TRIP_CURRENCY_CODES } from '../options';
 import type { CreateTripInput } from '../types';
 
@@ -41,6 +43,7 @@ export function CreateTripScreen() {
   const [dateError, setDateError] = useState<string | undefined>(undefined);
   const [error, setError] = useState<ApiError | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const cover = useTripCoverUpload();
   const canSubmit = Boolean(name.trim() && destination.label.trim());
 
   function onStartDateChange(date: Date) {
@@ -67,6 +70,10 @@ export function CreateTripScreen() {
       end_date: end,
       currency_code: currency,
     };
+    // Create defaults cover_image_url to '' server-side, so an empty key is noise.
+    if (cover.coverUrl !== '') {
+      input.cover_image_url = cover.coverUrl;
+    }
     const trimmedDescription = description.trim();
     if (trimmedDescription) {
       input.description = trimmedDescription;
@@ -93,7 +100,13 @@ export function CreateTripScreen() {
         <>
           <FormError error={error} />
           {!canSubmit ? <Text style={styles.submitHint}>Add a trip name and destination to continue.</Text> : null}
-          <Button title="Create trip" onPress={onSubmit} loading={submitting} disabled={!canSubmit} />
+          {cover.busy ? <Text style={styles.submitHint}>Wait for the cover upload to finish.</Text> : null}
+          <Button
+            title="Create trip"
+            onPress={onSubmit}
+            loading={submitting}
+            disabled={!canSubmit || cover.busy}
+          />
         </>
       }
     >
@@ -117,6 +130,16 @@ export function CreateTripScreen() {
           value={destination}
           onChange={setDestination}
           error={error?.fieldErrors?.destination}
+        />
+      </FormSection>
+
+      <FormSection title="Cover photo">
+        <CoverImageField
+          coverUrl={cover.coverUrl}
+          status={cover.status}
+          error={cover.error ?? error?.fieldErrors?.cover_image_url ?? null}
+          onChoose={() => void cover.chooseCover()}
+          onRemove={cover.removeCover}
         />
       </FormSection>
 

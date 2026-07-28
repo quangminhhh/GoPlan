@@ -26,7 +26,16 @@ jest.mock('expo-router', () => ({
 jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
 jest.mock('../hooks/useTripDetail', () => ({ useTripDetail: (...args: unknown[]) => mockUseTripDetail(...args) }));
 jest.mock('../tripEvents', () => ({ publishTripEvent: (...args: unknown[]) => mockPublishTripEvent(...args) }));
-jest.mock('../api', () => ({ updateTrip: jest.fn() }));
+jest.mock('../api', () => ({ updateTrip: jest.fn(), uploadTripCover: jest.fn() }));
+jest.mock('expo-image', () => {
+  const { View } = jest.requireActual('react-native');
+  return { Image: View };
+});
+jest.mock('@/shared/media/pickImage', () => ({ pickImage: jest.fn() }));
+jest.mock('@/shared/media/preprocessImage', () => ({ preprocessImage: jest.fn() }));
+jest.mock('@/shared/media/imageCodec', () => ({
+  nativeImageCodec: { encode: jest.fn(), discard: jest.fn(async () => undefined) },
+}));
 
 interface MockDateFieldProps {
   label: string;
@@ -57,7 +66,11 @@ import type { PlacePicker } from '@/shared/location/PlacePicker';
 // eslint-disable-next-line import/first
 import type { ResolvedPlace } from '@/shared/location/types';
 // eslint-disable-next-line import/first
-import { updateTrip } from '../api';
+import { pickImage } from '@/shared/media/pickImage';
+// eslint-disable-next-line import/first
+import { preprocessImage } from '@/shared/media/preprocessImage';
+// eslint-disable-next-line import/first
+import { updateTrip, uploadTripCover } from '../api';
 // eslint-disable-next-line import/first
 import { EditTripScreen } from '../screens/EditTripScreen';
 // eslint-disable-next-line import/first
@@ -66,6 +79,20 @@ import type { TripDetailResponse } from '../types';
 import type { ApiError } from '@/shared/api/errors';
 
 const mockUpdateTrip = updateTrip as jest.MockedFunction<typeof updateTrip>;
+const mockPick = pickImage as jest.MockedFunction<typeof pickImage>;
+const mockPreprocess = preprocessImage as jest.MockedFunction<typeof preprocessImage>;
+const mockUploadCover = uploadTripCover as jest.MockedFunction<typeof uploadTripCover>;
+
+const pickedImage = { uri: 'file:///cover.heic', width: 4032, height: 3024, fileName: 'IMG_9.HEIC' };
+const processedImage = {
+  uri: 'file:///cover.jpg',
+  name: 'IMG_9.jpg',
+  type: 'image/jpeg',
+  width: 2560,
+  height: 1440,
+  bytes: 900_000,
+} as const;
+const UPLOADED_COVER_URL = '/media/trip-covers/8f0e.webp';
 const notFoundError: ApiError = { kind: 'message', message: 'Trip not found.', errorCode: 'TRIP_NOT_FOUND', status: 404 };
 
 function axiosErrorWith(status: number, data: unknown): AxiosError {
@@ -242,6 +269,66 @@ describe('EditTripScreen', () => {
       label: 'Da Lat, Vietnam',
       place: { title: 'Da Lat, Vietnam', address: '' },
     });
+  });
+
+  it('omits cover_image_url when the cover is never touched', async () => {
+    mockUpdateTrip.mockResolvedValue(detail.trip);
+    await render(<EditTripScreen />);
+    await save();
+
+    await waitFor(() => expect(mockUpdateTrip).toHaveBeenCalled());
+    expect(mockUpdateTrip.mock.calls[0]?.[1]).not.toHaveProperty('cover_image_url');
+  });
+
+  it('clears the cover with an empty string after Remove', async () => {
+    mockUpdateTrip.mockResolvedValue(detail.trip);
+    await render(<EditTripScreen />);
+    await fireEvent.press(screen.getByLabelText('Remove photo'));
+    await save();
+
+    await waitFor(() =>
+      expect(mockUpdateTrip).toHaveBeenCalledWith(
+        'trip-123',
+        expect.objectContaining({ cover_image_url: '' }),
+      ),
+    );
+  });
+
+  it('replaces the cover with the newly uploaded url', async () => {
+    mockUpdateTrip.mockResolvedValue(detail.trip);
+    mockPick.mockResolvedValue({ status: 'picked', image: pickedImage });
+    mockPreprocess.mockResolvedValue(processedImage);
+    mockUploadCover.mockResolvedValue(UPLOADED_COVER_URL);
+
+    await render(<EditTripScreen />);
+    await fireEvent.press(screen.getByLabelText('Replace photo'));
+    await waitFor(() => expect(mockUploadCover).toHaveBeenCalledWith(processedImage));
+    await save();
+
+    await waitFor(() =>
+      expect(mockUpdateTrip).toHaveBeenCalledWith(
+        'trip-123',
+        expect.objectContaining({ cover_image_url: UPLOADED_COVER_URL }),
+      ),
+    );
+  });
+
+  it('blocks submit until an in-flight cover upload settles', async () => {
+    mockPick.mockResolvedValue({ status: 'picked', image: pickedImage });
+    mockPreprocess.mockResolvedValue(processedImage);
+    mockUploadCover.mockImplementation(() => new Promise(() => undefined));
+
+    await render(<EditTripScreen />);
+    await fireEvent.press(screen.getByLabelText('Replace photo'));
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Save changes' }).props.accessibilityState,
+      ).toEqual(expect.objectContaining({ disabled: true })),
+    );
+    expect(screen.getByText('Wait for the cover upload to finish.')).toBeTruthy();
+    await save();
+    expect(mockUpdateTrip).not.toHaveBeenCalled();
   });
 
   it('blocks duplicate submission while the PATCH is pending', async () => {

@@ -14,6 +14,18 @@ jest.mock('expo-router', () => ({
 
 jest.mock('../api', () => ({
   createTrip: jest.fn(),
+  uploadTripCover: jest.fn(),
+}));
+
+jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
+jest.mock('expo-image', () => {
+  const { View } = jest.requireActual('react-native');
+  return { Image: View };
+});
+jest.mock('@/shared/media/pickImage', () => ({ pickImage: jest.fn() }));
+jest.mock('@/shared/media/preprocessImage', () => ({ preprocessImage: jest.fn() }));
+jest.mock('@/shared/media/imageCodec', () => ({
+  nativeImageCodec: { encode: jest.fn(), discard: jest.fn(async () => undefined) },
 }));
 
 // The picker owns its own debounce, abort controllers and HTTP calls; those are
@@ -61,11 +73,29 @@ import type { PlacePicker } from '@/shared/location/PlacePicker';
 // eslint-disable-next-line import/first
 import type { ResolvedPlace } from '@/shared/location/types';
 // eslint-disable-next-line import/first
-import { createTrip } from '../api';
+import { pickImage } from '@/shared/media/pickImage';
+// eslint-disable-next-line import/first
+import { preprocessImage } from '@/shared/media/preprocessImage';
+// eslint-disable-next-line import/first
+import { createTrip, uploadTripCover } from '../api';
 // eslint-disable-next-line import/first
 import { CreateTripScreen } from '../screens/CreateTripScreen';
 
 const mockCreateTrip = createTrip as jest.MockedFunction<typeof createTrip>;
+const mockPick = pickImage as jest.MockedFunction<typeof pickImage>;
+const mockPreprocess = preprocessImage as jest.MockedFunction<typeof preprocessImage>;
+const mockUploadCover = uploadTripCover as jest.MockedFunction<typeof uploadTripCover>;
+
+const pickedImage = { uri: 'file:///cover.heic', width: 4032, height: 3024, fileName: 'IMG_9.HEIC' };
+const processedImage = {
+  uri: 'file:///cover.jpg',
+  name: 'IMG_9.jpg',
+  type: 'image/jpeg',
+  width: 2560,
+  height: 1440,
+  bytes: 900_000,
+} as const;
+const UPLOADED_COVER_URL = '/media/trip-covers/8f0e.webp';
 
 const verifiedPlace: ResolvedPlace = {
   provider: 'here',
@@ -209,6 +239,55 @@ describe('CreateTripScreen', () => {
         }),
       ),
     );
+  });
+
+  it('sends the uploaded cover url with the created trip', async () => {
+    mockCreateTrip.mockResolvedValue({ id: 'trip-123' } as never);
+    mockPick.mockResolvedValue({ status: 'picked', image: pickedImage });
+    mockPreprocess.mockResolvedValue(processedImage);
+    mockUploadCover.mockResolvedValue(UPLOADED_COVER_URL);
+
+    await render(<CreateTripScreen />);
+    await fillRequiredFields();
+    await fireEvent.press(screen.getByLabelText('Choose photo'));
+    await waitFor(() => expect(mockUploadCover).toHaveBeenCalledWith(processedImage));
+    await fireEvent.press(screen.getByText('Create trip'));
+
+    await waitFor(() =>
+      expect(mockCreateTrip).toHaveBeenCalledWith(
+        expect.objectContaining({ cover_image_url: UPLOADED_COVER_URL }),
+      ),
+    );
+  });
+
+  it('omits cover_image_url entirely when no cover was chosen', async () => {
+    mockCreateTrip.mockResolvedValue({ id: 'trip-123' } as never);
+
+    await render(<CreateTripScreen />);
+    await fillRequiredFields();
+    await fireEvent.press(screen.getByText('Create trip'));
+
+    await waitFor(() => expect(mockCreateTrip).toHaveBeenCalled());
+    expect(mockCreateTrip.mock.calls[0]?.[0]).not.toHaveProperty('cover_image_url');
+  });
+
+  it('blocks submit until an in-flight cover upload settles', async () => {
+    mockPick.mockResolvedValue({ status: 'picked', image: pickedImage });
+    mockPreprocess.mockResolvedValue(processedImage);
+    mockUploadCover.mockImplementation(() => new Promise(() => undefined));
+
+    await render(<CreateTripScreen />);
+    await fillRequiredFields();
+    await fireEvent.press(screen.getByLabelText('Choose photo'));
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Create trip' }).props.accessibilityState,
+      ).toEqual(expect.objectContaining({ disabled: true })),
+    );
+    expect(screen.getByText('Wait for the cover upload to finish.')).toBeTruthy();
+    await fireEvent.press(screen.getByText('Create trip'));
+    expect(mockCreateTrip).not.toHaveBeenCalled();
   });
 
   it('keeps submit available when place search is unavailable', async () => {

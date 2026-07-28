@@ -12,6 +12,7 @@ import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 import { Screen } from '@/shared/ui/Screen';
 import { TextField } from '@/shared/ui/TextField';
 import { updateTrip } from '../api';
+import { CoverImageField } from '../components/CoverImageField';
 import { DestinationField } from '../components/DestinationField';
 import { formatDateParam, parseDateOnly } from '../dates';
 import {
@@ -19,6 +20,7 @@ import {
   destinationValueFromTrip,
   type TripDestinationValue,
 } from '../destination';
+import { useTripCoverUpload } from '../hooks/useTripCoverUpload';
 import { useTripDetail } from '../hooks/useTripDetail';
 import { getTimezoneOptions, TRIP_CURRENCY_CODES } from '../options';
 import { publishTripEvent } from '../tripEvents';
@@ -66,6 +68,7 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
   const [error, setError] = useState<ApiError | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submitLockRef = useRef(false);
+  const cover = useTripCoverUpload(original.cover_image_url);
   const timezoneOptions = getTimezoneOptions(original.timezone);
   const canSubmit = Boolean(name.trim() && destination.label.trim());
 
@@ -112,6 +115,11 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
     if (destinationTouched) {
       Object.assign(input, destinationFields(destination));
     }
+    // '' after Remove clears the cover, a new URL replaces it, and an untouched
+    // cover is never mentioned at all.
+    if (cover.changed) {
+      input.cover_image_url = cover.coverUrl;
+    }
 
     submitLockRef.current = true;
     setSubmitting(true);
@@ -135,7 +143,13 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
         <>
           <FormError error={error} />
           {!canSubmit ? <Text style={styles.submitHint}>Add a trip name and destination to continue.</Text> : null}
-          <Button title="Save changes" onPress={onSubmit} loading={submitting} disabled={!canSubmit} />
+          {cover.busy ? <Text style={styles.submitHint}>Wait for the cover upload to finish.</Text> : null}
+          <Button
+            title="Save changes"
+            onPress={onSubmit}
+            loading={submitting}
+            disabled={!canSubmit || cover.busy}
+          />
         </>
       }
     >
@@ -152,6 +166,16 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
           value={destination}
           onChange={onDestinationChange}
           error={error?.fieldErrors?.destination}
+        />
+      </FormSection>
+
+      <FormSection title="Cover photo">
+        <CoverImageField
+          coverUrl={cover.coverUrl}
+          status={cover.status}
+          error={cover.error ?? error?.fieldErrors?.cover_image_url ?? null}
+          onChoose={() => void cover.chooseCover()}
+          onRemove={cover.removeCover}
         />
       </FormSection>
 
