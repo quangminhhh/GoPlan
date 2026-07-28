@@ -1,15 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { type ApiError, normalizeApiError } from '@/shared/api/errors';
-import { lookupLocation, suggestLocations } from '../api';
-import { ACTIVITY_FIELD_LIMITS } from '../formModel';
-import type {
-  ActivityPlacePayload,
-  LocationSuggestion,
-} from '../types';
+import { lookupLocation, suggestLocations } from './api';
 import {
-  buildStructuredLocation,
-  type StructuredLocationValue,
-} from '../viewModel';
+  MAX_PLACE_LABEL_LENGTH,
+  MAX_PROVIDER_ID_LENGTH,
+  resolvePlace,
+  truncateCodePoints,
+} from './resolvePlace';
+import type { PlaceSuggestion, ResolvedPlace } from './types';
 
 export const LOCATION_SEARCH_DEBOUNCE_MS = 300;
 export const PLACE_SEARCH_UNAVAILABLE_MESSAGE =
@@ -25,24 +23,19 @@ export type LocationSearchStatus =
   | 'error';
 export type LocationLookupStatus = 'idle' | 'loading' | 'ready' | 'error';
 
-export interface StructuredLocationSelection extends StructuredLocationValue {
-  location_mode: 'STRUCTURED';
+/** What the caller stores when the user declines or fails verification. */
+export interface ManualPlaceEntry {
+  label: string;
 }
 
-export interface ManualLocationValue {
-  location_mode: 'MANUAL';
-  location_label: string;
-  place: null;
-}
-
-export interface SettledLocationLookupFailure extends ManualLocationValue {
+export interface PlaceLookupFailure extends ManualPlaceEntry {
   error: ApiError;
   guidance: string;
 }
 
-export type LocationLookupResult =
-  | { kind: 'success'; selection: StructuredLocationSelection }
-  | { kind: 'failure'; fallback: SettledLocationLookupFailure }
+export type PlaceLookupResult =
+  | { kind: 'success'; place: ResolvedPlace }
+  | { kind: 'failure'; fallback: PlaceLookupFailure }
   | { kind: 'stale' };
 
 interface UseLocationSearchOptions {
@@ -62,26 +55,19 @@ function isLocationSearchUnavailable(error: ApiError): boolean {
   );
 }
 
-function withinProviderIdLimit(suggestion: LocationSuggestion): boolean {
-  return (
-    Array.from(suggestion.provider_id).length <=
-    ACTIVITY_FIELD_LIMITS.place_provider_id
-  );
+function withinProviderIdLimit(suggestion: PlaceSuggestion): boolean {
+  return Array.from(suggestion.provider_id).length <= MAX_PROVIDER_ID_LENGTH;
 }
 
-function staleLookupResult(): LocationLookupResult {
+function staleLookupResult(): PlaceLookupResult {
   return { kind: 'stale' };
-}
-
-function truncateCodePoints(value: string, maxLength: number): string {
-  return Array.from(value).slice(0, maxLength).join('');
 }
 
 export function useLocationSearch({
   enabled = true,
 }: UseLocationSearchOptions = {}) {
   const [query, setQueryValue] = useState('');
-  const [suggestions, setSuggestions] = useState<LocationSuggestion[]>([]);
+  const [suggestions, setSuggestions] = useState<PlaceSuggestion[]>([]);
   const [searchStatus, setSearchStatus] =
     useState<LocationSearchStatus>('idle');
   const [searchError, setSearchError] = useState<ApiError | null>(null);
@@ -241,16 +227,11 @@ export function useLocationSearch({
 
   const commitLookupFailure = useCallback(
     (
-      suggestion: LocationSuggestion,
+      suggestion: PlaceSuggestion,
       nextError: ApiError,
-    ): LocationLookupResult => {
-      const fallback: SettledLocationLookupFailure = {
-        location_mode: 'MANUAL',
-        location_label: truncateCodePoints(
-          suggestion.title,
-          ACTIVITY_FIELD_LIMITS.location_label,
-        ),
-        place: null,
+    ): PlaceLookupResult => {
+      const fallback: PlaceLookupFailure = {
+        label: truncateCodePoints(suggestion.title, MAX_PLACE_LABEL_LENGTH),
         error: nextError,
         guidance: MANUAL_LOCATION_GUIDANCE,
       };
@@ -263,9 +244,7 @@ export function useLocationSearch({
   );
 
   const selectSuggestion = useCallback(
-    async (
-      suggestion: LocationSuggestion,
-    ): Promise<LocationLookupResult> => {
+    async (suggestion: PlaceSuggestion): Promise<PlaceLookupResult> => {
       if (!enabled || !mountedRef.current) {
         return staleLookupResult();
       }
@@ -298,8 +277,8 @@ export function useLocationSearch({
           return staleLookupResult();
         }
 
-        const value = buildStructuredLocation(suggestion, lookup);
-        if (!value) {
+        const place = resolvePlace(suggestion, lookup);
+        if (!place) {
           return commitLookupFailure(
             suggestion,
             INVALID_CANONICAL_PLACE_ERROR,
@@ -307,13 +286,7 @@ export function useLocationSearch({
         }
 
         setLookupStatus('ready');
-        return {
-          kind: 'success',
-          selection: {
-            location_mode: 'STRUCTURED',
-            ...value,
-          },
-        };
+        return { kind: 'success', place };
       } catch (caught) {
         if (
           !mountedRef.current ||
@@ -338,10 +311,8 @@ export function useLocationSearch({
   );
 
   const createManualValue = useCallback(
-    (existingLabel = ''): ManualLocationValue => ({
-      location_mode: 'MANUAL',
-      location_label: query.trim() || existingLabel,
-      place: null,
+    (existingLabel = ''): ManualPlaceEntry => ({
+      label: query.trim() || existingLabel,
     }),
     [query],
   );
@@ -361,8 +332,3 @@ export function useLocationSearch({
     createManualValue,
   };
 }
-
-export type PlacePickerValue = {
-  location_label: string;
-  place: ActivityPlacePayload | null;
-};
