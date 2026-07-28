@@ -42,10 +42,24 @@ export function useAvatarUpdate(): AvatarUpdate {
         return;
       }
       setStatus('uploading');
-      const file = await preprocessImage(outcome.image, AVATAR_TARGET, nativeImageCodec);
-      // The response carries the whole user; replace it rather than patching
-      // avatar_url, so every derived field stays server-authoritative.
-      updateUser(await uploadAvatarRequest(file));
+      // Every temp file this flow creates: the picker's full-resolution copy
+      // and the encoded upload. Both sit in the cache directory and nothing
+      // reads them once the request is done, so without this repeated avatar
+      // changes would pile up megabytes there.
+      const temporaries = [outcome.image.uri];
+      try {
+        const file = await preprocessImage(outcome.image, AVATAR_TARGET, nativeImageCodec);
+        temporaries.push(file.uri);
+        // The response carries the whole user; replace it rather than patching
+        // avatar_url, so every derived field stays server-authoritative.
+        updateUser(await uploadAvatarRequest(file));
+      } finally {
+        // Cleanup runs on the failure path too, and must never replace the
+        // outcome the user is actually waiting on with a delete error.
+        await Promise.all(
+          temporaries.map((uri) => nativeImageCodec.discard(uri).catch(() => undefined)),
+        );
+      }
       setStatus('idle');
     } catch (caught) {
       setStatus('idle');

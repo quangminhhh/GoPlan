@@ -65,14 +65,21 @@ export async function preprocessImage(
   format: UploadImageMimeType = DEFAULT_OUTPUT_FORMAT,
 ): Promise<PreprocessedImage> {
   const { width, height } = scaledDimensions(source.width, source.height, target.maxEdgePx);
+  // Each step writes a cache file. Only the one that fits the budget survives;
+  // every overshooting attempt is discarded as soon as the next step supersedes
+  // it, so a three-step ladder does not leave two dead files behind per upload.
+  let previousAttempt: string | null = null;
 
   for (const quality of QUALITY_STEPS) {
     let encoded: { uri: string; width: number; height: number; bytes: number };
     try {
       encoded = await codec.encode({ uri: source.uri, width, height, quality, format });
     } catch {
+      await discardQuietly(codec, previousAttempt);
       throw new ImagePreprocessError('UNREADABLE', 'That image could not be read.');
     }
+    await discardQuietly(codec, previousAttempt);
+    previousAttempt = encoded.uri;
 
     if (encoded.bytes <= target.maxBytes) {
       return {
@@ -86,8 +93,21 @@ export async function preprocessImage(
     }
   }
 
+  await discardQuietly(codec, previousAttempt);
   throw new ImagePreprocessError(
     'BUDGET_UNREACHABLE',
     'That image could not be compressed enough to upload.',
   );
+}
+
+/** Cleanup must never replace the error the caller actually needs to see. */
+async function discardQuietly(codec: ImageCodec, uri: string | null): Promise<void> {
+  if (uri === null) {
+    return;
+  }
+  try {
+    await codec.discard(uri);
+  } catch {
+    // Intentionally ignored; see ImageCodec.discard.
+  }
 }

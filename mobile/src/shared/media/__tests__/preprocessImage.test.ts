@@ -13,6 +13,7 @@ function codecReturning(bytesByQuality: Record<number, number>): ImageCodec {
       height,
       bytes: bytesByQuality[quality],
     })),
+    discard: jest.fn(async () => undefined),
   };
 }
 
@@ -89,9 +90,48 @@ describe('preprocessImage', () => {
   });
 
   it('fails with UNREADABLE when the codec cannot decode the source', async () => {
-    const codec: ImageCodec = { encode: jest.fn(async () => { throw new Error('decode failed'); }) };
+    const codec: ImageCodec = {
+      encode: jest.fn(async () => { throw new Error('decode failed'); }),
+      discard: jest.fn(async () => undefined),
+    };
 
     await expect(preprocessImage(source, target, codec)).rejects.toBeInstanceOf(ImagePreprocessError);
+    await expect(preprocessImage(source, target, codec)).rejects.toMatchObject({ code: 'UNREADABLE' });
+  });
+
+  it('discards every superseded encode and keeps only the one it returns', async () => {
+    const codec = codecReturning({ 0.9: 900_000, 0.8: 600_000, 0.7: 300_000 });
+
+    const result = await preprocessImage(source, target, codec);
+
+    expect(codec.discard).toHaveBeenCalledWith('file:///out-0.9.jpg');
+    expect(codec.discard).toHaveBeenCalledWith('file:///out-0.8.jpg');
+    expect(codec.discard).not.toHaveBeenCalledWith(result.uri);
+    expect(codec.discard).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves no encode behind when every quality step overshoots', async () => {
+    const codec = codecReturning({ 0.9: 900_000, 0.8: 800_000, 0.7: 700_000 });
+
+    await expect(preprocessImage(source, target, codec)).rejects.toMatchObject({ code: 'BUDGET_UNREACHABLE' });
+
+    expect(codec.discard).toHaveBeenCalledTimes(3);
+    for (const quality of [0.9, 0.8, 0.7]) {
+      expect(codec.discard).toHaveBeenCalledWith(`file:///out-${quality}.jpg`);
+    }
+  });
+
+  it('surfaces the encode failure even when cleaning up the previous step fails', async () => {
+    const codec = codecReturning({ 0.9: 900_000 });
+    (codec.discard as jest.Mock).mockRejectedValue(new Error('delete failed'));
+    (codec.encode as jest.Mock).mockImplementationOnce(async ({ width, height }) => ({
+      uri: 'file:///out-0.9.jpg',
+      width,
+      height,
+      bytes: 900_000,
+    }));
+    (codec.encode as jest.Mock).mockImplementationOnce(async () => { throw new Error('decode failed'); });
+
     await expect(preprocessImage(source, target, codec)).rejects.toMatchObject({ code: 'UNREADABLE' });
   });
 

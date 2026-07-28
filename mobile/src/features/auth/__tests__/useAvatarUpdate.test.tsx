@@ -2,13 +2,17 @@ const mockUpdateUser = jest.fn();
 jest.mock('../session', () => ({ useSession: () => ({ updateUser: mockUpdateUser }) }));
 jest.mock('@/shared/media/pickImage', () => ({ pickImage: jest.fn() }));
 jest.mock('@/shared/media/preprocessImage', () => ({ preprocessImage: jest.fn() }));
-jest.mock('@/shared/media/imageCodec', () => ({ nativeImageCodec: { encode: jest.fn() } }));
+jest.mock('@/shared/media/imageCodec', () => ({
+  nativeImageCodec: { encode: jest.fn(), discard: jest.fn(async () => undefined) },
+}));
 jest.mock('../api', () => ({ uploadAvatarRequest: jest.fn(), deleteAvatarRequest: jest.fn() }));
 
 // eslint-disable-next-line import/first
 import { act, renderHook, waitFor } from '@testing-library/react-native';
 // eslint-disable-next-line import/first
 import { axiosError } from '@test/axiosError';
+// eslint-disable-next-line import/first
+import { nativeImageCodec } from '@/shared/media/imageCodec';
 // eslint-disable-next-line import/first
 import { pickImage } from '@/shared/media/pickImage';
 // eslint-disable-next-line import/first
@@ -29,7 +33,12 @@ const picked = { uri: 'file:///a.heic', width: 4032, height: 4032, fileName: 'IM
 const processed = { uri: 'file:///a.jpg', name: 'IMG_1.jpg', type: 'image/jpeg', width: 512, height: 512, bytes: 60_000 } as const;
 
 describe('useAvatarUpdate', () => {
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // clearAllMocks keeps implementations, so restore the default here rather
+    // than letting one test's rejecting discard leak into the next.
+    (nativeImageCodec.discard as jest.Mock).mockResolvedValue(undefined);
+  });
 
   it('uploads a picked photo and replaces the session user from the response', async () => {
     mockPick.mockResolvedValue({ status: 'picked', image: picked });
@@ -148,6 +157,42 @@ describe('useAvatarUpdate', () => {
     await act(async () => { await result.current.changeAvatar(); });
 
     expect(mockUpload).toHaveBeenCalledTimes(2);
+  });
+
+  it('deletes the picked source and the encoded upload once the request is done', async () => {
+    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPreprocess.mockResolvedValue(processed);
+    mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
+
+    const { result } = await renderHook(useAvatarUpdate);
+    await act(async () => { await result.current.changeAvatar(); });
+
+    expect(nativeImageCodec.discard).toHaveBeenCalledWith(picked.uri);
+    expect(nativeImageCodec.discard).toHaveBeenCalledWith(processed.uri);
+  });
+
+  it('still reports success when deleting a temp file fails', async () => {
+    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPreprocess.mockResolvedValue(processed);
+    mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
+    (nativeImageCodec.discard as jest.Mock).mockRejectedValue(new Error('delete failed'));
+
+    const { result } = await renderHook(useAvatarUpdate);
+    await act(async () => { await result.current.changeAvatar(); });
+
+    expect(mockUpdateUser).toHaveBeenCalledWith({ id: 'u1', avatar_url: '/media/a.webp' });
+    expect(result.current.error).toBeNull();
+  });
+
+  it('deletes the picked source even when the upload fails', async () => {
+    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPreprocess.mockRejectedValue(new ImagePreprocessError('UNREADABLE', 'internal'));
+
+    const { result } = await renderHook(useAvatarUpdate);
+    await act(async () => { await result.current.changeAvatar(); });
+
+    expect(nativeImageCodec.discard).toHaveBeenCalledWith(picked.uri);
+    expect(result.current.error).not.toBeNull();
   });
 
   it('dismissError clears a previous failure', async () => {

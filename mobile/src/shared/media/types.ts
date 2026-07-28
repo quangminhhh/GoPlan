@@ -73,4 +73,18 @@ export interface ImageCodec {
     quality: number;
     format: UploadImageMimeType;
   }): Promise<{ uri: string; width: number; height: number; bytes: number }>;
+
+  /**
+   * Drop a temporary file this flow no longer needs.
+   *
+   * Every encode writes to the cache directory, and the quality ladder can write
+   * three files for one upload. Best-effort by contract: a file that is already
+   * gone, or that the OS refuses to delete, must never fail the surrounding
+   * operation, so implementations swallow their own errors.
+   *
+   * `preprocessImage` discards the intermediates it created. The caller owns the
+   * returned file and the picked source, and discards both once the upload is
+   * finished.
+   */
+  discard(uri: string): Promise<void>;
 }

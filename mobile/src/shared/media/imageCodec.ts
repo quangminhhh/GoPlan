@@ -31,4 +31,17 @@ export const nativeImageCodec: ImageCodec = {
       bytes: new File(saved.uri).size,
     };
   },
+
+  async discard(uri) {
+    try {
+      const file = new File(uri);
+      if (file.exists) {
+        file.delete();
+      }
+    } catch {
+      // Best effort: a URI the filesystem does not own (a content:// or ph://
+      // asset) or an already-deleted file must not break the upload it belongs
+      // to. The OS reclaims the cache directory on its own either way.
+    }
+  },
 };
