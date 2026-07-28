@@ -83,6 +83,24 @@ describe('TripsLayout header actions', () => {
     expect(screen.getByLabelText('Close custom types')).toBeTruthy();
   });
 
+  it('registers Expenses dashboard and detail as push routes and its form as a sheet', async () => {
+    await render(<TripsLayout />);
+
+    expect(mockRegisterScreen).toHaveBeenCalledWith(
+      '[tripId]/expenses/index',
+      expect.objectContaining({ title: 'Expenses' }),
+    );
+    expect(mockRegisterScreen).toHaveBeenCalledWith(
+      '[tripId]/expenses/[expenseId]',
+      expect.objectContaining({ title: 'Expense' }),
+    );
+    expect(mockRegisterScreen).toHaveBeenCalledWith(
+      '[tripId]/expenses/expense-form',
+      expect.objectContaining({ title: 'Expense', presentation: 'formSheet' }),
+    );
+    expect(screen.getByLabelText('Cancel expense form')).toBeTruthy();
+  });
+
   it('returns to the previous route from the trip detail header when history exists', async () => {
     mockRouter.canGoBack.mockReturnValue(true);
     await render(<TripsLayout />);
@@ -98,6 +116,7 @@ describe('TripsLayout header actions', () => {
     ['Cancel timeline day form'],
     ['Cancel timeline activity form'],
     ['Close custom types'],
+    ['Cancel expense form'],
   ])('returns to tabs from %s when there is no navigation history', async (label) => {
     mockRouter.canGoBack.mockReturnValue(false);
     await render(<TripsLayout />);

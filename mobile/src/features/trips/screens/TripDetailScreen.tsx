@@ -166,6 +166,10 @@ export function TripDetailScreen() {
     router.push(`/trips/${tripId}/timeline`);
   }, [router, tripId]);
 
+  const openExpenses = useCallback(() => {
+    router.push(`/trips/${tripId}/expenses`);
+  }, [router, tripId]);
+
   if (status === 'loading') {
     return <LoadingScreen />;
   }
@@ -269,6 +273,7 @@ export function TripDetailScreen() {
               onPress={openTimeline}
               style={({ pressed }) => [
                 styles.planningRow,
+                styles.rowDivider,
                 pressed ? styles.planningRowPressed : null,
               ]}
             >
@@ -279,6 +284,26 @@ export function TripDetailScreen() {
                 <Text style={styles.infoText}>Timeline</Text>
                 <Text style={styles.planningDescription}>
                   Plan days, activities, and reminders
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={colors.textMuted} />
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Open Expenses"
+              onPress={openExpenses}
+              style={({ pressed }) => [
+                styles.planningRow,
+                pressed ? styles.planningRowPressed : null,
+              ]}
+            >
+              <View style={styles.infoIcon}>
+                <Ionicons name="wallet-outline" size={18} color={colors.primary} />
+              </View>
+              <View style={styles.planningCopy}>
+                <Text style={styles.infoText}>Expenses</Text>
+                <Text style={styles.planningDescription}>
+                  Track shared costs and settlement
                 </Text>
               </View>
               <Ionicons name="chevron-forward" size={20} color={colors.textMuted} />
