@@ -1,6 +1,12 @@
 import { Pressable, Text, View } from 'react-native';
 
 const mockRouter = { replace: jest.fn(), push: jest.fn(), back: jest.fn() };
+let mockPlacePickerProps: unknown;
+
+function mockRenderPlacePicker(props: unknown) {
+  mockPlacePickerProps = props;
+  return null;
+}
 
 jest.mock('expo-router', () => ({
   useRouter: () => mockRouter,
@@ -8,6 +14,12 @@ jest.mock('expo-router', () => ({
 
 jest.mock('../api', () => ({
   createTrip: jest.fn(),
+}));
+
+// The picker owns its own debounce, abort controllers and HTTP calls; those are
+// proven in src/shared/location. Mocking it keeps this suite about the payload.
+jest.mock('@/shared/location/PlacePicker', () => ({
+  PlacePicker: mockRenderPlacePicker,
 }));
 
 interface MockDateFieldProps {
@@ -39,15 +51,46 @@ function mockDateField({ label, onChange, error }: MockDateFieldProps) {
 jest.mock('@/shared/ui/DateField', () => ({ DateField: mockDateField }));
 
 // eslint-disable-next-line import/first
+import type { ComponentProps } from 'react';
+// eslint-disable-next-line import/first
 import { AxiosError, AxiosHeaders } from 'axios';
 // eslint-disable-next-line import/first
-import { fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+// eslint-disable-next-line import/first
+import type { PlacePicker } from '@/shared/location/PlacePicker';
+// eslint-disable-next-line import/first
+import type { ResolvedPlace } from '@/shared/location/types';
 // eslint-disable-next-line import/first
 import { createTrip } from '../api';
 // eslint-disable-next-line import/first
 import { CreateTripScreen } from '../screens/CreateTripScreen';
 
 const mockCreateTrip = createTrip as jest.MockedFunction<typeof createTrip>;
+
+const verifiedPlace: ResolvedPlace = {
+  provider: 'here',
+  provider_id: 'canonical-here-id',
+  label: 'Hội An, Quảng Nam',
+  address: 'Hội An, Quảng Nam, Việt Nam',
+  lat: 15.8801,
+  lng: 108.338,
+  country_code: 'VN',
+};
+
+const emptyDestinationFields = {
+  destination_provider: '',
+  destination_provider_id: '',
+  destination_lat: null,
+  destination_lng: null,
+  destination_country_code: '',
+};
+
+function currentPickerProps(): ComponentProps<typeof PlacePicker> {
+  if (!mockPlacePickerProps) {
+    throw new Error('Expected PlacePicker to be rendered.');
+  }
+  return mockPlacePickerProps as ComponentProps<typeof PlacePicker>;
+}
 
 function axiosErrorWith(status: number, data: unknown): AxiosError {
   const config = { headers: new AxiosHeaders() };
@@ -66,7 +109,10 @@ async function fillRequiredFields(): Promise<void> {
 }
 
 describe('CreateTripScreen', () => {
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockPlacePickerProps = undefined;
+  });
 
   it('submits optional values and replaces the route with the created trip detail', async () => {
     mockCreateTrip.mockResolvedValue({ id: 'trip-123' } as never);
@@ -84,6 +130,7 @@ describe('CreateTripScreen', () => {
       expect(mockCreateTrip).toHaveBeenCalledWith({
         name: 'Summer escape',
         destination: 'Da Lat, Vietnam',
+        ...emptyDestinationFields,
         start_date: '2026-06-01',
         end_date: '2026-06-03',
         description: 'Mountain air',
@@ -92,6 +139,88 @@ describe('CreateTripScreen', () => {
       }),
     );
     expect(mockRouter.replace).toHaveBeenCalledWith('/trips/trip-123');
+  });
+
+  it('sends every structured field from one verified place', async () => {
+    mockCreateTrip.mockResolvedValue({ id: 'trip-123' } as never);
+
+    await render(<CreateTripScreen />);
+    await fireEvent.changeText(screen.getByLabelText('Trip name'), 'Hoi An trip');
+    await act(async () => {
+      currentPickerProps().onSelectPlace(verifiedPlace);
+    });
+    await fireEvent.press(screen.getByLabelText('Set Start date to June 1'));
+    await fireEvent.press(screen.getByLabelText('Set End date to June 3'));
+    await fireEvent.press(screen.getByText('Create trip'));
+
+    await waitFor(() =>
+      expect(mockCreateTrip).toHaveBeenCalledWith(
+        expect.objectContaining({
+          destination: 'Hội An, Quảng Nam',
+          destination_provider: 'here',
+          destination_provider_id: 'canonical-here-id',
+          destination_lat: 15.8801,
+          destination_lng: 108.338,
+          destination_country_code: 'VN',
+        }),
+      ),
+    );
+  });
+
+  it('sends explicitly empty structured fields for a manual destination', async () => {
+    mockCreateTrip.mockResolvedValue({ id: 'trip-123' } as never);
+
+    await render(<CreateTripScreen />);
+    await fillRequiredFields();
+    await fireEvent.press(screen.getByText('Create trip'));
+
+    await waitFor(() => expect(mockCreateTrip).toHaveBeenCalled());
+    const payload = mockCreateTrip.mock.calls[0]?.[0];
+    // An omitted key is not the same as an empty one on the server side, so the
+    // manual path must state every column rather than leaving it undefined.
+    expect(payload).toMatchObject({
+      destination: 'Da Lat, Vietnam',
+      ...emptyDestinationFields,
+    });
+    for (const field of Object.keys(emptyDestinationFields)) {
+      expect(payload).toHaveProperty(field);
+    }
+  });
+
+  it('degrades to manual entry and still submits after a lookup failure', async () => {
+    mockCreateTrip.mockResolvedValue({ id: 'trip-123' } as never);
+
+    await render(<CreateTripScreen />);
+    await fireEvent.changeText(screen.getByLabelText('Trip name'), 'Fallback trip');
+    await act(async () => {
+      currentPickerProps().onLookupFailure({
+        label: 'Unverified suggestion',
+        error: { kind: 'network', message: 'Cannot reach the server.' },
+        guidance: 'Enter the location manually.',
+      });
+    });
+    await fireEvent.press(screen.getByText('Create trip'));
+
+    await waitFor(() =>
+      expect(mockCreateTrip).toHaveBeenCalledWith(
+        expect.objectContaining({
+          destination: 'Unverified suggestion',
+          ...emptyDestinationFields,
+        }),
+      ),
+    );
+  });
+
+  it('keeps submit available when place search is unavailable', async () => {
+    await render(<CreateTripScreen />);
+    await fillRequiredFields();
+
+    // The picker renders its own unavailable notice; what matters here is that
+    // the form never depends on it.
+    expect(
+      screen.getByRole('button', { name: 'Create trip' }).props
+        .accessibilityState,
+    ).toEqual(expect.objectContaining({ disabled: false }));
   });
 
   it('blocks a local end-date-before-start-date submission', async () => {

@@ -9,7 +9,9 @@ import { FormError } from '@/shared/ui/FormError';
 import { Screen } from '@/shared/ui/Screen';
 import { TextField } from '@/shared/ui/TextField';
 import { createTrip } from '../api';
+import { DestinationField } from '../components/DestinationField';
 import { formatDateParam } from '../dates';
+import { destinationFields, type TripDestinationValue } from '../destination';
 import { TRIP_CURRENCY_CODES } from '../options';
 import type { CreateTripInput } from '../types';
 
@@ -27,7 +29,10 @@ function FormSection({ title, children }: PropsWithChildren<{ title: string }>) 
 export function CreateTripScreen() {
   const router = useRouter();
   const [name, setName] = useState('');
-  const [destination, setDestination] = useState('');
+  const [destination, setDestination] = useState<TripDestinationValue>({
+    label: '',
+    place: null,
+  });
   const [startDate, setStartDate] = useState(new Date());
   const [endDate, setEndDate] = useState(new Date());
   const [description, setDescription] = useState('');
@@ -36,7 +41,7 @@ export function CreateTripScreen() {
   const [dateError, setDateError] = useState<string | undefined>(undefined);
   const [error, setError] = useState<ApiError | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const canSubmit = Boolean(name.trim() && destination.trim());
+  const canSubmit = Boolean(name.trim() && destination.label.trim());
 
   function onStartDateChange(date: Date) {
     setStartDate(date);
@@ -57,7 +62,7 @@ export function CreateTripScreen() {
     }
     const input: CreateTripInput = {
       name: name.trim(),
-      destination: destination.trim(),
+      ...destinationFields(destination),
       start_date: start,
       end_date: end,
       currency_code: currency,
@@ -108,13 +113,9 @@ export function CreateTripScreen() {
           maxLength={120}
           error={error?.fieldErrors?.name}
         />
-        <TextField
-          label="Destination *"
-          accessibilityLabel="Destination"
-          placeholder="Da Lat, Vietnam"
+        <DestinationField
           value={destination}
-          onChangeText={setDestination}
-          maxLength={200}
+          onChange={setDestination}
           error={error?.fieldErrors?.destination}
         />
       </FormSection>
