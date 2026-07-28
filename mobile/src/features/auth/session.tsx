@@ -7,7 +7,7 @@ import {
   useMemo,
   useState,
 } from 'react';
-import { refreshTokens, setOnRefreshFailed } from '@/shared/api/refresh';
+import { refreshTokens, rotateTokens, setOnRefreshFailed } from '@/shared/api/refresh';
 import { clearTokens, getRefreshToken, setAccessToken, setRefreshToken } from '@/shared/api/token-store';
 import { fetchMe, logoutRequest } from './api';
 import type { AuthResponse, AuthUser } from './types';
@@ -19,6 +19,7 @@ export interface SessionContextValue {
   user: AuthUser | null;
   signIn: (auth: AuthResponse) => Promise<void>;
   signOut: () => Promise<void>;
+  rotateSession: (auth: AuthResponse) => Promise<'rotated' | 'signedOut'>;
   updateUser: (user: AuthUser) => void;
 }
 
@@ -85,13 +86,33 @@ export function SessionProvider({ children }: PropsWithChildren) {
     setStatus('signedOut');
   }, []);
 
+  /**
+   * Adopt the token pair returned by an operation that revoked every previous
+   * token (password change). Owns the failure policy so no screen can get it
+   * wrong: the server has already invalidated this account's tokens, so a failed
+   * secure write leaves nothing usable on disk and the only safe outcome is a
+   * clean re-login — never a stale, already-revoked refresh token left behind.
+   */
+  const rotateSession = useCallback(async (auth: AuthResponse): Promise<'rotated' | 'signedOut'> => {
+    try {
+      await rotateTokens(auth.tokens);
+    } catch {
+      await clearTokens();
+      setUser(null);
+      setStatus('signedOut');
+      return 'signedOut';
+    }
+    setUser(auth.user);
+    return 'rotated';
+  }, []);
+
   const updateUser = useCallback((next: AuthUser) => {
     setUser(next);
   }, []);
 
   const value = useMemo(
-    () => ({ status, user, signIn, signOut, updateUser }),
-    [status, user, signIn, signOut, updateUser],
+    () => ({ status, user, signIn, signOut, rotateSession, updateUser }),
+    [status, user, signIn, signOut, rotateSession, updateUser],
   );
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
