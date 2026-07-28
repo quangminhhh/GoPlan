@@ -3,11 +3,9 @@ import type {
   CreateActivityPayload,
   CreateCustomTypePayload,
   CreateSectionPayload,
-  LocationSuggestion,
   PatchActivityPayload,
   PatchCustomTypePayload,
   PatchSectionPayload,
-  ResolvedLocationLookup,
   TimelineActivity,
   TimelineCustomTypeMeta,
   TimelineResponse,
@@ -26,10 +24,6 @@ interface ActivityResponse {
 
 interface CustomTypeResponse {
   custom_type: TimelineCustomTypeMeta;
-}
-
-interface LocationSuggestionsResponse {
-  suggestions: LocationSuggestion[];
 }
 
 export async function getTimeline(
@@ -146,32 +140,4 @@ export async function deleteCustomType(
   typeId: string,
 ): Promise<void> {
   await apiClient.delete(`/trips/${tripId}/timeline/custom-types/${typeId}`);
-}
-
-export async function suggestLocations(
-  query: string,
-  signal?: AbortSignal,
-): Promise<LocationSuggestion[]> {
-  const { data } = await apiClient.get<LocationSuggestionsResponse>(
-    '/location-search/suggest',
-    {
-      params: { q: query },
-      signal,
-    },
-  );
-  return data.suggestions;
-}
-
-export async function lookupLocation(
-  providerId: string,
-  signal?: AbortSignal,
-): Promise<ResolvedLocationLookup> {
-  const { data } = await apiClient.get<ResolvedLocationLookup>(
-    '/location-search/lookup',
-    {
-      params: { id: providerId },
-      signal,
-    },
-  );
-  return data;
 }

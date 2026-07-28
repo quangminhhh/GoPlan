@@ -18,11 +18,9 @@ import {
   deleteCustomType,
   deleteSection,
   getTimeline,
-  lookupLocation,
   patchActivity,
   patchCustomType,
   patchSection,
-  suggestLocations,
   updateActivityStatus,
 } from '../api';
 
@@ -222,48 +220,6 @@ describe('timeline api', () => {
     expect(mockDelete).toHaveBeenCalledWith(
       '/trips/trip-1/timeline/custom-types/type-1',
     );
-  });
-
-  it('suggests locations and unwraps suggestions with cancellation support', async () => {
-    const controller = new AbortController();
-    const suggestions = [
-      {
-        provider: 'here',
-        provider_id: 'here:place:1',
-        title: 'Da Nang',
-        subtitle: 'Vietnam',
-      },
-    ];
-    mockGet.mockResolvedValue({ data: { suggestions } } as never);
-
-    await expect(
-      suggestLocations('Da Nang', controller.signal),
-    ).resolves.toEqual(suggestions);
-    expect(mockGet).toHaveBeenCalledWith('/location-search/suggest', {
-      params: { q: 'Da Nang' },
-      signal: controller.signal,
-    });
-  });
-
-  it('looks up a canonical location from the direct response with cancellation support', async () => {
-    const controller = new AbortController();
-    const lookup = {
-      destination: 'Da Nang, Vietnam',
-      destination_provider: 'here',
-      destination_provider_id: 'here:place:canonical',
-      destination_lat: 16.0544,
-      destination_lng: 108.2022,
-      destination_country_code: 'VN',
-    };
-    mockGet.mockResolvedValue({ data: lookup } as never);
-
-    await expect(
-      lookupLocation('here:place:1', controller.signal),
-    ).resolves.toEqual(lookup);
-    expect(mockGet).toHaveBeenCalledWith('/location-search/lookup', {
-      params: { id: 'here:place:1' },
-      signal: controller.signal,
-    });
   });
 
   it('lets API failures propagate for callers to normalize', async () => {

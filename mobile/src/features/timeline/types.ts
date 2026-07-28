@@ -195,21 +195,3 @@ export type PatchCustomTypePayload = Partial<{
   icon_key: string;
   is_active: boolean;
 }>;
-
-export interface LocationSuggestion {
-  provider: 'here';
-  provider_id: string;
-  title: string;
-  subtitle: string;
-}
-
-export interface ResolvedLocationLookup {
-  destination: string;
-  destination_provider: 'here';
-  destination_provider_id: string;
-  destination_lat: number | null;
-  destination_lng: number | null;
-  destination_country_code: string;
-}
-
-export type ResolvedLookup = ResolvedLocationLookup;
