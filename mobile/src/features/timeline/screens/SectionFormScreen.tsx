@@ -131,6 +131,7 @@ interface SectionFormEditorProps {
   initialDraft: SectionFormDraft;
   canManage: boolean;
   submitLockRef: { current: boolean };
+  submissionCommittedRef: { current: boolean };
   submitting: boolean;
   setSubmitting: (submitting: boolean) => void;
   invalidate: () => void;
@@ -148,6 +149,7 @@ function SectionFormEditor({
   initialDraft,
   canManage,
   submitLockRef,
+  submissionCommittedRef,
   submitting,
   setSubmitting,
   invalidate,
@@ -242,15 +244,22 @@ function SectionFormEditor({
       } else if (intent.mode === 'edit' && patchPayload) {
         await patchSection(intent.tripId, intent.sectionId, patchPayload);
       }
+      submissionCommittedRef.current = true;
 
       await publishTimelineEvent({
         type: 'timelineChanged',
         tripId: intent.tripId,
       });
-      if (mountedRef.current && isActiveGeneration(generation)) {
+      if (isScreenActive()) {
         onConfirmedSuccess();
       }
     } catch (caught) {
+      if (submissionCommittedRef.current) {
+        if (isScreenActive()) {
+          onConfirmedSuccess();
+        }
+        return;
+      }
       if (!mountedRef.current || !isActiveGeneration(generation)) {
         return;
       }
@@ -260,8 +269,10 @@ function SectionFormEditor({
         await refresh('silent');
       }
     } finally {
-      submitLockRef.current = false;
-      if (isScreenActive()) {
+      if (!submissionCommittedRef.current) {
+        submitLockRef.current = false;
+      }
+      if (!submissionCommittedRef.current && isScreenActive()) {
         setSubmitting(false);
       }
     }
@@ -279,6 +290,7 @@ function SectionFormEditor({
     refresh,
     setSubmitting,
     submitLockRef,
+    submissionCommittedRef,
     timeline.sections,
   ]);
 
@@ -334,6 +346,7 @@ function ValidSectionFormScreen({
   } = useTimeline(intent.tripId, { autoReconcile: false });
   const [submitting, setSubmitting] = useState(false);
   const submitLockRef = useRef(false);
+  const submissionCommittedRef = useRef(false);
   const activeRef = useRef(false);
   const mountedRef = useRef(true);
   const generationRef = useRef(0);
@@ -360,16 +373,20 @@ function ValidSectionFormScreen({
     useCallback(() => {
       activeRef.current = true;
       generationRef.current += 1;
-      if (!submitLockRef.current) {
-        setSubmitting(false);
+      if (submissionCommittedRef.current) {
+        router.dismissTo(parentHref);
+      } else {
+        if (!submitLockRef.current) {
+          setSubmitting(false);
+        }
+        void requestReconcile();
       }
-      void requestReconcile();
 
       return () => {
         activeRef.current = false;
         generationRef.current += 1;
       };
-    }, [requestReconcile]),
+    }, [parentHref, requestReconcile, router]),
   );
 
   useEffect(
@@ -392,7 +409,7 @@ function ValidSectionFormScreen({
   useEffect(
     () =>
       subscribeToTimelineEvents(intent.tripId, () => {
-        if (activeRef.current) {
+        if (activeRef.current && !submissionCommittedRef.current) {
           return requestReconcile();
         }
         return undefined;
@@ -525,6 +542,7 @@ function ValidSectionFormScreen({
         initialDraft={initialDraft}
         canManage={canManage}
         submitLockRef={submitLockRef}
+        submissionCommittedRef={submissionCommittedRef}
         submitting={submitting}
         setSubmitting={setSubmitting}
         invalidate={invalidate}

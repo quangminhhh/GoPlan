@@ -90,6 +90,7 @@ interface HydratedActivityFormProps {
   requestReconcile: (forceInitial?: boolean) => Promise<void>;
   invalidateTimeline: () => void;
   submitLockRef: { current: boolean };
+  submissionCommittedRef: { current: boolean };
   submitting: boolean;
   setSubmitting: (submitting: boolean) => void;
   isScreenActive: () => boolean;
@@ -208,6 +209,7 @@ function HydratedActivityForm({
   requestReconcile,
   invalidateTimeline,
   submitLockRef,
+  submissionCommittedRef,
   submitting,
   setSubmitting,
   isScreenActive,
@@ -372,16 +374,23 @@ function HydratedActivityForm({
       } else if (intent.mode === 'edit' && patchPayload) {
         await patchActivity(intent.tripId, intent.activityId, patchPayload);
       }
+      submissionCommittedRef.current = true;
 
       await publishTimelineEvent({
         type: 'timelineChanged',
         tripId: intent.tripId,
       });
 
-      if (isActiveGeneration(generation)) {
+      if (isScreenActive()) {
         router.dismissTo(parentHref);
       }
     } catch (caught) {
+      if (submissionCommittedRef.current) {
+        if (isScreenActive()) {
+          router.dismissTo(parentHref);
+        }
+        return;
+      }
       if (!isActiveGeneration(generation)) {
         return;
       }
@@ -391,8 +400,10 @@ function HydratedActivityForm({
         await refreshAll('silent');
       }
     } finally {
-      submitLockRef.current = false;
-      if (isScreenActive()) {
+      if (!submissionCommittedRef.current) {
+        submitLockRef.current = false;
+      }
+      if (!submissionCommittedRef.current && isScreenActive()) {
         setSubmitting(false);
       }
     }
@@ -413,6 +424,7 @@ function HydratedActivityForm({
     selectableCustomTypeIds,
     setSubmitting,
     submitLockRef,
+    submissionCommittedRef,
   ]);
 
   const pullToRefresh = useCallback(() => {
@@ -477,7 +489,10 @@ function HydratedActivityForm({
         refreshing={timelineRefreshing || tripRefreshing}
         localFieldErrors={localFieldErrors}
         submitError={submitError}
-        backgroundError={timelineError ?? tripError}
+        backgroundError={selectActivityFormError(
+          timelineError,
+          tripError,
+        )}
         onDraftChange={changeDraft}
         onSubmit={() => void submit()}
         onRefresh={pullToRefresh}
@@ -516,6 +531,7 @@ function ValidActivityFormScreen({
   });
   const [submitting, setSubmitting] = useState(false);
   const submitLockRef = useRef(false);
+  const submissionCommittedRef = useRef(false);
   const activeRef = useRef(false);
   const mountedRef = useRef(true);
   const generationRef = useRef(0);
@@ -545,16 +561,20 @@ function ValidActivityFormScreen({
     useCallback(() => {
       activeRef.current = true;
       generationRef.current += 1;
-      if (!submitLockRef.current) {
-        setSubmitting(false);
+      if (submissionCommittedRef.current) {
+        router.dismissTo(parentHref);
+      } else {
+        if (!submitLockRef.current) {
+          setSubmitting(false);
+        }
+        void requestReconcile();
       }
-      void requestReconcile();
 
       return () => {
         activeRef.current = false;
         generationRef.current += 1;
       };
-    }, [requestReconcile]),
+    }, [parentHref, requestReconcile, router]),
   );
 
   useEffect(
@@ -568,7 +588,7 @@ function ValidActivityFormScreen({
 
   useAppForegroundEffect(
     useCallback(() => {
-      if (activeRef.current) {
+      if (activeRef.current && !submissionCommittedRef.current) {
         void requestReconcile();
       }
     }, [requestReconcile]),
@@ -577,7 +597,7 @@ function ValidActivityFormScreen({
   useEffect(
     () =>
       subscribeToTimelineEvents(intent.tripId, () => {
-        if (!activeRef.current) {
+        if (!activeRef.current || submissionCommittedRef.current) {
           return;
         }
         return requestReconcile();
@@ -590,6 +610,7 @@ function ValidActivityFormScreen({
       subscribeToTripEvents((event) => {
         if (
           activeRef.current &&
+          !submissionCommittedRef.current &&
           isEventForTrip(event, intent.tripId)
         ) {
           void requestReconcile();
@@ -636,7 +657,12 @@ function ValidActivityFormScreen({
       : undefined;
 
   if (!timeline || !detail) {
-    const loadError = timelineError ?? tripError;
+    const loadError = selectActivityFormError(
+      timelineError,
+      tripError,
+      !timeline,
+      !detail,
+    );
     const loading =
       !loadError &&
       (timelineStatus === 'loading' || tripStatus === 'loading');
@@ -682,6 +708,7 @@ function ValidActivityFormScreen({
       requestReconcile={requestReconcile}
       invalidateTimeline={invalidateTimeline}
       submitLockRef={submitLockRef}
+      submissionCommittedRef={submissionCommittedRef}
       submitting={submitting}
       setSubmitting={setSubmitting}
       isScreenActive={isScreenActive}
@@ -773,6 +800,27 @@ function isEventForTrip(event: TripEvent, tripId: string): boolean {
 
 function shouldReconcileAfterFailure(error: ApiError): boolean {
   return error.status === 403 || error.status === 404 || error.status === 409;
+}
+
+function selectActivityFormError(
+  timelineError: ApiError | null,
+  tripError: ApiError | null,
+  timelineMissing = false,
+  tripMissing = false,
+): ApiError | null {
+  if (timelineError?.status === 404) {
+    return timelineError;
+  }
+  if (tripError?.status === 404) {
+    return tripError;
+  }
+  if (timelineMissing && timelineError) {
+    return timelineError;
+  }
+  if (tripMissing && tripError) {
+    return tripError;
+  }
+  return timelineError ?? tripError;
 }
 
 function getAuthorityMessage({

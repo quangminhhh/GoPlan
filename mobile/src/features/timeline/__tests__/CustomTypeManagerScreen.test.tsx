@@ -725,6 +725,9 @@ describe('CustomTypeManagerScreen', () => {
       expect(mockPublishTimelineEvent).toHaveBeenCalledTimes(1),
     );
     expect(screen.queryByText('Custom type created.')).toBeNull();
+    expect(
+      screen.getByLabelText('New custom type name').props.value,
+    ).toBe('');
     expect(mockRefresh).not.toHaveBeenCalled();
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
   });

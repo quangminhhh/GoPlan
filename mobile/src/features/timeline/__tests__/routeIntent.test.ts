@@ -26,7 +26,7 @@ describe('parseTimelineRouteIntent', () => {
   it('accepts one canonical UUID string', () => {
     expect(parseTimelineRouteIntent({ tripId: TRIP_ID })).toEqual({ tripId: TRIP_ID });
     expect(parseTimelineRouteIntent({ tripId: TRIP_ID.toUpperCase() })).toEqual({
-      tripId: TRIP_ID.toUpperCase(),
+      tripId: TRIP_ID,
     });
   });
 
@@ -53,6 +53,17 @@ describe('parseSectionFormRouteIntent', () => {
       tripId: TRIP_ID,
     });
     expect(parseSectionFormRouteIntent(editParams)).toEqual({
+      mode: 'edit',
+      tripId: TRIP_ID,
+      sectionId: SECTION_ID,
+    });
+    expect(
+      parseSectionFormRouteIntent({
+        ...editParams,
+        tripId: TRIP_ID.toUpperCase(),
+        sectionId: SECTION_ID.toUpperCase(),
+      }),
+    ).toEqual({
       mode: 'edit',
       tripId: TRIP_ID,
       sectionId: SECTION_ID,
@@ -106,6 +117,28 @@ describe('parseActivityFormRouteIntent', () => {
       sectionId: SECTION_ID,
     });
     expect(parseActivityFormRouteIntent(editParams)).toEqual({
+      mode: 'edit',
+      tripId: TRIP_ID,
+      activityId: ACTIVITY_ID,
+    });
+    expect(
+      parseActivityFormRouteIntent({
+        ...createParams,
+        tripId: TRIP_ID.toUpperCase(),
+        sectionId: SECTION_ID.toUpperCase(),
+      }),
+    ).toEqual({
+      mode: 'create',
+      tripId: TRIP_ID,
+      sectionId: SECTION_ID,
+    });
+    expect(
+      parseActivityFormRouteIntent({
+        ...editParams,
+        tripId: TRIP_ID.toUpperCase(),
+        activityId: ACTIVITY_ID.toUpperCase(),
+      }),
+    ).toEqual({
       mode: 'edit',
       tripId: TRIP_ID,
       activityId: ACTIVITY_ID,

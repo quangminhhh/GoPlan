@@ -610,6 +610,40 @@ describe('activity payloads', () => {
     });
   });
 
+  it('rounds structured coordinates to the backend precision for create and patch', () => {
+    const initial = validDraft({
+      location_mode: 'STRUCTURED',
+      location_label: 'Da Nang',
+      place: {
+        provider: 'here',
+        provider_id: 'canonical-id',
+        title: 'Da Nang',
+        address: 'Vietnam',
+        lat: 16,
+        lng: 108,
+      },
+    });
+    const draft = {
+      ...initial,
+      place: {
+        ...initial.place!,
+        lat: 16.0470791,
+        lng: 108.2062309,
+      },
+    };
+
+    expect(buildCreateActivityPayload(draft)?.place).toMatchObject({
+      lat: 16.047079,
+      lng: 108.206231,
+    });
+    expect(
+      buildPatchActivityPayload(initial, draft, { place: true })?.place,
+    ).toMatchObject({
+      lat: 16.047079,
+      lng: 108.206231,
+    });
+  });
+
   it('serializes non-timed values with explicit null times and no reminders', () => {
     const payload = buildCreateActivityPayload(
       validDraft({

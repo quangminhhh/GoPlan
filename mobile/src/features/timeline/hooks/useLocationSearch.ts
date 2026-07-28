@@ -73,6 +73,10 @@ function staleLookupResult(): LocationLookupResult {
   return { kind: 'stale' };
 }
 
+function truncateCodePoints(value: string, maxLength: number): string {
+  return Array.from(value).slice(0, maxLength).join('');
+}
+
 export function useLocationSearch({
   enabled = true,
 }: UseLocationSearchOptions = {}) {
@@ -242,7 +246,10 @@ export function useLocationSearch({
     ): LocationLookupResult => {
       const fallback: SettledLocationLookupFailure = {
         location_mode: 'MANUAL',
-        location_label: suggestion.title,
+        location_label: truncateCodePoints(
+          suggestion.title,
+          ACTIVITY_FIELD_LIMITS.location_label,
+        ),
         place: null,
         error: nextError,
         guidance: MANUAL_LOCATION_GUIDANCE,

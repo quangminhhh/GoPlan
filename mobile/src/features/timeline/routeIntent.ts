@@ -34,7 +34,7 @@ function parseUuid(value: TimelineRouteParam): string | null {
   if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) {
     return null;
   }
-  return UUID_PATTERN.test(value) ? value : null;
+  return UUID_PATTERN.test(value) ? value.toLowerCase() : null;
 }
 
 export function parseTimelineRouteIntent({

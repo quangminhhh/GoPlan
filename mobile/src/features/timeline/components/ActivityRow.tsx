@@ -7,6 +7,7 @@ import {
   Text,
   View,
 } from 'react-native';
+import type { ApiError } from '@/shared/api/errors';
 import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
 import { ActivityStatusControls } from './ActivityStatusControls';
 import { getTimelineIconName, getTimelineTokenColors } from '../tokenMaps';
@@ -25,6 +26,7 @@ interface ActivityRowProps {
     activityId: string,
     nextStatus: TimelineActivityStatus,
   ) => Promise<void>;
+  statusError?: ApiError | null;
 }
 
 interface DetailLineProps {
@@ -97,6 +99,7 @@ function ActivityRowComponent({
   onEdit,
   onDelete,
   onChangeStatus,
+  statusError,
 }: ActivityRowProps) {
   const [expanded, setExpanded] = useState(false);
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
@@ -311,9 +314,17 @@ function ActivityRowComponent({
             <ActivityStatusControls
               activity={activity}
               disabled={actionsDisabled}
+              error={statusError === undefined ? undefined : null}
               onChangeStatus={changeStatus}
             />
           ) : null}
+        </View>
+      ) : null}
+
+      {statusError ? (
+        <View accessibilityRole="alert" style={styles.linkNotice}>
+          <Ionicons name="alert-circle-outline" size={16} color={colors.danger} />
+          <Text style={styles.linkNoticeText}>{statusError.message}</Text>
         </View>
       ) : null}
 

@@ -38,6 +38,7 @@ export function useTimeline(
   const snapshotRef = useRef<TimelineSnapshot | null>(null);
   const requestIdRef = useRef(0);
   const activeTripIdRef = useRef(tripId);
+  const focusedRef = useRef(false);
 
   useEffect(() => {
     activeTripIdRef.current = tripId;
@@ -137,11 +138,16 @@ export function useTimeline(
       return undefined;
     }
 
-    return subscribeToTimelineEvents(tripId, () => refresh('silent'));
+    return subscribeToTimelineEvents(tripId, () => {
+      if (focusedRef.current) {
+        return refresh('silent');
+      }
+      return undefined;
+    });
   }, [autoReconcile, refresh, tripId]);
 
   const reconcileOnForeground = useCallback(() => {
-    if (autoReconcile) {
+    if (autoReconcile && focusedRef.current) {
       void refresh(snapshotRef.current?.tripId === tripId ? 'silent' : 'initial');
     }
   }, [autoReconcile, refresh, tripId]);
@@ -150,11 +156,13 @@ export function useTimeline(
 
   useFocusEffect(
     useCallback(() => {
+      focusedRef.current = true;
       if (autoReconcile) {
         void refresh(snapshotRef.current?.tripId === tripId ? 'silent' : 'initial');
       }
 
       return () => {
+        focusedRef.current = false;
         requestIdRef.current += 1;
       };
     }, [autoReconcile, refresh, tripId]),

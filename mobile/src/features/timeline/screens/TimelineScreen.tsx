@@ -13,7 +13,7 @@ import {
   type SectionListRenderItemInfo,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { normalizeApiError } from '@/shared/api/errors';
+import { normalizeApiError, type ApiError } from '@/shared/api/errors';
 import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
 import { Button } from '@/shared/ui/Button';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
@@ -55,6 +55,11 @@ interface PendingActivityMutation {
   kind: 'delete' | 'status';
 }
 
+interface ActivityStatusMutationError {
+  activityId: string;
+  error: ApiError;
+}
+
 function TimelineContent({ tripId }: TimelineContentProps) {
   const router = useRouter();
   const {
@@ -86,12 +91,26 @@ function TimelineContent({ tripId }: TimelineContentProps) {
   );
   const [pendingActivityMutation, setPendingActivityMutation] =
     useState<PendingActivityMutation | null>(null);
+  const [activityStatusError, setActivityStatusError] =
+    useState<ActivityStatusMutationError | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const sections = useMemo(
     () => buildTimelineListSections(timeline?.sections ?? []),
     [timeline?.sections],
   );
   const actionsLocked = sectionActionsLocked || activityActionsLocked;
+  const statusErrorActivityExists =
+    activityStatusError !== null &&
+    timeline?.sections.some((section) =>
+      section.activities.some(
+        (activity) => activity.id === activityStatusError.activityId,
+      ),
+    ) === true;
+  const detachedStatusErrorMessage =
+    activityStatusError && !statusErrorActivityExists
+      ? activityStatusError.error.message
+      : null;
+  const visibleMutationError = mutationError ?? detachedStatusErrorMessage;
 
   useEffect(() => {
     if (
@@ -181,6 +200,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
       return;
     }
     setMutationError(null);
+    setActivityStatusError(null);
     router.push(`/trips/${tripId}/timeline/section-form?mode=create`);
   }, [router, tripId]);
 
@@ -190,6 +210,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
         return;
       }
       setMutationError(null);
+      setActivityStatusError(null);
       router.push(
         `/trips/${tripId}/timeline/section-form?mode=edit&sectionId=${section.id}`,
       );
@@ -203,6 +224,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
         return;
       }
       setMutationError(null);
+      setActivityStatusError(null);
       router.push(
         `/trips/${tripId}/timeline/activity-form?mode=create&sectionId=${sectionId}`,
       );
@@ -216,6 +238,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
         return;
       }
       setMutationError(null);
+      setActivityStatusError(null);
       router.push(
         `/trips/${tripId}/timeline/activity-form?mode=edit&activityId=${activityId}`,
       );
@@ -233,6 +256,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
 
       setDeletingSectionId(section.id);
       setMutationError(null);
+      setActivityStatusError(null);
       invalidate();
 
       try {
@@ -277,6 +301,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
       deleteStartedRef.current = false;
       setSectionActionsLocked(true);
       setMutationError(null);
+      setActivityStatusError(null);
       const releasePrompt = () => {
         if (deleteStartedRef.current) {
           return;
@@ -333,6 +358,8 @@ function TimelineContent({ tripId }: TimelineContentProps) {
       activityLockRef.current = true;
       setActivityActionsLocked(true);
       setPendingActivityMutation({ activityId, kind: 'status' });
+      setActivityStatusError(null);
+      setMutationError(null);
       invalidate();
 
       try {
@@ -346,6 +373,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
       } catch (caught) {
         if (mountedRef.current) {
           const normalized = normalizeApiError(caught);
+          setActivityStatusError({ activityId, error: normalized });
           if (
             normalized.status === 403 ||
             normalized.status === 404 ||
@@ -376,6 +404,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
 
       setPendingActivityMutation({ activityId, kind: 'delete' });
       setMutationError(null);
+      setActivityStatusError(null);
       invalidate();
 
       try {
@@ -427,6 +456,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
       activityDeleteStartedRef.current = false;
       setActivityActionsLocked(true);
       setMutationError(null);
+      setActivityStatusError(null);
       const releasePrompt = () => {
         if (activityDeleteStartedRef.current) {
           return;
@@ -493,11 +523,17 @@ function TimelineContent({ tripId }: TimelineContentProps) {
           onEdit={openEditActivity}
           onDelete={confirmDeleteActivity}
           onChangeStatus={changeActivityStatus}
+          statusError={
+            activityStatusError?.activityId === item.activity.id
+              ? activityStatusError.error
+              : null
+          }
         />
       );
     },
     [
       actionsLocked,
+      activityStatusError,
       changeActivityStatus,
       confirmDeleteActivity,
       openEditActivity,
@@ -616,7 +652,7 @@ function TimelineContent({ tripId }: TimelineContentProps) {
         }
         ListHeaderComponent={
           error ||
-          mutationError ||
+          visibleMutationError ||
           deletingSectionId ||
           pendingActivityMutation ? (
             <View>
@@ -641,14 +677,16 @@ function TimelineContent({ tripId }: TimelineContentProps) {
                   </Pressable>
                 </View>
               ) : null}
-              {mutationError ? (
+              {visibleMutationError ? (
                 <View accessibilityRole="alert" style={styles.inlineError}>
                   <Ionicons
                     name="alert-circle-outline"
                     size={20}
                     color={colors.danger}
                   />
-                  <Text style={styles.inlineErrorText}>{mutationError}</Text>
+                  <Text style={styles.inlineErrorText}>
+                    {visibleMutationError}
+                  </Text>
                 </View>
               ) : null}
               {deletingSectionId ? (

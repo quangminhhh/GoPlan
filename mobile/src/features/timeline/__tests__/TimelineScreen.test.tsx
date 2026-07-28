@@ -149,6 +149,16 @@ function hookState({
   };
 }
 
+function deferred<T>() {
+  let resolve: (value: T) => void = () => undefined;
+  let reject: (reason?: unknown) => void = () => undefined;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('TimelineScreen', () => {
   let scrollSpy: jest.SpyInstance;
   let alertSpy: jest.SpyInstance;
@@ -516,7 +526,7 @@ describe('TimelineScreen', () => {
     });
   });
 
-  it('updates status through the row capability and reconciles a rejected transition', async () => {
+  it('keeps a rejected status detail visible after reconciliation revokes the control', async () => {
     const conflict = new AxiosError(
       'Conflict',
       undefined,
@@ -534,6 +544,159 @@ describe('TimelineScreen', () => {
       },
     );
     mockUpdateActivityStatus.mockRejectedValue(conflict);
+    const initialTimeline = buildTimeline({
+      sections: [
+        buildSection({
+          activities: [
+            buildActivity({
+              title: 'Airport transfer',
+              capabilities: {
+                can_edit: false,
+                can_delete: false,
+                can_update_status: true,
+              },
+            }),
+          ],
+        }),
+      ],
+    });
+    const reconciledTimeline = buildTimeline({
+      sections: [
+        buildSection({
+          activities: [
+            buildActivity({
+              title: 'Airport transfer',
+              status: 'IN_PROGRESS',
+              capabilities: {
+                can_edit: false,
+                can_delete: false,
+                can_update_status: false,
+              },
+            }),
+          ],
+        }),
+      ],
+    });
+    const state = hookState({
+      timeline: initialTimeline,
+    });
+    const reconciledState = hookState({
+      timeline: reconciledTimeline,
+    });
+    const pendingRefresh = deferred<void>();
+    state.refresh.mockReturnValue(pendingRefresh.promise);
+    mockUseTimeline.mockReturnValue(state);
+    const rendered = await render(<TimelineScreen />);
+
+    await fireEvent.press(
+      screen.getByRole('button', {
+        name: 'Expand Airport transfer details',
+      }),
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Start activity' }),
+    );
+    await waitFor(() =>
+      expect(state.refresh).toHaveBeenCalledWith('silent'),
+    );
+    mockUseTimeline.mockReturnValue(reconciledState);
+    await rendered.rerender(<TimelineScreen />);
+    await act(async () => {
+      pendingRefresh.resolve();
+    });
+
+    expect(
+      await screen.findByText(
+        'This status transition is no longer allowed.',
+      ),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('button', { name: 'Start activity' }),
+      ).toBeNull(),
+    );
+    expect(mockUpdateActivityStatus).toHaveBeenCalledWith(
+      TRIP_ID,
+      'activity-1',
+      { status: 'IN_PROGRESS' },
+    );
+    expect(state.invalidate).toHaveBeenCalledTimes(1);
+    expect(state.refresh).toHaveBeenCalledWith('silent');
+    expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
+  });
+
+  it('keeps a rejected status detail visible when reconciliation removes the activity', async () => {
+    mockUpdateActivityStatus.mockRejectedValue(
+      new AxiosError(
+        'Not found',
+        undefined,
+        undefined,
+        undefined,
+        {
+          status: 404,
+          statusText: 'Not Found',
+          headers: {},
+          config: {} as never,
+          data: {
+            detail: 'This activity no longer exists.',
+            error_code: 'ACTIVITY_NOT_FOUND',
+          },
+        },
+      ),
+    );
+    const state = hookState({
+      timeline: buildTimeline({
+        sections: [
+          buildSection({
+            activities: [
+              buildActivity({
+                title: 'Airport transfer',
+                capabilities: {
+                  can_edit: false,
+                  can_delete: false,
+                  can_update_status: true,
+                },
+              }),
+            ],
+          }),
+        ],
+      }),
+    });
+    const reconciledState = hookState({
+      timeline: buildTimeline({
+        sections: [buildSection({ activities: [] })],
+      }),
+    });
+    const pendingRefresh = deferred<void>();
+    state.refresh.mockReturnValue(pendingRefresh.promise);
+    mockUseTimeline.mockReturnValue(state);
+    const rendered = await render(<TimelineScreen />);
+
+    await fireEvent.press(
+      screen.getByRole('button', {
+        name: 'Expand Airport transfer details',
+      }),
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Start activity' }),
+    );
+    await waitFor(() =>
+      expect(state.refresh).toHaveBeenCalledWith('silent'),
+    );
+    mockUseTimeline.mockReturnValue(reconciledState);
+    await rendered.rerender(<TimelineScreen />);
+    await act(async () => {
+      pendingRefresh.resolve();
+    });
+
+    expect(
+      await screen.findByText('This activity no longer exists.'),
+    ).toBeTruthy();
+    expect(screen.queryByText('Airport transfer')).toBeNull();
+    expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
+  });
+
+  it('updates status through the row capability and publishes success', async () => {
     const state = hookState({
       timeline: buildTimeline({
         sections: [
@@ -564,19 +727,18 @@ describe('TimelineScreen', () => {
       screen.getByRole('button', { name: 'Start activity' }),
     );
 
-    expect(
-      await screen.findByText(
-        'This status transition is no longer allowed.',
+    await waitFor(() =>
+      expect(mockUpdateActivityStatus).toHaveBeenCalledWith(
+        TRIP_ID,
+        'activity-1',
+        { status: 'IN_PROGRESS' },
       ),
-    ).toBeTruthy();
-    expect(mockUpdateActivityStatus).toHaveBeenCalledWith(
-      TRIP_ID,
-      'activity-1',
-      { status: 'IN_PROGRESS' },
     );
     expect(state.invalidate).toHaveBeenCalledTimes(1);
-    expect(state.refresh).toHaveBeenCalledWith('silent');
-    expect(mockPublishTimelineEvent).not.toHaveBeenCalled();
+    expect(mockPublishTimelineEvent).toHaveBeenCalledWith({
+      type: 'timelineChanged',
+      tripId: TRIP_ID,
+    });
   });
 
   it('keeps rows visible with an inline error and retries silently', async () => {

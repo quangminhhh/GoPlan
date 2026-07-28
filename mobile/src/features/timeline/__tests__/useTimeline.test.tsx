@@ -305,6 +305,38 @@ describe('useTimeline', () => {
     unmount();
   });
 
+  it('ignores reconciliation while blurred and refreshes once on refocus', async () => {
+    mockGetTimeline
+      .mockResolvedValueOnce(timeline('Arrival'))
+      .mockResolvedValueOnce(timeline('Refocused'));
+    const { result, unmount } = await renderHook(() => useTimeline('trip-1'));
+
+    let blur: (() => void) | void;
+    await act(async () => {
+      blur = latestFocusCallback()();
+    });
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    await act(async () => {
+      blur?.();
+      latestForegroundCallback()();
+      await publishTimelineEvent({
+        type: 'timelineChanged',
+        tripId: 'trip-1',
+      });
+    });
+    expect(mockGetTimeline).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      latestFocusCallback()();
+    });
+    await waitFor(() =>
+      expect(result.current.timeline?.sections[0]?.label).toBe('Refocused'),
+    );
+    expect(mockGetTimeline).toHaveBeenCalledTimes(2);
+    unmount();
+  });
+
   it('does not own focus, foreground, or events when auto reconciliation is disabled', async () => {
     mockGetTimeline.mockResolvedValue(timeline('Manual load'));
     const { result, unmount } = await renderHook(() =>

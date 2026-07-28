@@ -22,7 +22,7 @@ interface StatusAction {
 }
 
 interface OwnedErrorState {
-  activityStateKey: string;
+  activityId: string;
   error: ApiError;
 }
 
@@ -110,7 +110,6 @@ export function ActivityStatusControls({
   const inFlightRef = useRef(false);
   const mountedRef = useRef(false);
   const ownsError = error === undefined;
-  const activityStateKey = `${activity.id}:${activity.status}`;
   const actions = useMemo(
     () => getActivityStatusActions(activity),
     [activity],
@@ -141,7 +140,7 @@ export function ActivityStatusControls({
         const nextError = normalizeApiError(caught);
         if (mountedRef.current) {
           if (ownsError) {
-            setOwnedError({ activityStateKey, error: nextError });
+            setOwnedError({ activityId: activity.id, error: nextError });
           }
           onSettledFailure?.(nextError);
         }
@@ -153,7 +152,7 @@ export function ActivityStatusControls({
       }
     },
     [
-      activityStateKey,
+      activity.id,
       disabled,
       onChangeStatus,
       onSettledFailure,
@@ -161,33 +160,35 @@ export function ActivityStatusControls({
     ],
   );
 
-  if (actions.length === 0) {
-    return null;
-  }
-
   const displayError = ownsError
-    ? ownedError?.activityStateKey === activityStateKey
+    ? ownedError?.activityId === activity.id
       ? ownedError.error
       : null
     : error;
 
+  if (actions.length === 0 && !displayError) {
+    return null;
+  }
+
   return (
     <View accessibilityLabel="Activity status controls" style={styles.wrap}>
-      <View style={styles.actions}>
-        {actions.map((action) => (
-          <View key={action.status} style={styles.action}>
-            <Button
-              title={action.label}
-              variant="secondary"
-              disabled={disabled || pendingStatus !== null}
-              loading={pendingStatus === action.status}
-              onPress={() => {
-                void requestStatusChange(action.status);
-              }}
-            />
-          </View>
-        ))}
-      </View>
+      {actions.length > 0 ? (
+        <View style={styles.actions}>
+          {actions.map((action) => (
+            <View key={action.status} style={styles.action}>
+              <Button
+                title={action.label}
+                variant="secondary"
+                disabled={disabled || pendingStatus !== null}
+                loading={pendingStatus === action.status}
+                onPress={() => {
+                  void requestStatusChange(action.status);
+                }}
+              />
+            </View>
+          ))}
+        </View>
+      ) : null}
       {displayError ? (
         <View accessibilityRole="alert" style={styles.error}>
           <Text style={styles.errorText}>{displayError.message}</Text>

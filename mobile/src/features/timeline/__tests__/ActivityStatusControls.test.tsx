@@ -265,6 +265,45 @@ describe('ActivityStatusControls', () => {
     );
   });
 
+  it('keeps a rejection visible when reconciliation changes status and revokes capability', async () => {
+    const pending = deferred<void>();
+    const onChangeStatus = jest.fn(() => pending.promise);
+    const rendered = await render(
+      <ActivityStatusControls
+        activity={buildActivity('UPCOMING')}
+        onChangeStatus={onChangeStatus}
+      />,
+    );
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Start activity' }),
+    );
+    await rendered.rerender(
+      <ActivityStatusControls
+        activity={buildActivity('IN_PROGRESS', {
+          canUpdateStatus: false,
+        })}
+        onChangeStatus={onChangeStatus}
+      />,
+    );
+    await act(async () => {
+      pending.reject(
+        axiosErrorWith(409, {
+          detail: 'This status transition is no longer allowed.',
+          error_code: 'INVALID_STATUS_TRANSITION',
+        }),
+      );
+    });
+
+    expect(
+      await screen.findByText(
+        'This status transition is no longer allowed.',
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.getByLabelText('Activity status controls')).toBeTruthy();
+  });
+
   it('renders an externally supplied error without replacing its ownership', async () => {
     const externalError: ApiError = {
       kind: 'message',

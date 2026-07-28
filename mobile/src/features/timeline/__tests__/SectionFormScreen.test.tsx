@@ -444,7 +444,7 @@ describe('SectionFormScreen', () => {
     expect(mockCreateSection).not.toHaveBeenCalled();
   });
 
-  it('creates with the trip-timezone date then reconciles once through the event before dismissing', async () => {
+  it('creates with the trip-timezone date then dismisses without self-reconciliation', async () => {
     await render(<SectionFormScreen />);
     await focusScreen();
     mockRefresh.mockClear();
@@ -475,8 +475,7 @@ describe('SectionFormScreen', () => {
       ),
     );
     expect(mockInvalidate).toHaveBeenCalledTimes(1);
-    expect(mockRefresh).toHaveBeenCalledTimes(1);
-    expect(mockRefresh).toHaveBeenCalledWith('silent');
+    expect(mockRefresh).not.toHaveBeenCalled();
     expect(mockPublishTimelineEvent).toHaveBeenCalledTimes(1);
     expect(mockPublishTimelineEvent).toHaveBeenCalledWith({
       type: 'timelineChanged',
@@ -691,7 +690,7 @@ describe('SectionFormScreen', () => {
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
   });
 
-  it('publishes one confirmed late success but does not reconcile or navigate the inactive screen', async () => {
+  it('keeps a confirmed late success terminal and dismisses on refocus without replay', async () => {
     const pending = deferred<TimelineSection>();
     mockCreateSection.mockReturnValue(pending.promise);
     await render(<SectionFormScreen />);
@@ -718,5 +717,22 @@ describe('SectionFormScreen', () => {
     );
     expect(mockRefresh).not.toHaveBeenCalled();
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Add day' }),
+    );
+    expect(mockCreateSection).toHaveBeenCalledTimes(1);
+
+    await focusScreen();
+    await waitFor(() =>
+      expect(mockRouter.dismissTo).toHaveBeenCalledWith(
+        `/trips/${TRIP_ID}/timeline`,
+      ),
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Add day' }),
+    );
+    expect(mockCreateSection).toHaveBeenCalledTimes(1);
+    expect(mockRefresh).not.toHaveBeenCalled();
   });
 });

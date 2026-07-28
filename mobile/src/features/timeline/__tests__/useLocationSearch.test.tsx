@@ -379,6 +379,35 @@ describe('useLocationSearch', () => {
     unmount();
   });
 
+  it('caps a failed lookup fallback label by Unicode code points', async () => {
+    mockLookupLocation.mockRejectedValue(
+      axiosErrorWith(502, {
+        detail: 'Could not verify this place.',
+        error_code: 'LOCATION_LOOKUP_FAILED',
+      }),
+    );
+    const { result, unmount } = await renderHook(() => useLocationSearch());
+
+    let selectionResult:
+      | Awaited<ReturnType<typeof result.current.selectSuggestion>>
+      | undefined;
+    await act(async () => {
+      selectionResult = await result.current.selectSuggestion({
+        ...suggestion,
+        title: '😀'.repeat(201),
+      });
+    });
+
+    expect(selectionResult?.kind).toBe('failure');
+    const label =
+      selectionResult?.kind === 'failure'
+        ? selectionResult.fallback.location_label
+        : '';
+    expect(Array.from(label)).toHaveLength(200);
+    expect(label).toBe('😀'.repeat(200));
+    unmount();
+  });
+
   it('never falls back to the suggestion id when the canonical id is invalid', async () => {
     mockLookupLocation.mockResolvedValue({
       ...lookup,

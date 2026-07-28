@@ -448,6 +448,24 @@ describe('ActivityFormScreen', () => {
     expect(mockPatchActivity).not.toHaveBeenCalled();
   });
 
+  it('canonicalizes uppercase UUID route keys before hydration and lookup', async () => {
+    mockParams = {
+      tripId: TRIP_ID.toUpperCase(),
+      mode: 'edit',
+      activityId: ACTIVITY_ID.toUpperCase(),
+    };
+
+    await render(<ActivityFormScreen />);
+
+    expect(mockUseTimeline).toHaveBeenCalledWith(TRIP_ID, {
+      autoReconcile: false,
+    });
+    expect(mockUseTripDetail).toHaveBeenCalledWith(TRIP_ID, {
+      autoReconcile: false,
+    });
+    expect(currentFormProps().draft.title).toBe('Breakfast');
+  });
+
   it('bridges canonical and failed lookups into the ActivityForm draft contract', async () => {
     await render(<ActivityFormScreen />);
     const editor = currentFormProps().renderStructuredLocationEditor;
@@ -535,6 +553,40 @@ describe('ActivityFormScreen', () => {
       });
     },
   );
+
+  it('prioritizes an authoritative Trip Detail 404 over a Timeline background error', async () => {
+    mockUseTimeline.mockReturnValue({
+      ...readyTimelineHook(),
+      error: {
+        kind: 'message',
+        message: 'Timeline is temporarily unavailable.',
+        status: 500,
+      },
+    });
+    mockUseTripDetail.mockReturnValue({
+      ...loadingTripHook(),
+      status: 'error',
+      error: {
+        kind: 'message',
+        message: 'Trip not found.',
+        errorCode: 'TRIP_NOT_FOUND',
+        status: 404,
+      },
+    });
+
+    await render(<ActivityFormScreen />);
+
+    expect(screen.getByText('Activity form unavailable')).toBeTruthy();
+    expect(
+      screen.getByText(
+        'This trip or activity no longer exists, or you no longer have access.',
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText('Timeline is temporarily unavailable.'),
+    ).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
+  });
 
   it('hydrates once, preserves edits across authority refresh, and rehydrates for a new route identity', async () => {
     const view = await render(<ActivityFormScreen />);
@@ -640,7 +692,7 @@ describe('ActivityFormScreen', () => {
     );
   });
 
-  it('creates with a full payload, locks duplicate submit and Cancel, then reconciles once before dismissing', async () => {
+  it('creates with a full payload, locks duplicate submit and Cancel, then dismisses without self-reconciliation', async () => {
     const pending = deferred<TimelineActivity>();
     mockCreateActivity.mockReturnValue(pending.promise);
     mockParams = {
@@ -717,17 +769,15 @@ describe('ActivityFormScreen', () => {
       ),
     );
     expect(mockPublishTimelineEvent).toHaveBeenCalledTimes(1);
-    expect(mockRefreshTimeline).toHaveBeenCalledTimes(1);
-    expect(mockRefreshTrip).toHaveBeenCalledTimes(1);
-    expect(mockRefreshTimeline).toHaveBeenCalledWith('silent');
-    expect(mockRefreshTrip).toHaveBeenCalledWith('silent');
+    expect(mockRefreshTimeline).not.toHaveBeenCalled();
+    expect(mockRefreshTrip).not.toHaveBeenCalled();
     expect(mockInvalidateTimeline.mock.invocationCallOrder[0]).toBeLessThan(
       mockCreateActivity.mock.invocationCallOrder[0]!,
     );
     expect(mockCreateActivity.mock.invocationCallOrder[0]).toBeLessThan(
       mockPublishTimelineEvent.mock.invocationCallOrder[0]!,
     );
-    expect(mockRefreshTimeline.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(mockPublishTimelineEvent.mock.invocationCallOrder[0]).toBeLessThan(
       mockRouter.dismissTo.mock.invocationCallOrder[0]!,
     );
   });
@@ -988,6 +1038,108 @@ describe('ActivityFormScreen', () => {
     expect(mockRefreshTimeline).not.toHaveBeenCalled();
     expect(mockRefreshTrip).not.toHaveBeenCalled();
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('keeps a blurred committed create terminal and dismisses on refocus without replay', async () => {
+    const pending = deferred<TimelineActivity>();
+    mockCreateActivity.mockReturnValue(pending.promise);
+    mockParams = {
+      tripId: TRIP_ID,
+      mode: 'create',
+      sectionId: SECTION_ID,
+    };
+    await render(<ActivityFormScreen />);
+    const blur = await focusScreen();
+    mockRefreshTimeline.mockClear();
+    mockRefreshTrip.mockClear();
+    await changeDraft(
+      (draft) => ({
+        ...draft,
+        title: 'Committed while blurred',
+        start_time: '12:30',
+      }),
+      ['title', 'start_time'],
+    );
+    await act(async () => {
+      currentFormProps().onSubmit();
+    });
+    await waitFor(() =>
+      expect(mockCreateActivity).toHaveBeenCalledTimes(1),
+    );
+
+    await act(async () => {
+      blur?.();
+      pending.resolve(activity({ title: 'Committed while blurred' }));
+    });
+    await waitFor(() =>
+      expect(mockPublishTimelineEvent).toHaveBeenCalledTimes(1),
+    );
+
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+    expect(currentFormProps().submitting).toBe(true);
+    expect(mockLatestStackOptions?.gestureEnabled).toBe(false);
+    expect(mockRefreshTimeline).not.toHaveBeenCalled();
+    expect(mockRefreshTrip).not.toHaveBeenCalled();
+    await act(async () => {
+      currentFormProps().onSubmit();
+    });
+    expect(mockCreateActivity).toHaveBeenCalledTimes(1);
+
+    await focusScreen();
+    await waitFor(() =>
+      expect(mockRouter.dismissTo).toHaveBeenCalledWith(
+        `/trips/${TRIP_ID}/timeline`,
+      ),
+    );
+    await act(async () => {
+      currentFormProps().onSubmit();
+    });
+    expect(mockCreateActivity).toHaveBeenCalledTimes(1);
+    expect(mockRefreshTimeline).not.toHaveBeenCalled();
+    expect(mockRefreshTrip).not.toHaveBeenCalled();
+  });
+
+  it('dismisses a refocused form when its older generation commits successfully', async () => {
+    const pending = deferred<TimelineActivity>();
+    mockCreateActivity.mockReturnValue(pending.promise);
+    mockParams = {
+      tripId: TRIP_ID,
+      mode: 'create',
+      sectionId: SECTION_ID,
+    };
+    await render(<ActivityFormScreen />);
+    const blur = await focusScreen();
+    await changeDraft(
+      (draft) => ({
+        ...draft,
+        title: 'Commits after refocus',
+        start_time: '12:45',
+      }),
+      ['title', 'start_time'],
+    );
+    await act(async () => {
+      currentFormProps().onSubmit();
+    });
+    await waitFor(() =>
+      expect(mockCreateActivity).toHaveBeenCalledTimes(1),
+    );
+
+    await act(async () => {
+      blur?.();
+    });
+    await focusScreen();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pending.resolve(activity({ title: 'Commits after refocus' }));
+    });
+    await waitFor(() =>
+      expect(mockRouter.dismissTo).toHaveBeenCalledWith(
+        `/trips/${TRIP_ID}/timeline`,
+      ),
+    );
+    expect(mockCreateActivity).toHaveBeenCalledTimes(1);
+    expect(mockPublishTimelineEvent).toHaveBeenCalledTimes(1);
   });
 
   it('reconciles both sources for focus, foreground, timeline, and matching trip events only', async () => {

@@ -309,7 +309,7 @@ function ValidCustomTypeManagerScreen({ tripId }: { tripId: string }) {
       scope: CustomTypeMutationScope,
       mutate: () => Promise<unknown>,
       activeSuccessMessage: string,
-      onActiveSuccess?: () => void,
+      onCommittedSuccess?: () => void,
     ): Promise<void> => {
       if (mutationLockRef.current) {
         return;
@@ -324,12 +324,14 @@ function ValidCustomTypeManagerScreen({ tripId }: { tripId: string }) {
 
       try {
         await mutate();
+        if (mountedRef.current) {
+          onCommittedSuccess?.();
+        }
         await publishTimelineEvent({
           type: 'timelineChanged',
           tripId,
         });
         if (isActiveGeneration(generation)) {
-          onActiveSuccess?.();
           setSuccessMessage(activeSuccessMessage);
         }
       } catch (caught) {

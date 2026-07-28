@@ -22,6 +22,7 @@ export const REMINDER_PRESETS = [
 ] as const;
 
 export const MAX_REMINDER_OFFSETS = 5;
+const ACTIVITY_COORDINATE_DECIMAL_PLACES = 6;
 
 export const ACTIVITY_FIELD_LIMITS = {
   title: 140,
@@ -924,9 +925,16 @@ function normalizePlace(
     provider_id: place.provider_id,
     title: normalizeText(place.title),
     address: normalizeText(place.address ?? ''),
-    lat: place.lat ?? null,
-    lng: place.lng ?? null,
+    lat: normalizeCoordinate(place.lat),
+    lng: normalizeCoordinate(place.lng),
   };
+}
+
+function normalizeCoordinate(value: number | null | undefined): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return Number(value.toFixed(ACTIVITY_COORDINATE_DECIMAL_PLACES));
 }
 
 function clonePlace(
