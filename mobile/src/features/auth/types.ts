@@ -23,3 +23,13 @@ export interface AuthResponse {
   user: AuthUser;
   tokens: AuthTokens;
 }
+
+export interface ProfileNameInput {
+  first_name: string;
+  last_name: string;
+}
+
+export interface ChangePasswordInput {
+  current_password: string;
+  new_password: string;
+}
