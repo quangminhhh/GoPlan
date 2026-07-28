@@ -85,6 +85,17 @@ export interface TripListPage {
 export interface CreateTripInput {
   name: string;
   destination: string;
+  destination_provider?: string;
+  destination_provider_id?: string;
+  /**
+   * Requests carry coordinates as JSON numbers (what the lookup endpoint returns
+   * and what the web client forwards). Responses carry them as strings, because
+   * Django serialises Decimal that way — hence the asymmetry with `Trip`.
+   */
+  destination_lat?: number | null;
+  destination_lng?: number | null;
+  destination_country_code?: string;
+  cover_image_url?: string;
   start_date: string;
   end_date: string;
   description?: string;
@@ -97,8 +108,9 @@ export interface UpdateTripInput {
   destination?: string;
   destination_provider?: string;
   destination_provider_id?: string;
-  destination_lat?: string | null;
-  destination_lng?: string | null;
+  /** Numbers on the request, strings on the response — see CreateTripInput. */
+  destination_lat?: number | null;
+  destination_lng?: number | null;
   destination_country_code?: string;
   cover_image_url?: string;
   start_date?: string;
