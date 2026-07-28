@@ -102,7 +102,14 @@ async function doRefresh(): Promise<string | null> {
     }
     setAccessToken(data.access);
     // Backend rotates refresh tokens (ROTATE_REFRESH_TOKENS): persist the new one.
+    // Enqueued with no await since the generation check above, so a rotation
+    // starting from here on is guaranteed to write after this one and win.
     await setRefreshToken(data.refresh);
+    if (tokenGeneration !== generationAtStart) {
+      // A rotation landed while that write was in flight. It has superseded both
+      // tokens, so this access token is revoked even though the write succeeded.
+      return accessAfterSupersedingRotation();
+    }
     return data.access;
   } catch {
     if (tokenGeneration !== generationAtStart) {

@@ -1,6 +1,8 @@
 jest.mock('expo-secure-store', () => {
   const store = new Map<string, string>();
   return {
+    // Exposed so a test can hold one write open and still let it commit later.
+    __store: store,
     getItemAsync: jest.fn(async (key: string) => store.get(key) ?? null),
     setItemAsync: jest.fn(async (key: string, value: string) => {
       store.set(key, value);
@@ -21,6 +23,13 @@ import { apiClient } from '../client';
 import { refreshHttp, refreshTokens, rotateTokens, setOnRefreshFailed } from '../refresh';
 // eslint-disable-next-line import/first
 import { clearTokens, getAccessToken, getRefreshToken, setAccessToken, setRefreshToken } from '../token-store';
+
+const secureStore = (SecureStore as unknown as { __store: Map<string, string> }).__store;
+
+/** Lets every pending microtask settle without depending on how many there are. */
+function settle(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 describe('refreshTokens', () => {
   beforeEach(async () => {
@@ -179,6 +188,41 @@ describe('rotateTokens', () => {
 
     releaseWrite();
     await rotation;
+    await expect(refreshing).resolves.toBe('rotated-access');
+  });
+
+  it('wins over a refresh whose own SecureStore write was still in flight', async () => {
+    // The narrow window the generation guard alone does not cover: the refresh
+    // response arrives and passes its check, and only then does the password
+    // change land — while the refresh's write to the same key is still open.
+    await setRefreshToken('old-refresh');
+    jest
+      .spyOn(refreshHttp, 'post')
+      .mockResolvedValue({ data: { access: 'chain-access', refresh: 'chain-refresh' } });
+
+    let commitChainWrite: (() => void) | null = null;
+    (SecureStore.setItemAsync as jest.Mock).mockImplementationOnce(
+      (key: string, value: string) =>
+        new Promise<void>((resolve) => {
+          commitChainWrite = () => {
+            secureStore.set(key, value);
+            resolve();
+          };
+        }),
+    );
+
+    const refreshing = refreshTokens();
+    await settle();
+    expect(commitChainWrite).not.toBeNull();
+
+    const rotation = rotateTokens({ access: 'rotated-access', refresh: 'rotated-refresh' });
+    commitChainWrite!();
+    await rotation;
+
+    // The rotated pair is authoritative even though the older write committed
+    // last, and the superseded refresh reports the token that still works.
+    await expect(getRefreshToken()).resolves.toBe('rotated-refresh');
+    expect(getAccessToken()).toBe('rotated-access');
     await expect(refreshing).resolves.toBe('rotated-access');
   });
 
