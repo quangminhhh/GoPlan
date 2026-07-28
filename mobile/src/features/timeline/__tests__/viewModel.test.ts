@@ -1,6 +1,8 @@
 import type {
-  LocationSuggestion,
-  ResolvedLookup,
+  PlaceSuggestion,
+  ResolvedPlaceLookup,
+} from '@/shared/location/types';
+import type {
   TimelineActivity,
   TimelineSection,
 } from '../types';
@@ -75,7 +77,7 @@ function buildSection(
   };
 }
 
-const suggestion: LocationSuggestion = {
+const suggestion: PlaceSuggestion = {
   provider: 'here',
   provider_id: 'unverified-suggestion-id',
   title: 'Hội An',
@@ -83,8 +85,8 @@ const suggestion: LocationSuggestion = {
 };
 
 function buildLookup(
-  overrides: Partial<ResolvedLookup> = {},
-): ResolvedLookup {
+  overrides: Partial<ResolvedPlaceLookup> = {},
+): ResolvedPlaceLookup {
   return {
     destination: 'Hội An, Quảng Nam, Việt Nam',
     destination_provider: 'here',

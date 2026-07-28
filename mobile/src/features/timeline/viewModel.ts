@@ -1,16 +1,15 @@
+import { resolvePlace } from '@/shared/location/resolvePlace';
+import type {
+  PlaceSuggestion,
+  ResolvedPlaceLookup,
+} from '@/shared/location/types';
 import type {
   ActivityPlacePayload,
-  LocationSuggestion,
-  ResolvedLookup,
   TimelineActivity,
   TimelineSection,
 } from './types';
 
 const MINUTES_PER_DAY = 24 * 60;
-const MAX_LOCATION_LABEL_LENGTH = 200;
-const MAX_PLACE_TITLE_LENGTH = 200;
-const MAX_PLACE_ADDRESS_LENGTH = 255;
-const MAX_PROVIDER_ID_LENGTH = 255;
 
 const SECTION_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
   weekday: 'short',
@@ -255,36 +254,24 @@ export function formatActivityTime(activity: TimelineActivity): string {
 }
 
 export function buildStructuredLocation(
-  suggestion: LocationSuggestion,
-  lookup: ResolvedLookup,
+  suggestion: PlaceSuggestion,
+  lookup: ResolvedPlaceLookup,
 ): StructuredLocationValue | null {
-  const canonicalProviderId = lookup.destination_provider_id;
-  if (
-    typeof canonicalProviderId !== 'string' ||
-    canonicalProviderId.trim().length === 0 ||
-    codePointLength(canonicalProviderId) > MAX_PROVIDER_ID_LENGTH
-  ) {
+  const place = resolvePlace(suggestion, lookup);
+  if (!place) {
     return null;
   }
-
-  const safeTitle = truncateText(
-    suggestion.title,
-    Math.min(MAX_LOCATION_LABEL_LENGTH, MAX_PLACE_TITLE_LENGTH),
-  );
-  const safeAddress = truncateText(
-    lookup.destination ?? suggestion.subtitle,
-    MAX_PLACE_ADDRESS_LENGTH,
-  );
-
+  // The shared caps already match the activity caps; this mapping is a rename,
+  // not a second truncation pass.
   return {
-    location_label: safeTitle,
+    location_label: place.label,
     place: {
-      provider: 'here',
-      provider_id: canonicalProviderId,
-      title: safeTitle,
-      address: safeAddress,
-      lat: lookup.destination_lat ?? null,
-      lng: lookup.destination_lng ?? null,
+      provider: place.provider,
+      provider_id: place.provider_id,
+      title: place.label,
+      address: place.address,
+      lat: place.lat,
+      lng: place.lng,
     },
   };
 }
@@ -419,12 +406,4 @@ function parseIsoDate(value: string): Date | null {
     return null;
   }
   return date;
-}
-
-function truncateText(value: string, maxLength: number): string {
-  return Array.from(value).slice(0, maxLength).join('');
-}
-
-function codePointLength(value: string): number {
-  return Array.from(value).length;
 }
