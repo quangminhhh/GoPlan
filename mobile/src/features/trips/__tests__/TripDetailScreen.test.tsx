@@ -25,7 +25,16 @@ jest.mock('expo-router', () => ({
 }));
 
 jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
-jest.mock('expo-image', () => ({ Image: () => null }));
+// A testID-bearing stand-in, so a coverless trip is distinguishable from one
+// that renders a cover — `() => null` would look identical either way.
+jest.mock('expo-image', () => {
+  const { View } = jest.requireActual('react-native');
+  const { createElement } = jest.requireActual('react');
+  return {
+    Image: (props: Record<string, unknown>) =>
+      createElement(View, { ...props, testID: 'trip-cover-image' }),
+  };
+});
 jest.mock('../hooks/useTripDetail', () => ({ useTripDetail: (...args: unknown[]) => mockUseTripDetail(...args) }));
 jest.mock('../hooks/usePendingInvitations', () => ({
   usePendingInvitations: (...args: unknown[]) => mockUsePendingInvitations(...args),
@@ -169,6 +178,19 @@ describe('TripDetailScreen', () => {
     expect(mockRouter.push).toHaveBeenCalledWith('/trips/trip-123/edit');
     await fireEvent.press(screen.getByRole('button', { name: 'Invite friends' }));
     expect(mockRouter.push).toHaveBeenCalledWith('/trips/trip-123/invite');
+  });
+
+  it('renders the stored cover, and the placeholder when the trip has none', async () => {
+    await render(<TripDetailScreen />);
+    expect(await screen.findByTestId('trip-cover-image')).toBeTruthy();
+
+    mockUseTripDetail.mockReturnValue(
+      readyHook({ ...tripDetail, trip: { ...tripDetail.trip, cover_image_url: '' } }),
+    );
+    await render(<TripDetailScreen />);
+
+    expect(screen.queryByTestId('trip-cover-image')).toBeNull();
+    expect(await screen.findByText('Overview')).toBeTruthy();
   });
 
   it('shows Timeline and Expenses Planning entries to every readable trip', async () => {

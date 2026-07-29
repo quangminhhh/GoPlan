@@ -12,7 +12,16 @@ import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 import { Screen } from '@/shared/ui/Screen';
 import { TextField } from '@/shared/ui/TextField';
 import { updateTrip } from '../api';
+import { CoverImageField } from '../components/CoverImageField';
+import { DestinationField } from '../components/DestinationField';
 import { formatDateParam, parseDateOnly } from '../dates';
+import {
+  destinationFieldError,
+  destinationFields,
+  destinationValueFromTrip,
+  type TripDestinationValue,
+} from '../destination';
+import { useTripCoverUpload } from '../hooks/useTripCoverUpload';
 import { useTripDetail } from '../hooks/useTripDetail';
 import { getTimezoneOptions, TRIP_CURRENCY_CODES } from '../options';
 import { publishTripEvent } from '../tripEvents';
@@ -46,7 +55,10 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
   const router = useRouter();
   const original = detail.trip;
   const [name, setName] = useState(original.name);
-  const [destination, setDestination] = useState(original.destination);
+  const [destination, setDestination] = useState<TripDestinationValue>(() =>
+    destinationValueFromTrip(original),
+  );
+  const [destinationTouched, setDestinationTouched] = useState(false);
   const [startDate, setStartDate] = useState(() => parseDateOnly(original.start_date));
   const [endDate, setEndDate] = useState(() => parseDateOnly(original.end_date));
   const [description, setDescription] = useState(original.description);
@@ -57,8 +69,14 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
   const [error, setError] = useState<ApiError | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submitLockRef = useRef(false);
+  const cover = useTripCoverUpload(original.cover_image_url);
   const timezoneOptions = getTimezoneOptions(original.timezone);
-  const canSubmit = Boolean(name.trim() && destination.trim());
+  const canSubmit = Boolean(name.trim() && destination.label.trim());
+
+  function onDestinationChange(next: TripDestinationValue) {
+    setDestinationTouched(true);
+    setDestination(next);
+  }
 
   function onStartDateChange(date: Date) {
     setStartDate(date);
@@ -82,11 +100,9 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
       return;
     }
 
-    const trimmedDestination = destination.trim();
     const trimmedBudget = budget.trim();
     const input: UpdateTripInput = {
       name: name.trim(),
-      destination: trimmedDestination,
       start_date: start,
       end_date: end,
       description: description.trim(),
@@ -94,12 +110,16 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
       currency_code: currency,
       timezone,
     };
-    if (trimmedDestination !== original.destination) {
-      input.destination_provider = '';
-      input.destination_provider_id = '';
-      input.destination_lat = null;
-      input.destination_lng = null;
-      input.destination_country_code = '';
+    // Destination is omitted entirely unless the user changed it. A PATCH that
+    // never mentions destination cannot clear the stored coordinates, which is
+    // the one failure mode here that produces no error and no visible symptom.
+    if (destinationTouched) {
+      Object.assign(input, destinationFields(destination));
+    }
+    // '' after Remove clears the cover, a new URL replaces it, and an untouched
+    // cover is never mentioned at all.
+    if (cover.changed) {
+      input.cover_image_url = cover.coverUrl;
     }
 
     submitLockRef.current = true;
@@ -124,7 +144,13 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
         <>
           <FormError error={error} />
           {!canSubmit ? <Text style={styles.submitHint}>Add a trip name and destination to continue.</Text> : null}
-          <Button title="Save changes" onPress={onSubmit} loading={submitting} disabled={!canSubmit} />
+          {cover.busy ? <Text style={styles.submitHint}>Wait for the cover upload to finish.</Text> : null}
+          <Button
+            title="Save changes"
+            onPress={onSubmit}
+            loading={submitting}
+            disabled={!canSubmit || cover.busy}
+          />
         </>
       }
     >
@@ -137,13 +163,20 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
           maxLength={120}
           error={error?.fieldErrors?.name}
         />
-        <TextField
-          label="Destination *"
-          accessibilityLabel="Destination"
+        <DestinationField
           value={destination}
-          onChangeText={setDestination}
-          maxLength={200}
-          error={error?.fieldErrors?.destination}
+          onChange={onDestinationChange}
+          error={destinationFieldError(error?.fieldErrors)}
+        />
+      </FormSection>
+
+      <FormSection title="Cover photo">
+        <CoverImageField
+          coverUrl={cover.coverUrl}
+          status={cover.status}
+          error={cover.error ?? error?.fieldErrors?.cover_image_url ?? null}
+          onChoose={() => void cover.chooseCover()}
+          onRemove={cover.removeCover}
         />
       </FormSection>
 

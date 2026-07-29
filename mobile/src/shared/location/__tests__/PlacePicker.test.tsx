@@ -15,18 +15,18 @@ import {
 // eslint-disable-next-line import/first
 import { lookupLocation, suggestLocations } from '../api';
 // eslint-disable-next-line import/first
-import { PlacePicker, type PlacePickerProps } from '../components/PlacePicker';
+import { PlacePicker, type PlacePickerProps } from '../PlacePicker';
+// eslint-disable-next-line import/first
+import type {
+  PlaceSuggestion,
+  ResolvedPlaceLookup,
+} from '../types';
 // eslint-disable-next-line import/first
 import {
   LOCATION_SEARCH_DEBOUNCE_MS,
   MANUAL_LOCATION_GUIDANCE,
   PLACE_SEARCH_UNAVAILABLE_MESSAGE,
-} from '../hooks/useLocationSearch';
-// eslint-disable-next-line import/first
-import type {
-  LocationSuggestion,
-  ResolvedLocationLookup,
-} from '../types';
+} from '../useLocationSearch';
 
 const mockSuggestLocations = suggestLocations as jest.MockedFunction<
   typeof suggestLocations
@@ -35,14 +35,14 @@ const mockLookupLocation = lookupLocation as jest.MockedFunction<
   typeof lookupLocation
 >;
 
-const suggestion: LocationSuggestion = {
+const suggestion: PlaceSuggestion = {
   provider: 'here',
   provider_id: 'unverified-suggestion-id',
   title: 'Da Nang International Airport',
   subtitle: 'Da Nang, Vietnam',
 };
 
-const lookup: ResolvedLocationLookup = {
+const lookup: ResolvedPlaceLookup = {
   destination: 'Duy Tan, Hoa Thuan Tay, Da Nang, Vietnam',
   destination_provider: 'here',
   destination_provider_id: 'canonical-here-id',
@@ -52,14 +52,10 @@ const lookup: ResolvedLocationLookup = {
 };
 
 const selectedPlace: PlacePickerProps['value'] = {
-  location_label: 'Existing Station',
+  label: 'Existing Station',
   place: {
-    provider: 'here',
-    provider_id: 'existing-canonical-id',
     title: 'Existing Station',
     address: 'Existing address',
-    lat: 16,
-    lng: 108,
   },
 };
 
@@ -84,7 +80,7 @@ function deferred<T>() {
 
 function pickerCallbacks() {
   return {
-    onSelectLocation: jest.fn(),
+    onSelectPlace: jest.fn(),
     onUseManualEntry: jest.fn(),
     onLookupFailure: jest.fn(),
   };
@@ -160,7 +156,7 @@ describe('PlacePicker', () => {
       expect(screen.getByLabelText('Search places').props.value).toBe(
         'Da Nang',
       );
-      expect(callbacks.onSelectLocation).not.toHaveBeenCalled();
+      expect(callbacks.onSelectPlace).not.toHaveBeenCalled();
       expect(callbacks.onUseManualEntry).not.toHaveBeenCalled();
       expect(callbacks.onLookupFailure).not.toHaveBeenCalled();
       rendered.unmount();
@@ -188,11 +184,27 @@ describe('PlacePicker', () => {
     );
 
     expect(callbacks.onUseManualEntry).toHaveBeenCalledWith({
-      location_mode: 'MANUAL',
-      location_label: 'Hotel lobby',
-      place: null,
+      label: 'Hotel lobby',
     });
-    expect(callbacks.onSelectLocation).not.toHaveBeenCalled();
+    expect(callbacks.onSelectPlace).not.toHaveBeenCalled();
+    rendered.unmount();
+  });
+
+  it('shows an explicit empty state when search succeeds with no results', async () => {
+    mockSuggestLocations.mockResolvedValue([]);
+    const callbacks = pickerCallbacks();
+    const rendered = await render(
+      <PlacePicker value={selectedPlace} {...callbacks} />,
+    );
+
+    await enterSearch('Nowhere');
+    await advanceDebounce();
+
+    expect(screen.getByText('No results.')).toBeTruthy();
+    expect(screen.getByText('Existing Station')).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: 'Enter location manually' }),
+    ).toBeTruthy();
     rendered.unmount();
   });
 
@@ -213,17 +225,14 @@ describe('PlacePicker', () => {
     );
     await flushPromises();
 
-    expect(callbacks.onSelectLocation).toHaveBeenCalledWith({
-      location_mode: 'STRUCTURED',
-      location_label: suggestion.title,
-      place: {
-        provider: 'here',
-        provider_id: lookup.destination_provider_id,
-        title: suggestion.title,
-        address: lookup.destination,
-        lat: lookup.destination_lat,
-        lng: lookup.destination_lng,
-      },
+    expect(callbacks.onSelectPlace).toHaveBeenCalledWith({
+      provider: 'here',
+      provider_id: lookup.destination_provider_id,
+      label: suggestion.title,
+      address: lookup.destination,
+      lat: lookup.destination_lat,
+      lng: lookup.destination_lng,
+      country_code: lookup.destination_country_code,
     });
     expect(callbacks.onLookupFailure).not.toHaveBeenCalled();
     expect(callbacks.onUseManualEntry).not.toHaveBeenCalled();
@@ -254,9 +263,7 @@ describe('PlacePicker', () => {
     await flushPromises();
 
     expect(callbacks.onLookupFailure).toHaveBeenCalledWith({
-      location_mode: 'MANUAL',
-      location_label: suggestion.title,
-      place: null,
+      label: suggestion.title,
       guidance: MANUAL_LOCATION_GUIDANCE,
       error: {
         kind: 'message',
@@ -265,7 +272,7 @@ describe('PlacePicker', () => {
         errorCode: 'LOCATION_LOOKUP_FAILED',
       },
     });
-    expect(callbacks.onSelectLocation).not.toHaveBeenCalled();
+    expect(callbacks.onSelectPlace).not.toHaveBeenCalled();
     expect(callbacks.onUseManualEntry).not.toHaveBeenCalled();
     expect(screen.getByText(MANUAL_LOCATION_GUIDANCE)).toBeTruthy();
     expect(screen.queryByText(suggestion.provider_id)).toBeNull();
@@ -273,7 +280,7 @@ describe('PlacePicker', () => {
   });
 
   it('does not emit any commit callback for an aborted stale lookup', async () => {
-    const pendingLookup = deferred<ResolvedLocationLookup>();
+    const pendingLookup = deferred<ResolvedPlaceLookup>();
     mockSuggestLocations.mockResolvedValue([suggestion]);
     mockLookupLocation.mockReturnValue(pendingLookup.promise);
     const callbacks = pickerCallbacks();
@@ -297,7 +304,7 @@ describe('PlacePicker', () => {
       await Promise.resolve();
     });
 
-    expect(callbacks.onSelectLocation).not.toHaveBeenCalled();
+    expect(callbacks.onSelectPlace).not.toHaveBeenCalled();
     expect(callbacks.onLookupFailure).not.toHaveBeenCalled();
     expect(callbacks.onUseManualEntry).not.toHaveBeenCalled();
     rendered.unmount();
@@ -314,9 +321,7 @@ describe('PlacePicker', () => {
     );
 
     expect(callbacks.onUseManualEntry).toHaveBeenCalledWith({
-      location_mode: 'MANUAL',
-      location_label: selectedPlace?.location_label,
-      place: null,
+      label: selectedPlace?.label,
     });
     rendered.unmount();
   });

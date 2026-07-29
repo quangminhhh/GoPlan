@@ -52,4 +52,21 @@ describe('uploadFile', () => {
 
     expect(request.mock.calls[0][0].method).toBe('post');
   });
+
+  it('leaves the timeout to the client default when no override is given', async () => {
+    const request = jest.spyOn(apiClient, 'request').mockResolvedValue({ data: {} });
+
+    await uploadFile('/auth/avatar', 'avatar', file);
+
+    // Avatars are small; they must keep inheriting the 15s instance default.
+    expect(request.mock.calls[0][0].timeout).toBeUndefined();
+  });
+
+  it('passes an explicit timeout down to axios', async () => {
+    const request = jest.spyOn(apiClient, 'request').mockResolvedValue({ data: {} });
+
+    await uploadFile('/media/trip-covers', 'file', file, 'post', { timeoutMs: 120_000 });
+
+    expect(request.mock.calls[0][0].timeout).toBe(120_000);
+  });
 });

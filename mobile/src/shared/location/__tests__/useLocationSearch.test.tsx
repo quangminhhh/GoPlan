@@ -10,16 +10,16 @@ import { act, renderHook } from '@testing-library/react-native';
 // eslint-disable-next-line import/first
 import { lookupLocation, suggestLocations } from '../api';
 // eslint-disable-next-line import/first
+import type {
+  PlaceSuggestion,
+  ResolvedPlaceLookup,
+} from '../types';
+// eslint-disable-next-line import/first
 import {
   LOCATION_SEARCH_DEBOUNCE_MS,
   MANUAL_LOCATION_GUIDANCE,
   useLocationSearch,
-} from '../hooks/useLocationSearch';
-// eslint-disable-next-line import/first
-import type {
-  LocationSuggestion,
-  ResolvedLocationLookup,
-} from '../types';
+} from '../useLocationSearch';
 
 const mockSuggestLocations = suggestLocations as jest.MockedFunction<
   typeof suggestLocations
@@ -28,14 +28,14 @@ const mockLookupLocation = lookupLocation as jest.MockedFunction<
   typeof lookupLocation
 >;
 
-const suggestion: LocationSuggestion = {
+const suggestion: PlaceSuggestion = {
   provider: 'here',
   provider_id: 'suggestion-id',
   title: 'Da Nang International Airport',
   subtitle: 'Da Nang, Vietnam',
 };
 
-const lookup: ResolvedLocationLookup = {
+const lookup: ResolvedPlaceLookup = {
   destination: 'Duy Tan, Hoa Thuan Tay, Da Nang, Vietnam',
   destination_provider: 'here',
   destination_provider_id: 'canonical-id',
@@ -200,8 +200,8 @@ describe('useLocationSearch', () => {
   });
 
   it('aborts an older suggest request and lets only the latest request update state', async () => {
-    const first = deferred<LocationSuggestion[]>();
-    const second = deferred<LocationSuggestion[]>();
+    const first = deferred<PlaceSuggestion[]>();
+    const second = deferred<PlaceSuggestion[]>();
     const latestSuggestion = {
       ...suggestion,
       provider_id: 'latest-id',
@@ -251,29 +251,26 @@ describe('useLocationSearch', () => {
     );
     expect(selectionResult).toEqual({
       kind: 'success',
-      selection: {
-        location_mode: 'STRUCTURED',
-        location_label: suggestion.title,
-        place: {
-          provider: 'here',
-          provider_id: lookup.destination_provider_id,
-          title: suggestion.title,
-          address: lookup.destination,
-          lat: lookup.destination_lat,
-          lng: lookup.destination_lng,
-        },
+      place: {
+        provider: 'here',
+        provider_id: lookup.destination_provider_id,
+        label: suggestion.title,
+        address: lookup.destination,
+        lat: lookup.destination_lat,
+        lng: lookup.destination_lng,
+        country_code: lookup.destination_country_code,
       },
     });
     expect(
       selectionResult?.kind === 'success'
-        ? selectionResult.selection.place.provider_id
+        ? selectionResult.place.provider_id
         : undefined,
     ).not.toBe(suggestion.provider_id);
     unmount();
   });
 
   it('returns stale without a failure state when lookup is aborted by new input', async () => {
-    const pending = deferred<ResolvedLocationLookup>();
+    const pending = deferred<ResolvedPlaceLookup>();
     mockLookupLocation.mockReturnValue(pending.promise);
     const { result, unmount } = await renderHook(() => useLocationSearch());
     let lookupPromise:
@@ -305,7 +302,7 @@ describe('useLocationSearch', () => {
   });
 
   it('aborts lookup and returns stale when the picker becomes disabled', async () => {
-    const pending = deferred<ResolvedLocationLookup>();
+    const pending = deferred<ResolvedPlaceLookup>();
     mockLookupLocation.mockReturnValue(pending.promise);
     const { result, rerender, unmount } = await renderHook(
       ({ enabled }: { enabled: boolean }) =>
@@ -357,9 +354,7 @@ describe('useLocationSearch', () => {
     expect(selectionResult).toEqual({
       kind: 'failure',
       fallback: {
-        location_mode: 'MANUAL',
-        location_label: suggestion.title,
-        place: null,
+        label: suggestion.title,
         guidance: MANUAL_LOCATION_GUIDANCE,
         error: {
           kind: 'message',
@@ -373,9 +368,9 @@ describe('useLocationSearch', () => {
     expect(result.current.manualEntrySuggested).toBe(true);
     expect(
       selectionResult?.kind === 'failure'
-        ? selectionResult.fallback.place
-        : undefined,
-    ).toBeNull();
+        ? Object.keys(selectionResult.fallback)
+        : [],
+    ).not.toContain('place');
     unmount();
   });
 
@@ -401,7 +396,7 @@ describe('useLocationSearch', () => {
     expect(selectionResult?.kind).toBe('failure');
     const label =
       selectionResult?.kind === 'failure'
-        ? selectionResult.fallback.location_label
+        ? selectionResult.fallback.label
         : '';
     expect(Array.from(label)).toHaveLength(200);
     expect(label).toBe('😀'.repeat(200));
@@ -428,9 +423,7 @@ describe('useLocationSearch', () => {
         ? selectionResult.fallback
         : undefined,
     ).toMatchObject({
-      location_mode: 'MANUAL',
-      location_label: suggestion.title,
-      place: null,
+      label: suggestion.title,
     });
     expect(result.current.lookupStatus).toBe('error');
     unmount();

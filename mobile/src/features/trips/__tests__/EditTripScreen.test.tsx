@@ -4,6 +4,18 @@ const mockParams = { tripId: 'trip-123' };
 const mockRouter = { dismissTo: jest.fn() };
 const mockUseTripDetail = jest.fn();
 const mockPublishTripEvent = jest.fn();
+let mockPlacePickerProps: unknown;
+
+function mockRenderPlacePicker(props: unknown) {
+  mockPlacePickerProps = props;
+  return null;
+}
+
+// The picker's own debounce/abort/HTTP behaviour is proven in
+// src/shared/location; this suite is about what the PATCH carries.
+jest.mock('@/shared/location/PlacePicker', () => ({
+  PlacePicker: mockRenderPlacePicker,
+}));
 
 jest.mock('expo-router', () => ({
   Stack: { Screen: () => null },
@@ -14,7 +26,16 @@ jest.mock('expo-router', () => ({
 jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
 jest.mock('../hooks/useTripDetail', () => ({ useTripDetail: (...args: unknown[]) => mockUseTripDetail(...args) }));
 jest.mock('../tripEvents', () => ({ publishTripEvent: (...args: unknown[]) => mockPublishTripEvent(...args) }));
-jest.mock('../api', () => ({ updateTrip: jest.fn() }));
+jest.mock('../api', () => ({ updateTrip: jest.fn(), uploadTripCover: jest.fn() }));
+jest.mock('expo-image', () => {
+  const { View } = jest.requireActual('react-native');
+  return { Image: View };
+});
+jest.mock('@/shared/media/pickImage', () => ({ pickImage: jest.fn() }));
+jest.mock('@/shared/media/preprocessImage', () => ({ preprocessImage: jest.fn() }));
+jest.mock('@/shared/media/imageCodec', () => ({
+  nativeImageCodec: { encode: jest.fn(), discard: jest.fn(async () => undefined) },
+}));
 
 interface MockDateFieldProps {
   label: string;
@@ -35,11 +56,21 @@ function MockDateField({ label, onChange, error }: MockDateFieldProps) {
 jest.mock('@/shared/ui/DateField', () => ({ DateField: MockDateField }));
 
 // eslint-disable-next-line import/first
+import type { ComponentProps } from 'react';
+// eslint-disable-next-line import/first
 import { AxiosError, AxiosHeaders } from 'axios';
 // eslint-disable-next-line import/first
-import { fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 // eslint-disable-next-line import/first
-import { updateTrip } from '../api';
+import type { PlacePicker } from '@/shared/location/PlacePicker';
+// eslint-disable-next-line import/first
+import type { ResolvedPlace } from '@/shared/location/types';
+// eslint-disable-next-line import/first
+import { pickImage } from '@/shared/media/pickImage';
+// eslint-disable-next-line import/first
+import { preprocessImage } from '@/shared/media/preprocessImage';
+// eslint-disable-next-line import/first
+import { updateTrip, uploadTripCover } from '../api';
 // eslint-disable-next-line import/first
 import { EditTripScreen } from '../screens/EditTripScreen';
 // eslint-disable-next-line import/first
@@ -48,6 +79,20 @@ import type { TripDetailResponse } from '../types';
 import type { ApiError } from '@/shared/api/errors';
 
 const mockUpdateTrip = updateTrip as jest.MockedFunction<typeof updateTrip>;
+const mockPick = pickImage as jest.MockedFunction<typeof pickImage>;
+const mockPreprocess = preprocessImage as jest.MockedFunction<typeof preprocessImage>;
+const mockUploadCover = uploadTripCover as jest.MockedFunction<typeof uploadTripCover>;
+
+const pickedImage = { uri: 'file:///cover.heic', width: 4032, height: 3024, fileName: 'IMG_9.HEIC' };
+const processedImage = {
+  uri: 'file:///cover.jpg',
+  name: 'IMG_9.jpg',
+  type: 'image/jpeg',
+  width: 2560,
+  height: 1440,
+  bytes: 900_000,
+} as const;
+const UPLOADED_COVER_URL = '/media/trip-covers/8f0e.webp';
 const notFoundError: ApiError = { kind: 'message', message: 'Trip not found.', errorCode: 'TRIP_NOT_FOUND', status: 404 };
 
 function axiosErrorWith(status: number, data: unknown): AxiosError {
@@ -95,14 +140,43 @@ function readyHook(nextDetail: TripDetailResponse = detail) {
   };
 }
 
+const DESTINATION_KEYS = [
+  'destination',
+  'destination_provider',
+  'destination_provider_id',
+  'destination_lat',
+  'destination_lng',
+  'destination_country_code',
+] as const;
+
+// Short suggestion title vs canonical lookup destination — the PATCH must take
+// the canonical one, the same value the web picker persists.
+const verifiedPlace: ResolvedPlace = {
+  provider: 'here',
+  provider_id: 'canonical-here-id',
+  label: 'Hội An',
+  address: 'Hội An, Quảng Nam, Việt Nam',
+  lat: 15.8801,
+  lng: 108.338,
+  country_code: 'VN',
+};
+
 async function save(): Promise<void> {
   await fireEvent.press(screen.getByText('Save changes'));
+}
+
+function currentPickerProps(): ComponentProps<typeof PlacePicker> {
+  if (!mockPlacePickerProps) {
+    throw new Error('Expected PlacePicker to be rendered.');
+  }
+  return mockPlacePickerProps as ComponentProps<typeof PlacePicker>;
 }
 
 describe('EditTripScreen', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockParams.tripId = 'trip-123';
+    mockPlacePickerProps = undefined;
     mockUseTripDetail.mockReturnValue(readyHook());
   });
 
@@ -139,13 +213,124 @@ describe('EditTripScreen', () => {
     expect(mockRouter.dismissTo).toHaveBeenCalledWith('/trips/trip-123');
   });
 
+  it('keeps the stored destination when only the name changes', async () => {
+    mockUpdateTrip.mockResolvedValue(detail.trip);
+    await render(<EditTripScreen />);
+    await fireEvent.changeText(screen.getByLabelText('Trip name'), 'Renamed trip');
+    await save();
+
+    await waitFor(() => expect(mockUpdateTrip).toHaveBeenCalled());
+    const payload = mockUpdateTrip.mock.calls[0]?.[1];
+    expect(payload).toMatchObject({ name: 'Renamed trip' });
+    // A PATCH that mentions no destination key cannot clear the stored
+    // coordinates the web client also writes.
+    for (const key of DESTINATION_KEYS) {
+      expect(payload).not.toHaveProperty(key);
+    }
+  });
+
   it('does not clear destination metadata when the destination is unchanged', async () => {
     mockUpdateTrip.mockResolvedValue(detail.trip);
     await render(<EditTripScreen />);
     await save();
 
     await waitFor(() => expect(mockUpdateTrip).toHaveBeenCalled());
-    expect(mockUpdateTrip.mock.calls[0]?.[1]).not.toHaveProperty('destination_provider');
+    const payload = mockUpdateTrip.mock.calls[0]?.[1];
+    for (const key of DESTINATION_KEYS) {
+      expect(payload).not.toHaveProperty(key);
+    }
+  });
+
+  it('writes all six destination keys after re-picking a place', async () => {
+    mockUpdateTrip.mockResolvedValue(detail.trip);
+    await render(<EditTripScreen />);
+    await act(async () => {
+      currentPickerProps().onSelectPlace(verifiedPlace);
+    });
+    await save();
+
+    await waitFor(() =>
+      expect(mockUpdateTrip).toHaveBeenCalledWith(
+        'trip-123',
+        expect.objectContaining({
+          destination: 'Hội An, Quảng Nam, Việt Nam',
+          destination_provider: 'here',
+          destination_provider_id: 'canonical-here-id',
+          destination_lat: 15.8801,
+          destination_lng: 108.338,
+          destination_country_code: 'VN',
+        }),
+      ),
+    );
+  });
+
+  it('hydrates the picker from the stored structured destination', async () => {
+    await render(<EditTripScreen />);
+
+    expect(currentPickerProps().value).toEqual({
+      label: 'Da Lat, Vietnam',
+      place: { title: 'Da Lat, Vietnam', address: '' },
+    });
+  });
+
+  it('omits cover_image_url when the cover is never touched', async () => {
+    mockUpdateTrip.mockResolvedValue(detail.trip);
+    await render(<EditTripScreen />);
+    await save();
+
+    await waitFor(() => expect(mockUpdateTrip).toHaveBeenCalled());
+    expect(mockUpdateTrip.mock.calls[0]?.[1]).not.toHaveProperty('cover_image_url');
+  });
+
+  it('clears the cover with an empty string after Remove', async () => {
+    mockUpdateTrip.mockResolvedValue(detail.trip);
+    await render(<EditTripScreen />);
+    await fireEvent.press(screen.getByLabelText('Remove photo'));
+    await save();
+
+    await waitFor(() =>
+      expect(mockUpdateTrip).toHaveBeenCalledWith(
+        'trip-123',
+        expect.objectContaining({ cover_image_url: '' }),
+      ),
+    );
+  });
+
+  it('replaces the cover with the newly uploaded url', async () => {
+    mockUpdateTrip.mockResolvedValue(detail.trip);
+    mockPick.mockResolvedValue({ status: 'picked', image: pickedImage });
+    mockPreprocess.mockResolvedValue(processedImage);
+    mockUploadCover.mockResolvedValue(UPLOADED_COVER_URL);
+
+    await render(<EditTripScreen />);
+    await fireEvent.press(screen.getByLabelText('Replace photo'));
+    await waitFor(() => expect(mockUploadCover).toHaveBeenCalledWith(processedImage));
+    await save();
+
+    await waitFor(() =>
+      expect(mockUpdateTrip).toHaveBeenCalledWith(
+        'trip-123',
+        expect.objectContaining({ cover_image_url: UPLOADED_COVER_URL }),
+      ),
+    );
+  });
+
+  it('blocks submit until an in-flight cover upload settles', async () => {
+    mockPick.mockResolvedValue({ status: 'picked', image: pickedImage });
+    mockPreprocess.mockResolvedValue(processedImage);
+    mockUploadCover.mockImplementation(() => new Promise(() => undefined));
+
+    await render(<EditTripScreen />);
+    await fireEvent.press(screen.getByLabelText('Replace photo'));
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Save changes' }).props.accessibilityState,
+      ).toEqual(expect.objectContaining({ disabled: true })),
+    );
+    expect(screen.getByText('Wait for the cover upload to finish.')).toBeTruthy();
+    await save();
+    expect(mockUpdateTrip).not.toHaveBeenCalled();
   });
 
   it('blocks duplicate submission while the PATCH is pending', async () => {
@@ -162,11 +347,18 @@ describe('EditTripScreen', () => {
 
   it('renders backend field and business errors exactly as returned', async () => {
     mockUpdateTrip.mockRejectedValueOnce(
-      axiosErrorWith(400, { destination: ['Choose a valid destination.'], timezone: ['Use a valid timezone.'] }),
+      axiosErrorWith(400, {
+        destination_lng: ['Ensure that there are no more than 6 decimal places.'],
+        timezone: ['Use a valid timezone.'],
+      }),
     );
     await render(<EditTripScreen />);
     await save();
-    expect(await screen.findByText('Choose a valid destination.')).toBeTruthy();
+    expect(
+      await screen.findByText(
+        'Ensure that there are no more than 6 decimal places.',
+      ),
+    ).toBeTruthy();
     expect(await screen.findByText('Use a valid timezone.')).toBeTruthy();
 
     mockUpdateTrip.mockRejectedValueOnce(axiosErrorWith(409, { detail: 'Trip has already been cancelled.' }));

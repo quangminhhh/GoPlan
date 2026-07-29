@@ -22,6 +22,7 @@ import {
 import type { TripDetailResponse } from '@/features/trips/types';
 import { normalizeApiError, type ApiError } from '@/shared/api/errors';
 import { useAppForegroundEffect } from '@/shared/hooks/useAppForegroundEffect';
+import { PlacePicker } from '@/shared/location/PlacePicker';
 import { colors, spacing, typography } from '@/shared/theme/tokens';
 import { Button } from '@/shared/ui/Button';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
@@ -30,7 +31,6 @@ import {
   ActivityForm,
   type StructuredLocationEditorProps,
 } from '../components/ActivityForm';
-import { PlacePicker } from '../components/PlacePicker';
 import {
   buildCreateActivityPayload,
   buildPatchActivityPayload,
@@ -122,23 +122,28 @@ function renderStructuredLocationEditor({
   return (
     <PlacePicker
       value={{
-        location_label: locationLabel,
-        place: value?.place ?? null,
+        label: locationLabel,
+        place: value?.place
+          ? { title: value.place.title, address: value.place.address ?? '' }
+          : null,
       }}
       disabled={disabled}
       error={getPlaceEditorError(fieldErrors)}
-      onSelectLocation={(selection) =>
+      onSelectPlace={(place) =>
         onChange({
-          location_label: selection.location_label,
-          place: selection.place,
+          location_label: place.label,
+          place: {
+            provider: place.provider,
+            provider_id: place.provider_id,
+            title: place.label,
+            address: place.address,
+            lat: place.lat,
+            lng: place.lng,
+          },
         })
       }
-      onUseManualEntry={(manual) =>
-        onUseManual(manual.location_label)
-      }
-      onLookupFailure={(failure) =>
-        onUseManual(failure.location_label)
-      }
+      onUseManualEntry={(entry) => onUseManual(entry.label)}
+      onLookupFailure={(failure) => onUseManual(failure.label)}
     />
   );
 }

@@ -1,5 +1,7 @@
 import { apiClient } from '@/shared/api/client';
 import { extractCursor, type CursorPaginatedResponse } from '@/shared/api/pagination';
+import type { UploadableFile } from '@/shared/media/types';
+import { uploadFile } from '@/shared/media/uploadFile';
 import type {
   CreateTripInput,
   InvitableFriend,
@@ -86,4 +88,25 @@ export async function sendTripInvitations(
 
 export async function removeTripMember(tripId: string, userId: string): Promise<void> {
   await apiClient.delete(`/trips/${tripId}/members/${userId}`);
+}
+
+/**
+ * A cover is preprocessed down to at most 10 MB, which is roughly 80 megabits of
+ * body before multipart overhead — past the client's 15s default at any mobile
+ * uplink below ~6 Mbps, before the server has read, validated and re-encoded it.
+ * Two minutes covers ~10 MB near 1 Mbps plus that processing, and still bounds a
+ * dead request instead of leaving the form stuck on "uploading" forever.
+ */
+export const TRIP_COVER_UPLOAD_TIMEOUT_MS = 120_000;
+
+/**
+ * The upload does not attach itself to a trip; the returned `/media/...` path is
+ * an input to the next trip create or update.
+ */
+export async function uploadTripCover(file: UploadableFile): Promise<string> {
+  // Field name is `file` — /api/auth/avatar uses `avatar`, this endpoint does not.
+  const data = await uploadFile<{ url: string }>('/media/trip-covers', 'file', file, 'post', {
+    timeoutMs: TRIP_COVER_UPLOAD_TIMEOUT_MS,
+  });
+  return data.url;
 }

@@ -1,7 +1,7 @@
 import type { ComponentProps, ReactNode } from 'react';
 import { View } from 'react-native';
+import type { PlacePicker } from '@/shared/location/PlacePicker';
 import type { ActivityForm } from '../components/ActivityForm';
-import type { PlacePicker } from '../components/PlacePicker';
 
 let mockParams: Record<string, string | string[] | undefined> = {};
 const mockRouter = {
@@ -82,7 +82,7 @@ jest.mock('@/features/trips/hooks/useTripDetail', () => ({
 jest.mock('../components/ActivityForm', () => ({
   ActivityForm: mockRenderActivityForm,
 }));
-jest.mock('../components/PlacePicker', () => ({
+jest.mock('@/shared/location/PlacePicker', () => ({
   PlacePicker: mockRenderPlacePicker,
 }));
 jest.mock('../api', () => ({
@@ -489,22 +489,19 @@ describe('ActivityFormScreen', () => {
 
     const picker = currentPlacePickerProps();
     expect(picker.value).toEqual({
-      location_label: 'Existing manual label',
+      label: 'Existing manual label',
       place: null,
     });
     expect(picker.error).toBe('Provider id is invalid.');
 
-    picker.onSelectLocation({
-      location_mode: 'STRUCTURED',
-      location_label: 'Canonical place',
-      place: {
-        provider: 'here',
-        provider_id: 'canonical-id',
-        title: 'Canonical place',
-        address: 'Da Nang',
-        lat: 16,
-        lng: 108,
-      },
+    picker.onSelectPlace({
+      provider: 'here',
+      provider_id: 'canonical-id',
+      label: 'Canonical place',
+      address: 'Da Nang',
+      lat: 16,
+      lng: 108,
+      country_code: 'VN',
     });
     expect(onChange).toHaveBeenCalledWith({
       location_label: 'Canonical place',
@@ -512,9 +509,7 @@ describe('ActivityFormScreen', () => {
     });
 
     picker.onLookupFailure({
-      location_mode: 'MANUAL',
-      location_label: 'Unverified suggestion',
-      place: null,
+      label: 'Unverified suggestion',
       error: {
         kind: 'network',
         message: 'Cannot reach the server.',
