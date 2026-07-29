@@ -20,22 +20,21 @@ import type { ResolvedPlace } from '@/shared/location/types';
 // eslint-disable-next-line import/first
 import { DestinationField } from '../components/DestinationField';
 // eslint-disable-next-line import/first
-import type { TripDestinationValue } from '../destination';
+import { destinationValueFromPlace } from '../destination';
 
 const place: ResolvedPlace = {
   provider: 'here',
   provider_id: 'canonical-here-id',
-  label: 'Hội An, Quảng Nam',
+  label: 'Hội An',
   address: 'Hội An, Quảng Nam, Việt Nam',
   lat: 15.8801,
   lng: 108.338,
   country_code: 'VN',
 };
 
-const structuredValue: TripDestinationValue = {
-  label: place.label,
-  place,
-};
+const CANONICAL_DESTINATION = 'Hội An, Quảng Nam, Việt Nam';
+
+const structuredValue = destinationValueFromPlace(place);
 
 function currentPickerProps(): ComponentProps<typeof PlacePicker> {
   if (!mockPlacePickerProps) {
@@ -50,7 +49,7 @@ describe('DestinationField', () => {
     mockPlacePickerProps = undefined;
   });
 
-  it('adopts a verified place as a structured destination value', async () => {
+  it('adopts a verified place under its canonical destination label', async () => {
     const onChange = jest.fn();
     await render(
       <DestinationField
@@ -63,7 +62,7 @@ describe('DestinationField', () => {
       currentPickerProps().onSelectPlace(place);
     });
 
-    expect(onChange).toHaveBeenCalledWith({ label: place.label, place });
+    expect(onChange).toHaveBeenCalledWith({ label: CANONICAL_DESTINATION, place });
   });
 
   it('drops the structured half when the user chooses manual entry', async () => {
@@ -124,9 +123,11 @@ describe('DestinationField', () => {
       <DestinationField value={structuredValue} onChange={jest.fn()} />,
     );
 
+    // The manual input shows what will be submitted; the card keeps the short
+    // title the picker itself displays.
     expect(currentPickerProps().value).toEqual({
-      label: place.label,
-      place: { title: place.label, address: place.address },
+      label: CANONICAL_DESTINATION,
+      place: { title: 'Hội An', address: place.address },
     });
   });
 

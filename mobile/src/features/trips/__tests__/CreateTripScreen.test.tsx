@@ -97,10 +97,12 @@ const processedImage = {
 } as const;
 const UPLOADED_COVER_URL = '/media/trip-covers/8f0e.webp';
 
+// Short suggestion title vs canonical lookup destination — the payload must take
+// the canonical one, the same value the web picker persists.
 const verifiedPlace: ResolvedPlace = {
   provider: 'here',
   provider_id: 'canonical-here-id',
-  label: 'Hội An, Quảng Nam',
+  label: 'Hội An',
   address: 'Hội An, Quảng Nam, Việt Nam',
   lat: 15.8801,
   lng: 108.338,
@@ -186,7 +188,7 @@ describe('CreateTripScreen', () => {
     await waitFor(() =>
       expect(mockCreateTrip).toHaveBeenCalledWith(
         expect.objectContaining({
-          destination: 'Hội An, Quảng Nam',
+          destination: 'Hội An, Quảng Nam, Việt Nam',
           destination_provider: 'here',
           destination_provider_id: 'canonical-here-id',
           destination_lat: 15.8801,

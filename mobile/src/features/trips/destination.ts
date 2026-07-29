@@ -1,3 +1,4 @@
+import { truncateCodePoints } from '@/shared/location/resolvePlace';
 import type { ResolvedPlace } from '@/shared/location/types';
 import type { Trip } from './types';
 
@@ -63,11 +64,31 @@ export function destinationValueFromTrip(trip: Trip): TripDestinationValue {
   };
 }
 
-/** Adopt a verified place. */
+/**
+ * Adopt a verified place.
+ *
+ * A trip stores the canonical destination the HERE lookup returned, which the
+ * shared place carries in `address` ("Hội An, Quảng Nam, Việt Nam") — `label` is
+ * the short suggestion title ("Hội An") that the timeline wants for an activity.
+ * Taking the label here would persist a label from one representation next to
+ * five structured columns from another, and the same place would land in the
+ * column differently on web and on mobile.
+ *
+ * The address is capped at 255 for the shared picker but `destination` is 200,
+ * so it is re-truncated by code point — `slice` counts UTF-16 units and would
+ * split an emoji in half.
+ */
 export function destinationValueFromPlace(
   place: ResolvedPlace,
 ): TripDestinationValue {
-  return { label: place.label, place };
+  // A place rebuilt from a stored trip has no address; so does a lookup that
+  // returned no usable canonical destination.
+  const canonical = place.address.trim() || place.label;
+
+  return {
+    label: truncateCodePoints(canonical, TRIP_DESTINATION_MAX_LENGTH),
+    place,
+  };
 }
 
 /** Adopt typed text; always drops the structured half. */
@@ -82,9 +103,14 @@ export function manualDestinationValue(label: string): TripDestinationValue {
 export function destinationFields(
   value: TripDestinationValue,
 ): TripDestinationFields {
+  // Both shapes submit the label the form is holding: a structured value already
+  // normalised it to the canonical destination, and a hand-edited label always
+  // arrives with `place` dropped, so it can never disagree with the metadata.
+  const destination = value.label.trim();
+
   if (value.place) {
     return {
-      destination: value.place.label,
+      destination,
       destination_provider: value.place.provider,
       destination_provider_id: value.place.provider_id,
       destination_lat: normalizeCoordinate(value.place.lat),
@@ -94,7 +120,7 @@ export function destinationFields(
   }
 
   return {
-    destination: value.label.trim(),
+    destination,
     destination_provider: '',
     destination_provider_id: '',
     destination_lat: null,

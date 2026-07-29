@@ -4,13 +4,16 @@ import {
   destinationValueFromPlace,
   destinationValueFromTrip,
   manualDestinationValue,
+  TRIP_DESTINATION_MAX_LENGTH,
 } from '../destination';
 import type { Trip } from '../types';
 
+// The short suggestion title and the canonical lookup destination differ on
+// purpose: that difference is the whole point of these expectations.
 const place: ResolvedPlace = {
   provider: 'here',
   provider_id: 'canonical-here-id',
-  label: 'Hội An, Quảng Nam',
+  label: 'Hội An',
   address: 'Hội An, Quảng Nam, Việt Nam',
   lat: 15.8801,
   lng: 108.338,
@@ -41,10 +44,33 @@ function buildTrip(overrides: Partial<Trip> = {}): Trip {
   };
 }
 
+describe('destinationValueFromPlace', () => {
+  it('adopts the canonical lookup destination, not the short suggestion title', () => {
+    expect(destinationValueFromPlace(place).label).toBe(
+      'Hội An, Quảng Nam, Việt Nam',
+    );
+  });
+
+  it('truncates a canonical destination past the 200 cap by code point', () => {
+    const address = `${'🏝'.repeat(210)}`;
+
+    const { label } = destinationValueFromPlace({ ...place, address });
+
+    expect(Array.from(label)).toHaveLength(TRIP_DESTINATION_MAX_LENGTH);
+    expect(label).toBe('🏝'.repeat(TRIP_DESTINATION_MAX_LENGTH));
+  });
+
+  it('falls back to the label when the lookup carried no canonical destination', () => {
+    expect(destinationValueFromPlace({ ...place, address: '   ' }).label).toBe(
+      'Hội An',
+    );
+  });
+});
+
 describe('destinationFields', () => {
   it('writes all five structured columns from one verified place', () => {
     expect(destinationFields(destinationValueFromPlace(place))).toEqual({
-      destination: place.label,
+      destination: 'Hội An, Quảng Nam, Việt Nam',
       destination_provider: 'here',
       destination_provider_id: 'canonical-here-id',
       destination_lat: 15.8801,
