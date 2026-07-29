@@ -12,7 +12,11 @@ import { createTrip } from '../api';
 import { CoverImageField } from '../components/CoverImageField';
 import { DestinationField } from '../components/DestinationField';
 import { formatDateParam } from '../dates';
-import { destinationFields, type TripDestinationValue } from '../destination';
+import {
+  destinationFieldError,
+  destinationFields,
+  type TripDestinationValue,
+} from '../destination';
 import { useTripCoverUpload } from '../hooks/useTripCoverUpload';
 import { TRIP_CURRENCY_CODES } from '../options';
 import type { CreateTripInput } from '../types';
@@ -129,7 +133,7 @@ export function CreateTripScreen() {
         <DestinationField
           value={destination}
           onChange={setDestination}
-          error={error?.fieldErrors?.destination}
+          error={destinationFieldError(error?.fieldErrors)}
         />
       </FormSection>
 

@@ -53,6 +53,21 @@ describe('destinationFields', () => {
     });
   });
 
+  it('rounds structured coordinates to the backend six-decimal contract', () => {
+    expect(
+      destinationFields(
+        destinationValueFromPlace({
+          ...place,
+          lat: 15.880123789,
+          lng: 108.338987654,
+        }),
+      ),
+    ).toMatchObject({
+      destination_lat: 15.880124,
+      destination_lng: 108.338988,
+    });
+  });
+
   it('clears all five structured columns for a manual value', () => {
     expect(
       destinationFields(manualDestinationValue('  Nha Trang, Vietnam  ')),

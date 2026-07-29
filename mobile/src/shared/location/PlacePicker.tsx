@@ -103,6 +103,8 @@ export function PlacePicker({
     createManualValue,
   } = useLocationSearch({ enabled: !disabled });
   const lookupPending = lookupStatus === 'loading';
+  const noResults =
+    searchStatus === 'ready' && suggestions.length === 0;
 
   const chooseSuggestion = useCallback(
     (suggestion: PlaceSuggestion) => {
@@ -206,6 +208,12 @@ export function PlacePicker({
           style={styles.notice}
         >
           {searchMessage}
+        </Text>
+      ) : null}
+
+      {noResults ? (
+        <Text accessibilityLiveRegion="polite" style={styles.notice}>
+          No results.
         </Text>
       ) : null}
 

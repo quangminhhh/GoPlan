@@ -316,7 +316,7 @@ describe('CreateTripScreen', () => {
   it('renders DRF field errors beside their corresponding fields', async () => {
     mockCreateTrip.mockRejectedValue(
       axiosErrorWith(400, {
-        destination: ['Choose a valid destination.'],
+        destination_lat: ['Ensure that there are no more than 6 decimal places.'],
         budget_estimate: ['A non-negative number is required.'],
         currency_code: ['Unsupported trip currency code.'],
       }),
@@ -326,7 +326,11 @@ describe('CreateTripScreen', () => {
     await fillRequiredFields();
     await fireEvent.press(screen.getByText('Create trip'));
 
-    expect(await screen.findByText('Choose a valid destination.')).toBeTruthy();
+    expect(
+      await screen.findByText(
+        'Ensure that there are no more than 6 decimal places.',
+      ),
+    ).toBeTruthy();
     expect(await screen.findByText('A non-negative number is required.')).toBeTruthy();
     expect(await screen.findByText('Unsupported trip currency code.')).toBeTruthy();
   });

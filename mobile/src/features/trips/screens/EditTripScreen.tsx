@@ -16,6 +16,7 @@ import { CoverImageField } from '../components/CoverImageField';
 import { DestinationField } from '../components/DestinationField';
 import { formatDateParam, parseDateOnly } from '../dates';
 import {
+  destinationFieldError,
   destinationFields,
   destinationValueFromTrip,
   type TripDestinationValue,
@@ -165,7 +166,7 @@ function EditTripForm({ detail }: { detail: TripDetailResponse }) {
         <DestinationField
           value={destination}
           onChange={onDestinationChange}
-          error={error?.fieldErrors?.destination}
+          error={destinationFieldError(error?.fieldErrors)}
         />
       </FormSection>
 

@@ -345,11 +345,18 @@ describe('EditTripScreen', () => {
 
   it('renders backend field and business errors exactly as returned', async () => {
     mockUpdateTrip.mockRejectedValueOnce(
-      axiosErrorWith(400, { destination: ['Choose a valid destination.'], timezone: ['Use a valid timezone.'] }),
+      axiosErrorWith(400, {
+        destination_lng: ['Ensure that there are no more than 6 decimal places.'],
+        timezone: ['Use a valid timezone.'],
+      }),
     );
     await render(<EditTripScreen />);
     await save();
-    expect(await screen.findByText('Choose a valid destination.')).toBeTruthy();
+    expect(
+      await screen.findByText(
+        'Ensure that there are no more than 6 decimal places.',
+      ),
+    ).toBeTruthy();
     expect(await screen.findByText('Use a valid timezone.')).toBeTruthy();
 
     mockUpdateTrip.mockRejectedValueOnce(axiosErrorWith(409, { detail: 'Trip has already been cancelled.' }));

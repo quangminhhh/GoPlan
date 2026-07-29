@@ -26,6 +26,15 @@ export interface TripDestinationFields {
   destination_country_code: string;
 }
 
+const DESTINATION_ERROR_FIELDS = [
+  'destination',
+  'destination_provider',
+  'destination_provider_id',
+  'destination_lat',
+  'destination_lng',
+  'destination_country_code',
+] as const;
+
 /**
  * Hydrate the edit form from a stored trip.
  *
@@ -78,8 +87,8 @@ export function destinationFields(
       destination: value.place.label,
       destination_provider: value.place.provider,
       destination_provider_id: value.place.provider_id,
-      destination_lat: value.place.lat,
-      destination_lng: value.place.lng,
+      destination_lat: normalizeCoordinate(value.place.lat),
+      destination_lng: normalizeCoordinate(value.place.lng),
       destination_country_code: value.place.country_code,
     };
   }
@@ -92,6 +101,24 @@ export function destinationFields(
     destination_lng: null,
     destination_country_code: '',
   };
+}
+
+/** Surface any backend error for the structured destination as one field error. */
+export function destinationFieldError(
+  fieldErrors: Readonly<Record<string, string>> | undefined,
+): string | undefined {
+  for (const field of DESTINATION_ERROR_FIELDS) {
+    const message = fieldErrors?.[field];
+    if (message !== undefined) {
+      return message;
+    }
+  }
+  return undefined;
+}
+
+/** Django stores both coordinates with decimal_places=6. */
+function normalizeCoordinate(value: number | null): number | null {
+  return value === null ? null : Number(value.toFixed(6));
 }
 
 /**

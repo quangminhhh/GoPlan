@@ -190,6 +190,24 @@ describe('PlacePicker', () => {
     rendered.unmount();
   });
 
+  it('shows an explicit empty state when search succeeds with no results', async () => {
+    mockSuggestLocations.mockResolvedValue([]);
+    const callbacks = pickerCallbacks();
+    const rendered = await render(
+      <PlacePicker value={selectedPlace} {...callbacks} />,
+    );
+
+    await enterSearch('Nowhere');
+    await advanceDebounce();
+
+    expect(screen.getByText('No results.')).toBeTruthy();
+    expect(screen.getByText('Existing Station')).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: 'Enter location manually' }),
+    ).toBeTruthy();
+    rendered.unmount();
+  });
+
   it('emits only the canonical structured selection after lookup succeeds', async () => {
     mockSuggestLocations.mockResolvedValue([suggestion]);
     mockLookupLocation.mockResolvedValue(lookup);
