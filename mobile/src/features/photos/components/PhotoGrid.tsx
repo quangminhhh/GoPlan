@@ -57,6 +57,8 @@ interface PhotoGridProps {
   onPhotoPress: (photoId: string) => void;
   onPhotoLongPress?: (photoId: string) => void;
   onAssetNotFound: (photoId: string, failure: PhotoFailure) => void;
+  selectionMode?: boolean;
+  isSelected?: (photoId: string) => boolean;
   ListHeaderComponent?: React.ReactElement | null;
 }
 
@@ -73,6 +75,8 @@ export function PhotoGrid({
   onPhotoPress,
   onPhotoLongPress,
   onAssetNotFound,
+  selectionMode = false,
+  isSelected,
   ListHeaderComponent,
 }: PhotoGridProps) {
   const { width } = useWindowDimensions();
@@ -90,9 +94,11 @@ export function PhotoGrid({
         onPress={onPhotoPress}
         onLongPress={onPhotoLongPress}
         onAssetNotFound={onAssetNotFound}
+        selectionMode={selectionMode}
+        selected={isSelected?.(item.id) ?? false}
       />
     ),
-    [tripId, tileSize, onPhotoPress, onPhotoLongPress, onAssetNotFound],
+    [tripId, tileSize, onPhotoPress, onPhotoLongPress, onAssetNotFound, selectionMode, isSelected],
   );
 
   const keyExtractor = useCallback((item: TripPhoto) => item.id, []);

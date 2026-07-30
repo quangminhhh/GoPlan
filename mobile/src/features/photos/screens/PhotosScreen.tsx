@@ -5,9 +5,11 @@ import { colors, spacing, typography } from '@/shared/theme/tokens';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 import { Screen } from '@/shared/ui/Screen';
 import { PhotoGrid } from '../components/PhotoGrid';
+import { PhotoSelectionBar } from '../components/PhotoSelectionBar';
 import { PhotoUploadSheet } from '../components/PhotoUploadSheet';
 import { PhotoViewer } from '../components/PhotoViewer';
-import { PHOTO_ERROR_MESSAGES } from '../errors';
+import { PHOTO_ERROR_MESSAGES, type PhotoFailure } from '../errors';
+import { usePhotoSelection } from '../hooks/usePhotoSelection';
 import { usePhotoUpload } from '../hooks/usePhotoUpload';
 import { usePhotoViewer } from '../hooks/usePhotoViewer';
 import { useTripPhotos } from '../hooks/useTripPhotos';
@@ -35,14 +37,20 @@ export function PhotosScreen() {
     handleAssetNotFound,
   } = useTripPhotos(tripId);
 
-  const handleTripNotFound = useCallback(() => {
-    handleAssetNotFound('', {
-      kind: 'notFound',
-      message: PHOTO_ERROR_MESSAGES.tripNotFound,
-      status: 404,
-      errorCode: 'TRIP_NOT_FOUND',
-    });
-  }, [handleAssetNotFound]);
+  const handleTripNotFound = useCallback(
+    (failure?: PhotoFailure) => {
+      handleAssetNotFound(
+        '',
+        failure ?? {
+          kind: 'notFound',
+          message: PHOTO_ERROR_MESSAGES.tripNotFound,
+          status: 404,
+          errorCode: 'TRIP_NOT_FOUND',
+        },
+      );
+    },
+    [handleAssetNotFound],
+  );
 
   const upload = usePhotoUpload({
     tripId,
@@ -90,6 +98,30 @@ export function PhotosScreen() {
   const handleSave = useCallback(() => {
     void viewer.save();
   }, [viewer]);
+
+  const selection = usePhotoSelection({
+    tripId,
+    photos,
+    reconcile,
+    onTripNotFound: handleTripNotFound,
+  });
+
+  // A long press enters selection mode rather than opening the photo, and a tap
+  // toggles only while selection mode is on.
+  const handleTilePress = useCallback(
+    (photoId: string) => {
+      if (selection.selectionMode) {
+        selection.toggle(photoId);
+        return;
+      }
+      viewer.open(photoId);
+    },
+    [selection, viewer],
+  );
+
+  const handleStartDownload = useCallback(() => {
+    void selection.startDownload();
+  }, [selection]);
 
   if (tripNotFound) {
     // Neutral on purpose: a trip that was deleted and a trip the user was
@@ -191,12 +223,27 @@ export function PhotosScreen() {
           onRefresh={refresh}
           onEndReached={handleEndReached}
           onRetryPage={handleEndReached}
-          onPhotoPress={viewer.open}
+          onPhotoPress={handleTilePress}
+          onPhotoLongPress={selection.enterSelection}
           onAssetNotFound={handleAssetNotFound}
+          selectionMode={selection.selectionMode}
+          isSelected={selection.isSelected}
         />
+        {selection.selectionMode ? (
+          <PhotoSelectionBar
+            selectedCount={selection.selectedCount}
+            hasNextPage={hasNextPage}
+            download={selection.download}
+            onSelectLoaded={selection.selectLoaded}
+            onClear={selection.clear}
+            onExit={selection.exit}
+            onDownload={handleStartDownload}
+            onCancelDownload={selection.cancelDownload}
+          />
+        ) : null}
       </View>
       {uploadSheet}
-      {viewer.currentPhoto ? (
+      {viewer.currentPhoto && !selection.selectionMode ? (
         <PhotoViewer
           tripId={tripId}
           photos={photos}

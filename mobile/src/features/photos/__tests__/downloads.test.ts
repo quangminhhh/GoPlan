@@ -4,6 +4,7 @@ import {
   startPrivateMediaSession,
 } from '@/shared/media/privateMediaLifecycle';
 import {
+  downloadAndShareTripPhotoArchive,
   extensionForDownload,
   hasDiskRoomForArchive,
   isZipResponse,
@@ -255,5 +256,280 @@ describe('hasDiskRoomForArchive', () => {
 
   it('proceeds when the platform cannot report free space, which is a stated residual risk', () => {
     expect(hasDiskRoomForArchive(null, 10 * 1024 * 1024 * 1024)).toBe(true);
+  });
+});
+
+function zipResponse(chunks = [bytes(1024), bytes(1024)], headers: Record<string, string> = {}) {
+  return createFakeResponse({
+    status: 200,
+    headers: {
+      'content-type': 'application/zip',
+      'content-disposition': 'attachment; filename="da-lat-photos.zip"',
+      ...headers,
+    },
+    chunks,
+  });
+}
+
+describe('downloadAndShareTripPhotoArchive', () => {
+  it('posts the ordered ids as json and hands the file to the share sheet', async () => {
+    const native = nativeActions();
+    const transport = createFakeTransport(() => zipResponse().response);
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['c', 'a', 'b'],
+      transport,
+      native,
+    });
+
+    expect(outcome).toEqual({ status: 'shared', fileName: 'da-lat-photos.zip' });
+    const call = transport.fetches.calls[0];
+    expect(call.url).toBe('http://testserver:8000/api/trips/trip-1/photos/download');
+    expect(call.init.method).toBe('POST');
+    expect(call.init.headers['Content-Type']).toBe('application/json');
+    expect(call.init.body).toBe('{"photo_ids":["c","a","b"]}');
+    expect(native.share).toHaveBeenCalledWith(
+      expect.stringContaining('file:///'),
+      expect.objectContaining({ UTI: 'public.zip-archive' }),
+    );
+  });
+
+  it('streams chunk by chunk and never materialises the whole archive', async () => {
+    const handle = zipResponse([bytes(4096), bytes(4096), bytes(4096)]);
+    const transport = createFakeTransport(() => handle.response);
+    const progress: number[] = [];
+
+    await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native: nativeActions(),
+      onProgress: (written) => progress.push(written),
+    });
+
+    // Progress advances a chunk at a time, which is only possible if the body
+    // was pumped rather than buffered whole.
+    expect(progress).toEqual([4096, 8192, 12288]);
+    expect(handle.bodyRead()).toBe(true);
+  });
+
+  it('deletes the archive once the share sheet has settled', async () => {
+    const transport = createFakeTransport(() => zipResponse().response);
+    const shareOrder: string[] = [];
+    const native = nativeActions({
+      share: jest.fn(async (uri: string) => {
+        // The sheet reads the file while it is open, so it must still exist.
+        shareOrder.push((await transport.files.exists(uri)) ? 'exists-during-share' : 'missing');
+      }),
+    });
+
+    await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native,
+    });
+
+    expect(shareOrder).toEqual(['exists-during-share']);
+    expect(transport.files.contents().size).toBe(0);
+  });
+
+  it('rejects a 200 that is not actually a zip', async () => {
+    const transport = createFakeTransport(
+      () =>
+        createFakeResponse({
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+          chunks: [bytes(64)],
+        }).response,
+    );
+    const native = nativeActions();
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native,
+    });
+
+    expect(outcome).toMatchObject({ status: 'failed', failure: { kind: 'invalidContent' } });
+    expect(native.share).not.toHaveBeenCalled();
+    expect(transport.files.contents().size).toBe(0);
+  });
+
+  it('reports an all-or-nothing stale selection separately from other failures', async () => {
+    const transport = createFakeTransport(
+      () =>
+        jsonErrorResponse(404, {
+          detail: 'One or more selected photos were not found.',
+          error_code: 'PHOTO_NOT_FOUND',
+        }).response,
+    );
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a', 'b'],
+      transport,
+      native: nativeActions(),
+    });
+
+    expect(outcome).toEqual({ status: 'staleSelection' });
+  });
+
+  it('keeps a trip-level 404 distinguishable', async () => {
+    const transport = createFakeTransport(
+      () => jsonErrorResponse(404, { detail: 'Trip not found.', error_code: 'TRIP_NOT_FOUND' }).response,
+    );
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native: nativeActions(),
+    });
+
+    expect(outcome).toMatchObject({
+      status: 'failed',
+      failure: { kind: 'notFound', errorCode: 'TRIP_NOT_FOUND' },
+    });
+  });
+
+  it('uses bulk-specific wording when throttled', async () => {
+    const transport = createFakeTransport(
+      () => jsonErrorResponse(429, { detail: 'Too many requests.' }).response,
+    );
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native: nativeActions(),
+    });
+
+    expect(outcome).toMatchObject({
+      status: 'failed',
+      failure: { message: 'Download limit reached. Try again later.' },
+    });
+  });
+
+  it('refuses a selection outside 1..100 before spending a request', async () => {
+    const transport = createFakeTransport(() => zipResponse().response);
+
+    await expect(
+      downloadAndShareTripPhotoArchive({
+        tripId: 'trip-1',
+        photoIds: [],
+        transport,
+        native: nativeActions(),
+      }),
+    ).resolves.toMatchObject({ status: 'failed' });
+
+    await expect(
+      downloadAndShareTripPhotoArchive({
+        tripId: 'trip-1',
+        photoIds: Array.from({ length: 101 }, (_unused, index) => `p${index}`),
+        transport,
+        native: nativeActions(),
+      }),
+    ).resolves.toMatchObject({ status: 'failed' });
+
+    expect(transport.fetches.calls).toHaveLength(0);
+  });
+
+  it('reports an unavailable share sheet before downloading anything', async () => {
+    const transport = createFakeTransport(() => zipResponse().response);
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native: nativeActions({ isSharingAvailable: jest.fn(async () => false) }),
+    });
+
+    expect(outcome).toEqual({ status: 'unavailable' });
+    expect(transport.fetches.calls).toHaveLength(0);
+  });
+
+  it('deletes the partial archive when the download is cancelled', async () => {
+    const controller = new AbortController();
+    const transport = createFakeTransport(() => {
+      // Aborted after the response arrives but before the body is drained.
+      controller.abort();
+      return zipResponse().response;
+    });
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native: nativeActions(),
+      signal: controller.signal,
+    });
+
+    expect(outcome).toEqual({ status: 'cancelled' });
+    expect(transport.files.contents().size).toBe(0);
+  });
+
+  it('refuses to start when free disk is already below the reserve', async () => {
+    const transport = createFakeTransport(() => zipResponse().response);
+    transport.files.setAvailableBytes(1024);
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native: nativeActions(),
+    });
+
+    expect(outcome).toMatchObject({
+      status: 'failed',
+      failure: { message: 'Not enough storage space to prepare these photos.' },
+    });
+    expect(transport.fetches.calls).toHaveLength(0);
+  });
+
+  it('stops and cleans up when free disk drops mid-stream', async () => {
+    const transport = createFakeTransport(() =>
+      zipResponse([bytes(9 * 1024 * 1024), bytes(9 * 1024 * 1024)]).response,
+    );
+    let checks = 0;
+    const originalAvailable = transport.files.availableBytes;
+    transport.files.availableBytes = () => {
+      checks += 1;
+      // Plenty of room for the preflight; the volume fills while streaming.
+      return checks <= 1 ? originalAvailable() : 1024;
+    };
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native: nativeActions(),
+    });
+
+    expect(outcome).toMatchObject({
+      status: 'failed',
+      failure: { message: 'Not enough storage space to prepare these photos.' },
+    });
+    expect(transport.files.contents().size).toBe(0);
+  });
+
+  it('refuses when Content-Length would not fit inside the reserve', async () => {
+    const transport = createFakeTransport(
+      () => zipResponse([bytes(64)], { 'content-length': String(10 * 1024 * 1024 * 1024) }).response,
+    );
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native: nativeActions(),
+    });
+
+    expect(outcome).toMatchObject({
+      status: 'failed',
+      failure: { message: 'Not enough storage space to prepare these photos.' },
+    });
   });
 });

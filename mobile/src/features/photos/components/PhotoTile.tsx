@@ -1,8 +1,9 @@
 import { memo, useCallback } from 'react';
-import { Pressable, StyleSheet } from 'react-native';
+import { Pressable, StyleSheet, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import { AuthenticatedImage } from '@/shared/media/AuthenticatedImage';
 import type { ProtectedAssetError } from '@/shared/media/protectedAssetTypes';
-import { colors, radii } from '@/shared/theme/tokens';
+import { colors, radii, spacing } from '@/shared/theme/tokens';
 import { tripPhotoAssetKey, tripPhotoAssetPath } from '../api';
 import { TRIP_PHOTO_VARIANTS } from '../constants';
 import { toPhotoFailure, type PhotoFailure } from '../errors';
@@ -18,6 +19,8 @@ interface PhotoTileProps {
   onPress: (photoId: string) => void;
   onLongPress?: (photoId: string) => void;
   onAssetNotFound: (photoId: string, failure: PhotoFailure) => void;
+  selectionMode?: boolean;
+  selected?: boolean;
 }
 
 /**
@@ -37,6 +40,8 @@ function PhotoTileComponent({
   onPress,
   onLongPress,
   onAssetNotFound,
+  selectionMode = false,
+  selected = false,
 }: PhotoTileProps) {
   const handlePress = useCallback(() => onPress(photoId), [onPress, photoId]);
   const handleLongPress = useCallback(() => onLongPress?.(photoId), [onLongPress, photoId]);
@@ -47,8 +52,13 @@ function PhotoTileComponent({
 
   return (
     <Pressable
-      accessibilityRole="imagebutton"
-      accessibilityLabel={`Open photo uploaded by ${uploaderName}`}
+      accessibilityRole={selectionMode ? 'checkbox' : 'imagebutton'}
+      accessibilityLabel={
+        selectionMode
+          ? `Photo uploaded by ${uploaderName}`
+          : `Open photo uploaded by ${uploaderName}`
+      }
+      accessibilityState={selectionMode ? { checked: selected } : undefined}
       onPress={handlePress}
       onLongPress={onLongPress ? handleLongPress : undefined}
       style={({ pressed }) => [styles.tile, { width: size, height: size }, pressed && styles.pressed]}
@@ -66,6 +76,11 @@ function PhotoTileComponent({
         sourceHeight={thumbnailHeight}
         onNotFound={handleNotFound}
       />
+      {selectionMode ? (
+        <View style={[styles.badge, selected && styles.badgeSelected]} testID={`photo-tile-check-${photoId}`}>
+          {selected ? <Ionicons name="checkmark" size={14} color={colors.background} /> : null}
+        </View>
+      ) : null}
     </Pressable>
   );
 }
@@ -80,4 +95,18 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   pressed: { opacity: 0.7 },
+  badge: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    borderColor: colors.background,
+    borderRadius: radii.full,
+    borderWidth: 1.5,
+    bottom: spacing.xs,
+    height: 22,
+    justifyContent: 'center',
+    position: 'absolute',
+    right: spacing.xs,
+    width: 22,
+  },
+  badgeSelected: { backgroundColor: colors.primary, borderColor: colors.primary },
 });

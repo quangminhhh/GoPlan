@@ -15,9 +15,13 @@ import {
 } from '@/shared/media/privateMediaLifecycle';
 import { ProtectedAssetError, type ProtectedTransport } from '@/shared/media/protectedAssetTypes';
 import { createOpaqueFileName, nativeProtectedTransport } from '@/shared/media/protectedTransport';
-import { tripPhotoAssetPath } from './api';
+import { buildBulkDownloadBody, tripPhotoAssetPath, tripPhotoBulkDownloadPath } from './api';
 import { nativePhotoActions } from './nativePhotoActions';
-import { MEDIUM_MAX_BYTES, PRIVATE_MEDIA_DISK_RESERVE_BYTES } from './constants';
+import {
+  MEDIUM_MAX_BYTES,
+  PHOTO_BULK_DOWNLOAD_MAX_SELECTION,
+  PRIVATE_MEDIA_DISK_RESERVE_BYTES,
+} from './constants';
 import { PHOTO_ERROR_MESSAGES, toPhotoFailure, type PhotoFailure } from './errors';
 
 export interface NativePhotoActions {
@@ -258,4 +262,190 @@ export function throttledDownloadFailure(failure: PhotoFailure): PhotoFailure {
   return failure.kind === 'throttled'
     ? { ...failure, message: PHOTO_ERROR_MESSAGES.downloadThrottled }
     : failure;
+}
+
+/** Free space is re-checked every this many bytes while a ZIP streams. */
+export const ARCHIVE_DISK_CHECK_INTERVAL_BYTES = 8 * 1024 * 1024;
+
+export type ArchiveOutcome =
+  | { status: 'shared'; fileName: string }
+  | { status: 'unavailable' }
+  | { status: 'cancelled' }
+  | { status: 'staleSelection' }
+  | { status: 'failed'; failure: PhotoFailure };
+
+export interface DownloadArchiveOptions {
+  tripId: string;
+  photoIds: string[];
+  transport?: ProtectedTransport;
+  native?: NativePhotoActions;
+  signal?: AbortSignal;
+  onProgress?: (bytesWritten: number, totalBytes: number | null) => void;
+}
+
+/**
+ * Streams the bulk-download ZIP to a cache file and hands it to the iOS share
+ * sheet (D5).
+ *
+ * A ZIP is not something the photo library can accept, so the share sheet is the
+ * destination — Files, AirDrop, Mail. Chunks are pumped one at a time rather
+ * than buffered: `response.bytes()` would hold the whole archive in JavaScript
+ * memory, and a hundred photos is not a small archive. Bounded chunks still pass
+ * through a JS sink, so the invariant is "never materialise the whole archive",
+ * not "zero JS memory".
+ *
+ * SDK 57's `shareAsync` returns `Promise<void>`. Resolving proves the sheet
+ * closed and nothing more — not whether the user shared or cancelled — so the
+ * caller shows no success message and keeps the selection.
+ */
+export async function downloadAndShareTripPhotoArchive(
+  options: DownloadArchiveOptions,
+): Promise<ArchiveOutcome> {
+  const {
+    tripId,
+    photoIds,
+    transport = nativeProtectedTransport,
+    native = nativePhotoActions,
+    signal,
+    onProgress,
+  } = options;
+
+  if (photoIds.length === 0 || photoIds.length > PHOTO_BULK_DOWNLOAD_MAX_SELECTION) {
+    // An empty list is rejected by the serializer before the service layer sees
+    // it, and the server caps a request at 100. Neither should be reachable.
+    return {
+      status: 'failed',
+      failure: { kind: 'request', message: PHOTO_ERROR_MESSAGES.selectionCap },
+    };
+  }
+
+  if (!(await native.isSharingAvailable())) {
+    return { status: 'unavailable' };
+  }
+
+  let releaseLease: (() => void) | null = null;
+  try {
+    releaseLease = acquirePrivateTransferLease();
+  } catch {
+    return { status: 'cancelled' };
+  }
+
+  let stagedUri: string | null = null;
+  try {
+    if (!hasDiskRoomForArchive(transport.files.availableBytes(), 0)) {
+      return {
+        status: 'failed',
+        failure: { kind: 'request', message: PHOTO_ERROR_MESSAGES.lowStorage },
+      };
+    }
+
+    const epochAtStart = getPrivateMediaEpoch();
+    const response = await fetchProtectedResponse({
+      path: tripPhotoBulkDownloadPath(tripId),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: buildBulkDownloadBody(photoIds),
+      signal,
+      transport,
+    });
+
+    const contentType = response.headers.get('content-type');
+    const disposition = response.headers.get('content-disposition');
+    if (!isZipResponse(contentType, disposition)) {
+      await response.body?.cancel().catch(() => undefined);
+      return {
+        status: 'failed',
+        failure: { kind: 'invalidContent', message: 'The download could not be prepared.' },
+      };
+    }
+
+    // A streaming response usually has no Content-Length, so an absent one is
+    // normal rather than evidence that the archive is small.
+    const declared = Number(response.headers.get('content-length'));
+    const totalBytes = Number.isFinite(declared) && declared > 0 ? declared : null;
+    if (totalBytes !== null && !hasDiskRoomForArchive(transport.files.availableBytes(), totalBytes)) {
+      await response.body?.cancel().catch(() => undefined);
+      return {
+        status: 'failed',
+        failure: { kind: 'request', message: PHOTO_ERROR_MESSAGES.lowStorage },
+      };
+    }
+
+    const body = response.body;
+    if (!body) {
+      return {
+        status: 'failed',
+        failure: { kind: 'invalidContent', message: 'The download could not be prepared.' },
+      };
+    }
+
+    const fileName = zipFileNameFrom(disposition);
+    // The file on disk gets an opaque name; the server's filename is only ever
+    // a label and a share-sheet hint.
+    const sink = await transport.files.createSink(createOpaqueFileName('.zip'));
+    stagedUri = sink.uri;
+
+    const reader = body.getReader();
+    let received = 0;
+    let nextDiskCheck = ARCHIVE_DISK_CHECK_INTERVAL_BYTES;
+    try {
+      for (;;) {
+        if (signal?.aborted || getPrivateMediaEpoch() !== epochAtStart) {
+          throw createSessionClosedError();
+        }
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (!value || value.byteLength === 0) {
+          continue;
+        }
+        await sink.write(value);
+        received += value.byteLength;
+        onProgress?.(received, totalBytes);
+
+        if (received >= nextDiskCheck) {
+          nextDiskCheck = received + ARCHIVE_DISK_CHECK_INTERVAL_BYTES;
+          if (!hasDiskRoomForArchive(transport.files.availableBytes(), 0)) {
+            throw new ProtectedAssetError('request', PHOTO_ERROR_MESSAGES.lowStorage);
+          }
+        }
+      }
+      await sink.close();
+    } catch (error) {
+      await reader.cancel().catch(() => undefined);
+      await sink.discard();
+      stagedUri = null;
+      throw error;
+    }
+
+    await native.share(sink.uri, { UTI: 'public.zip-archive', mimeType: 'application/zip' });
+    return { status: 'shared', fileName };
+  } catch (caught) {
+    const failure = toPhotoFailure(caught);
+    if (failure.kind === 'cancelled') {
+      return { status: 'cancelled' };
+    }
+    if (failure.kind === 'notFound' && failure.errorCode === 'PHOTO_NOT_FOUND') {
+      // All-or-nothing: the server refuses the whole archive when any id is
+      // gone, and deliberately does not say which. The caller reconciles and
+      // asks for a fresh selection rather than retrying blind against a 30/hour
+      // budget.
+      return { status: 'staleSelection' };
+    }
+    return {
+      status: 'failed',
+      failure:
+        failure.kind === 'throttled'
+          ? { ...failure, message: PHOTO_ERROR_MESSAGES.bulkThrottled }
+          : failure,
+    };
+  } finally {
+    // Deleted only after the share sheet has settled: on iOS the sheet reads the
+    // file while it is open.
+    if (stagedUri) {
+      await transport.files.discard(stagedUri);
+    }
+    releaseLease?.();
+  }
 }
