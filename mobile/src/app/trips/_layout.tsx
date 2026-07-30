@@ -153,6 +153,12 @@ export default function TripsLayout() {
         }}
       />
       <Stack.Screen
+        name="[tripId]/photos/index"
+        options={{
+          title: 'Photos',
+        }}
+      />
+      <Stack.Screen
         name="[tripId]/edit"
         options={{
           title: 'Edit Trip',

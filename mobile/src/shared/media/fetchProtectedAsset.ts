@@ -17,6 +17,7 @@ import { getAccessToken } from '@/shared/api/token-store';
 import {
   isPrivateMediaSessionOpen,
   createSessionClosedError,
+  linkAbortSignals,
   trackPrivateOperation,
 } from './privateMediaLifecycle';
 import {
@@ -106,41 +107,6 @@ function assertNoCallerAuthorization(headers: Record<string, string> | undefined
       throw new ProtectedAssetError('request', 'Invalid media request.');
     }
   }
-}
-
-/**
- * One controller fed by several signals. `AbortSignal.any` is not dependable
- * across the RN and Jest runtimes this code has to run in, and the linkage is
- * five lines.
- */
-export function linkAbortSignals(signals: (AbortSignal | undefined)[]): {
-  signal: AbortSignal;
-  dispose: () => void;
-} {
-  const controller = new AbortController();
-  const cleanups: (() => void)[] = [];
-
-  for (const source of signals) {
-    if (!source) {
-      continue;
-    }
-    if (source.aborted) {
-      controller.abort();
-      break;
-    }
-    const forward = (): void => controller.abort();
-    source.addEventListener('abort', forward);
-    cleanups.push(() => source.removeEventListener('abort', forward));
-  }
-
-  return {
-    signal: controller.signal,
-    dispose: () => {
-      for (const cleanup of cleanups) {
-        cleanup();
-      }
-    },
-  };
 }
 
 function isAbortError(error: unknown): boolean {

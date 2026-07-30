@@ -137,6 +137,60 @@ export function trackPrivateOperation<T>(run: (signal: AbortSignal) => Promise<T
 }
 
 /**
+ * One controller fed by several signals. `AbortSignal.any` is not dependable
+ * across the RN and Jest runtimes this code has to run in, and the linkage is a
+ * few lines.
+ */
+export function linkAbortSignals(signals: (AbortSignal | undefined)[]): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  const cleanups: (() => void)[] = [];
+
+  for (const source of signals) {
+    if (!source) {
+      continue;
+    }
+    if (source.aborted) {
+      controller.abort();
+      break;
+    }
+    const forward = (): void => controller.abort();
+    source.addEventListener('abort', forward);
+    cleanups.push(() => source.removeEventListener('abort', forward));
+  }
+
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const cleanup of cleanups) {
+        cleanup();
+      }
+    },
+  };
+}
+
+/**
+ * Tracked private-network activity for a caller that has its own abort signal —
+ * the shape every photo API function needs. The run receives a signal that fires
+ * when either the caller or the session boundary says stop.
+ */
+export function trackPrivateRequest<T>(
+  callerSignal: AbortSignal | undefined,
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return trackPrivateOperation(async (lifecycleSignal) => {
+    const linked = linkAbortSignals([callerSignal, lifecycleSignal]);
+    try {
+      return await run(linked.signal);
+    } finally {
+      linked.dispose();
+    }
+  });
+}
+
+/**
  * Waits for private-network activity that already exists. It never starts a
  * request or a refresh of its own — sign-out must not be able to extend the
  * lifetime of the credentials it is about to revoke.

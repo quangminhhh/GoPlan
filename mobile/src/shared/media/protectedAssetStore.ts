@@ -19,10 +19,11 @@ import {
   getPrivateMediaEpoch,
   isPrivateMediaSessionOpen,
   createSessionClosedError,
+  linkAbortSignals,
   registerPrivateMediaPurger,
   trackPrivateOperation,
 } from './privateMediaLifecycle';
-import { fetchProtectedResponse, linkAbortSignals } from './fetchProtectedAsset';
+import { fetchProtectedResponse } from './fetchProtectedAsset';
 import {
   ProtectedAssetError,
   type ProtectedAssetVariant,
