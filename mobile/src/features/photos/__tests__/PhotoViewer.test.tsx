@@ -27,9 +27,20 @@ import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-li
 // eslint-disable-next-line import/first
 import { Alert } from 'react-native';
 // eslint-disable-next-line import/first
+import { State } from 'react-native-gesture-handler';
+// eslint-disable-next-line import/first
+import {
+  fireGestureHandler,
+  getByGestureTestId,
+} from 'react-native-gesture-handler/jest-utils';
+// eslint-disable-next-line import/first
 import { AxiosError } from 'axios';
 // eslint-disable-next-line import/first
-import { formatCapturedAt, PhotoViewer } from '../components/PhotoViewer';
+import {
+  formatCapturedAt,
+  photoViewerPageKey,
+  PhotoViewer,
+} from '../components/PhotoViewer';
 // eslint-disable-next-line import/first
 import { usePhotoViewer, VIEWER_PREFETCH_THRESHOLD } from '../hooks/usePhotoViewer';
 // eslint-disable-next-line import/first
@@ -111,6 +122,11 @@ beforeEach(() => {
 });
 
 describe('PhotoViewer rendering', () => {
+  it('changes page identity when a neighbour becomes active so stale zoom state is reset', () => {
+    expect(photoViewerPageKey('p2', 'p1')).toBe('p2:neighbour');
+    expect(photoViewerPageKey('p2', 'p2')).toBe('p2:active');
+  });
+
   it('opens on the tapped photo and mounts only its immediate neighbours', async () => {
     const photos = [photo('p1'), photo('p2'), photo('p3'), photo('p4'), photo('p5')];
     await renderViewer({ photos, currentIndex: 2 });
@@ -121,6 +137,21 @@ describe('PhotoViewer rendering', () => {
     // A five-photo gallery must not hold five medium variants in memory.
     expect(screen.queryByTestId('zoomable-photo-p1')).toBeNull();
     expect(screen.queryByTestId('zoomable-photo-p5')).toBeNull();
+  });
+
+  it('dismisses after a downward pager pan crosses the threshold', async () => {
+    const onClose = jest.fn();
+    await renderViewer({ onClose });
+
+    await act(async () => {
+      fireGestureHandler(getByGestureTestId('photo-viewer-dismiss-gesture'), [
+        { state: State.BEGAN, translationY: 0 },
+        { state: State.ACTIVE, translationY: 160 },
+        { state: State.END, translationY: 160 },
+      ]);
+    });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it('uses the medium variant, never the thumbnail', async () => {

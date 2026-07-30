@@ -50,6 +50,10 @@ const EXTENSION_BY_CONTENT_TYPE: Record<string, string> = {
   'image/png': '.png',
 };
 
+function transferWasInvalidated(epochAtStart: number, signal?: AbortSignal): boolean {
+  return signal?.aborted === true || getPrivateMediaEpoch() !== epochAtStart;
+}
+
 /**
  * Derives a file extension from what the server said, never from a path.
  *
@@ -135,6 +139,16 @@ export async function saveTripPhotoToLibrary(
 
     const contentType = response.headers.get('content-type');
     const disposition = response.headers.get('content-disposition');
+    const normalizedType = contentType?.split(';')[0]?.trim().toLowerCase() ?? '';
+    if (!normalizedType.startsWith('image/')) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new ProtectedAssetError('invalidContent', 'This photo could not be downloaded.');
+    }
+    const declared = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > MEDIUM_MAX_BYTES) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new ProtectedAssetError('invalidContent', 'This photo could not be downloaded.');
+    }
     const body = response.body;
     if (!body) {
       throw new ProtectedAssetError('invalidContent', 'This photo could not be downloaded.');
@@ -149,7 +163,7 @@ export async function saveTripPhotoToLibrary(
     let received = 0;
     try {
       for (;;) {
-        if (signal?.aborted || getPrivateMediaEpoch() !== epochAtStart) {
+        if (transferWasInvalidated(epochAtStart, signal)) {
           throw createSessionClosedError();
         }
         const { done, value } = await reader.read();
@@ -167,6 +181,12 @@ export async function saveTripPhotoToLibrary(
         onProgress?.(received);
       }
       await sink.close();
+      // The final read can resolve at the same moment sign-out invalidates the
+      // session. Re-check after the last await so an old user's bytes are never
+      // handed to Photos after the session boundary.
+      if (transferWasInvalidated(epochAtStart, signal)) {
+        throw createSessionClosedError();
+      }
     } catch (error) {
       await reader.cancel().catch(() => undefined);
       await sink.discard();
@@ -390,7 +410,7 @@ export async function downloadAndShareTripPhotoArchive(
     let nextDiskCheck = ARCHIVE_DISK_CHECK_INTERVAL_BYTES;
     try {
       for (;;) {
-        if (signal?.aborted || getPrivateMediaEpoch() !== epochAtStart) {
+        if (transferWasInvalidated(epochAtStart, signal)) {
           throw createSessionClosedError();
         }
         const { done, value } = await reader.read();
@@ -412,6 +432,11 @@ export async function downloadAndShareTripPhotoArchive(
         }
       }
       await sink.close();
+      // Same commit barrier as the single-photo path: a sign-out that lands
+      // after the stream's final chunk must stop the share sheet from opening.
+      if (transferWasInvalidated(epochAtStart, signal)) {
+        throw createSessionClosedError();
+      }
     } catch (error) {
       await reader.cancel().catch(() => undefined);
       await sink.discard();

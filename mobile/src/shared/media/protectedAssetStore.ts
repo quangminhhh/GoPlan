@@ -286,7 +286,10 @@ export async function acquireProtectedAsset(
 ): Promise<AcquiredProtectedAsset> {
   const { assetKey, path, variant, signal, transport = nativeProtectedTransport } = options;
 
-  if (signal?.aborted) {
+  // Check before the cache lookup. A shutdown closes the gate synchronously but
+  // purges files asynchronously; without this guard, a cache hit in that small
+  // window could hand private bytes to a signed-out/backgrounded caller.
+  if (signal?.aborted || !isPrivateMediaSessionOpen()) {
     throw createSessionClosedError();
   }
 

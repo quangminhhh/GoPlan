@@ -20,7 +20,8 @@ import {
   View,
   useWindowDimensions,
 } from 'react-native';
-import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
+import { runOnJS } from 'react-native-reanimated';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { AuthenticatedImage } from '@/shared/media/AuthenticatedImage';
@@ -35,6 +36,11 @@ import { ZoomablePhoto } from './ZoomablePhoto';
 
 /** Only the current photo and its two neighbours are ever mounted. */
 const NEIGHBOUR_WINDOW = 1;
+export const DISMISS_TRANSLATION = 120;
+
+export function photoViewerPageKey(photoId: string, currentPhotoId: string): string {
+  return `${photoId}:${photoId === currentPhotoId ? 'active' : 'neighbour'}`;
+}
 
 interface PhotoViewerProps {
   tripId: string;
@@ -83,6 +89,23 @@ export function PhotoViewer({
   const { width, height } = useWindowDimensions();
   const [zoomed, setZoomed] = useState(false);
   const scrollRef = useRef<ScrollView>(null);
+  // Putting the native ScrollView recognizer into RNGH's relation graph lets
+  // child gestures run simultaneously with it: vertical dismiss is no longer
+  // swallowed, while ordinary horizontal movement still pages at rest.
+  const pagerGesture = useMemo(() => Gesture.Native(), []);
+  const dismissGesture = Gesture.Pan()
+    .withTestId('photo-viewer-dismiss-gesture')
+    .enabled(!zoomed)
+    .activeOffsetY([-10, 10])
+    .failOffsetX([-24, 24])
+    .simultaneousWithExternalGesture(pagerGesture)
+    .onEnd((event) => {
+      'worklet';
+      if (event.translationY > DISMISS_TRANSLATION) {
+        runOnJS(onClose)();
+      }
+    });
+  const pagerGestures = Gesture.Simultaneous(pagerGesture, dismissGesture);
 
   const visible = useMemo(
     () =>
@@ -122,51 +145,60 @@ export function PhotoViewer({
     <Modal visible transparent={false} animationType="fade" onRequestClose={onClose}>
       <GestureHandlerRootView style={styles.root}>
         <SafeAreaView style={styles.root} testID="photo-viewer">
-          <ScrollView
-            ref={scrollRef}
-            testID="photo-viewer-pager"
-            horizontal
-            pagingEnabled
-            // A zoomed photo owns its own horizontal drags; letting the pager
-            // keep them would make panning switch photos instead.
-            scrollEnabled={!zoomed}
-            showsHorizontalScrollIndicator={false}
-            onMomentumScrollEnd={(event) => {
-              const page = Math.round(event.nativeEvent.contentOffset.x / width);
-              const next = visible[page];
-              if (next && next.id !== currentPhoto.id) {
-                onGoTo(next.id);
-              }
-            }}
-          >
-            {/* A plain ScrollView rather than a virtualised list: the window is
-                already capped at three items, and FlatList would leave the
-                previous neighbour unrendered until it is scrolled into view. */}
-            {visible.map((item) => (
-              <View key={item.id} style={{ width, height }}>
-                <ZoomablePhoto
-                  photoId={item.id}
-                  width={width}
-                  height={height}
-                  onDismiss={onClose}
-                  onZoomChange={setZoomed}
+          <GestureDetector gesture={pagerGestures}>
+            <ScrollView
+              ref={scrollRef}
+              testID="photo-viewer-pager"
+              horizontal
+              pagingEnabled
+              // A zoomed photo owns its own horizontal drags; letting the pager
+              // keep them would make panning switch photos instead.
+              scrollEnabled={!zoomed}
+              showsHorizontalScrollIndicator={false}
+              onMomentumScrollEnd={(event) => {
+                const page = Math.round(event.nativeEvent.contentOffset.x / width);
+                const next = visible[page];
+                if (next && next.id !== currentPhoto.id) {
+                  onGoTo(next.id);
+                }
+              }}
+            >
+              {/* A plain ScrollView rather than a virtualised list: the window is
+                  already capped at three items, and FlatList would leave the
+                  previous neighbour unrendered until it is scrolled into view. */}
+              {visible.map((item) => (
+                <View
+                  // Neighbours are pre-mounted. Remount both pages when the active
+                  // id changes so zoom/pan state owned by the old active page
+                  // cannot leave the new page's pager disabled.
+                  key={photoViewerPageKey(item.id, currentPhoto.id)}
+                  style={{ width, height }}
                 >
-                  <AuthenticatedImage
-                    assetKey={tripPhotoAssetKey(tripId, item.id, 'medium')}
-                    path={tripPhotoAssetPath(tripId, item.id, 'medium')}
-                    variant={TRIP_PHOTO_VARIANTS.medium}
+                  <ZoomablePhoto
+                    photoId={item.id}
                     width={width}
                     height={height}
-                    contentFit="contain"
-                    accessibilityLabel={`Photo uploaded by ${item.uploaded_by.display_name}`}
-                    sourceWidth={item.medium_width}
-                    sourceHeight={item.medium_height}
-                    onNotFound={handleNotFound(item.id)}
-                  />
-                </ZoomablePhoto>
-              </View>
-            ))}
-          </ScrollView>
+                    zoomed={zoomed && item.id === currentPhoto.id}
+                    pagerGesture={pagerGesture}
+                    onZoomChange={setZoomed}
+                  >
+                    <AuthenticatedImage
+                      assetKey={tripPhotoAssetKey(tripId, item.id, 'medium')}
+                      path={tripPhotoAssetPath(tripId, item.id, 'medium')}
+                      variant={TRIP_PHOTO_VARIANTS.medium}
+                      width={width}
+                      height={height}
+                      contentFit="contain"
+                      accessibilityLabel={`Photo uploaded by ${item.uploaded_by.display_name}`}
+                      sourceWidth={item.medium_width}
+                      sourceHeight={item.medium_height}
+                      onNotFound={handleNotFound(item.id)}
+                    />
+                  </ZoomablePhoto>
+                </View>
+              ))}
+            </ScrollView>
+          </GestureDetector>
 
           <View style={styles.topBar} pointerEvents="box-none">
             <Pressable

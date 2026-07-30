@@ -223,6 +223,55 @@ describe('bulk download', () => {
       await pending;
     });
   });
+
+  it('aborts an in-flight archive when selection mode is exited', async () => {
+    const finish = createDeferred<{ status: 'cancelled' }>();
+    mockDownloadAndShare.mockImplementation(() => finish.promise);
+    const { result } = await renderHook(() => usePhotoSelection(options()));
+    await act(async () => {
+      result.current.enterSelection('p1');
+    });
+
+    let pending!: Promise<void>;
+    await act(async () => {
+      pending = result.current.startDownload();
+    });
+    const signal = mockDownloadAndShare.mock.calls[0][0].signal as AbortSignal;
+
+    await act(async () => {
+      result.current.exit();
+    });
+
+    expect(signal.aborted).toBe(true);
+    expect(result.current.selectionMode).toBe(false);
+
+    await act(async () => {
+      finish.resolve({ status: 'cancelled' });
+      await pending;
+    });
+  });
+
+  it('aborts an in-flight archive when the screen unmounts', async () => {
+    const finish = createDeferred<{ status: 'cancelled' }>();
+    mockDownloadAndShare.mockImplementation(() => finish.promise);
+    const view = await renderHook(() => usePhotoSelection(options()));
+    await act(async () => {
+      view.result.current.enterSelection('p1');
+    });
+    let pending!: Promise<void>;
+    await act(async () => {
+      pending = view.result.current.startDownload();
+    });
+    const signal = mockDownloadAndShare.mock.calls[0][0].signal as AbortSignal;
+
+    await act(async () => {
+      view.unmount();
+    });
+
+    expect(signal.aborted).toBe(true);
+    finish.resolve({ status: 'cancelled' });
+    await pending;
+  });
 });
 
 describe('all-or-nothing bulk 404 (D17)', () => {

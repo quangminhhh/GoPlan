@@ -1,6 +1,7 @@
 import { setAccessToken } from '@/shared/api/token-store';
 import {
   __resetPrivateMediaLifecycleForTests,
+  beginPrivateMediaShutdown,
   startPrivateMediaSession,
 } from '@/shared/media/privateMediaLifecycle';
 import {
@@ -209,6 +210,49 @@ describe('saveTripPhotoToLibrary', () => {
     expect(outcome).toMatchObject({ status: 'failed', failure: { kind: 'invalidContent' } });
     expect(transport.files.contents().size).toBe(0);
   });
+
+  it('rejects a non-image success response before creating a Photos asset', async () => {
+    const native = nativeActions();
+    const transport = createFakeTransport(() => downloadResponse('text/html'));
+
+    const outcome = await saveTripPhotoToLibrary({
+      tripId: 'trip-1',
+      photoId: 'photo-1',
+      transport,
+      native,
+    });
+
+    expect(outcome).toMatchObject({ status: 'failed', failure: { kind: 'invalidContent' } });
+    expect(native.createAsset).not.toHaveBeenCalled();
+    expect(transport.files.contents().size).toBe(0);
+  });
+
+  it('does not hand a completed file to Photos after the session is invalidated', async () => {
+    const native = nativeActions();
+    const transport = createFakeTransport(() => downloadResponse());
+    const createSink = transport.files.createSink.bind(transport.files);
+    transport.files.createSink = async (fileName: string) => {
+      const sink = await createSink(fileName);
+      return {
+        ...sink,
+        close: async () => {
+          await sink.close();
+          beginPrivateMediaShutdown();
+        },
+      };
+    };
+
+    const outcome = await saveTripPhotoToLibrary({
+      tripId: 'trip-1',
+      photoId: 'photo-1',
+      transport,
+      native,
+    });
+
+    expect(outcome).toMatchObject({ status: 'failed', failure: { kind: 'cancelled' } });
+    expect(native.createAsset).not.toHaveBeenCalled();
+    expect(transport.files.contents().size).toBe(0);
+  });
 });
 
 describe('zip response validation', () => {
@@ -332,6 +376,33 @@ describe('downloadAndShareTripPhotoArchive', () => {
     });
 
     expect(shareOrder).toEqual(['exists-during-share']);
+    expect(transport.files.contents().size).toBe(0);
+  });
+
+  it('does not open the share sheet after the session is invalidated at stream commit', async () => {
+    const native = nativeActions();
+    const transport = createFakeTransport(() => zipResponse().response);
+    const createSink = transport.files.createSink.bind(transport.files);
+    transport.files.createSink = async (fileName: string) => {
+      const sink = await createSink(fileName);
+      return {
+        ...sink,
+        close: async () => {
+          await sink.close();
+          beginPrivateMediaShutdown();
+        },
+      };
+    };
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native,
+    });
+
+    expect(outcome).toEqual({ status: 'cancelled' });
+    expect(native.share).not.toHaveBeenCalled();
     expect(transport.files.contents().size).toBe(0);
   });
 

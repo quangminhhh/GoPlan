@@ -175,6 +175,21 @@ describe('transfer leases', () => {
     expect(purgeLog).toEqual(['protected-assets', 'upload-temp']);
   });
 
+  it('cancels a deferred purge when the app foregrounds before the lease releases', async () => {
+    await startPrivateMediaSession();
+    purgeLog.length = 0;
+    const release = acquirePrivateTransferLease();
+
+    suspendPrivateMediaSession();
+    await resumePrivateMediaSession();
+    release();
+    await flushPrivateMediaPurge();
+
+    expect(isPrivateMediaSessionOpen()).toBe(true);
+    expect(getPrivateMediaEpoch()).toBe(0);
+    expect(purgeLog).toEqual([]);
+  });
+
   it('purges immediately on background when nothing holds a lease', async () => {
     await startPrivateMediaSession();
     purgeLog.length = 0;

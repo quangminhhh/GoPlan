@@ -9,21 +9,22 @@
 
 import { useEffect } from 'react';
 import { StyleSheet, useWindowDimensions, View } from 'react-native';
-import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import { Gesture, GestureDetector, type GestureType } from 'react-native-gesture-handler';
 import Animated, { runOnJS, useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
 
 export const MIN_ZOOM = 1;
 export const MAX_ZOOM = 4;
 export const DOUBLE_TAP_ZOOM = 2;
-/** How far a downward drag has to travel before it counts as a dismiss. */
-export const DISMISS_TRANSLATION = 120;
 
 interface ZoomablePhotoProps {
   /** Resetting shared values keys off this, not off array position. */
   photoId: string;
   width: number;
   height: number;
-  onDismiss: () => void;
+  /** React-side zoom state used to enable the correct one-finger pan. */
+  zoomed: boolean;
+  /** Native recognizer coordinated with the child gestures. */
+  pagerGesture: GestureType;
   /** Reported so the pager can stop competing for horizontal drags. */
   onZoomChange?: (zoomed: boolean) => void;
   children: React.ReactNode;
@@ -33,7 +34,8 @@ export function ZoomablePhoto({
   photoId,
   width,
   height,
-  onDismiss,
+  zoomed,
+  pagerGesture,
   onZoomChange,
   children,
 }: ZoomablePhotoProps) {
@@ -71,6 +73,7 @@ export function ZoomablePhoto({
   };
 
   const pinch = Gesture.Pinch()
+    .simultaneousWithExternalGesture(pagerGesture)
     .onUpdate((event) => {
       'worklet';
       scale.value = clamp(savedScale.value * event.scale, MIN_ZOOM, MAX_ZOOM);
@@ -87,40 +90,27 @@ export function ZoomablePhoto({
       runOnJS(reportZoom)(scale.value > MIN_ZOOM);
     });
 
-  const pan = Gesture.Pan()
+  const zoomPan = Gesture.Pan()
+    .enabled(zoomed)
+    .simultaneousWithExternalGesture(pagerGesture)
     .onUpdate((event) => {
       'worklet';
-      if (scale.value > MIN_ZOOM) {
-        // Clamped to the scaled image's own bounds, so a zoomed photo cannot be
-        // dragged off screen.
-        const maxX = Math.max(0, (width * scale.value - viewportWidth) / 2);
-        const maxY = Math.max(0, (height * scale.value - viewportHeight) / 2);
-        translateX.value = clamp(savedTranslateX.value + event.translationX, -maxX, maxX);
-        translateY.value = clamp(savedTranslateY.value + event.translationY, -maxY, maxY);
-        return;
-      }
-      // At rest, only a mostly-vertical drag is ours; anything else belongs to
-      // the pager.
-      if (Math.abs(event.translationY) > Math.abs(event.translationX)) {
-        translateY.value = event.translationY;
-      }
+      // Clamped to the scaled image's own bounds, so a zoomed photo cannot be
+      // dragged off screen.
+      const maxX = Math.max(0, (width * scale.value - viewportWidth) / 2);
+      const maxY = Math.max(0, (height * scale.value - viewportHeight) / 2);
+      translateX.value = clamp(savedTranslateX.value + event.translationX, -maxX, maxX);
+      translateY.value = clamp(savedTranslateY.value + event.translationY, -maxY, maxY);
     })
     .onEnd(() => {
       'worklet';
-      if (scale.value > MIN_ZOOM) {
-        savedTranslateX.value = translateX.value;
-        savedTranslateY.value = translateY.value;
-        return;
-      }
-      if (translateY.value > DISMISS_TRANSLATION) {
-        runOnJS(onDismiss)();
-        return;
-      }
-      translateY.value = withTiming(0);
+      savedTranslateX.value = translateX.value;
+      savedTranslateY.value = translateY.value;
     });
 
   const doubleTap = Gesture.Tap()
     .numberOfTaps(2)
+    .simultaneousWithExternalGesture(pagerGesture)
     .onEnd(() => {
       'worklet';
       const zoomedIn = scale.value > MIN_ZOOM;
@@ -138,7 +128,10 @@ export function ZoomablePhoto({
       runOnJS(reportZoom)(false);
     });
 
-  const composed = Gesture.Simultaneous(pinch, Gesture.Exclusive(doubleTap, pan));
+  const composed = Gesture.Simultaneous(
+    pinch,
+    Gesture.Exclusive(doubleTap, zoomPan),
+  );
 
   const animatedStyle = useAnimatedStyle(() => ({
     transform: [

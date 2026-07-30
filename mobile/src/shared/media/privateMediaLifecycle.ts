@@ -351,6 +351,14 @@ export async function resumePrivateMediaSession(): Promise<void> {
   if (!sessionActive || acquisitionOpen) {
     return;
   }
+  // The app can return to the foreground while a transfer that deferred the
+  // background purge is still alive (for example, while an iOS share sheet is
+  // open). In that case no invalidation front half ever ran: the epoch is still
+  // current and the files still belong to this session. Cancel the deferred
+  // purge before reopening, otherwise releasing the lease later would
+  // unexpectedly close a foreground session with no subsequent AppState event
+  // available to reopen it.
+  purgeDeferred = false;
   acquisitionOpen = true;
   publishGeneration();
 }

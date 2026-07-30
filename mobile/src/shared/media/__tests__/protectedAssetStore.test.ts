@@ -453,4 +453,28 @@ describe('session boundaries', () => {
     ).rejects.toMatchObject({ kind: 'cancelled' });
     expect(transport.fetches.calls).toHaveLength(0);
   });
+
+  it('refuses a cache hit in the synchronous window before shutdown purge runs', async () => {
+    const transport = createFakeTransport(() => imageResponse([bytes(16)]).response);
+    const asset = await acquireProtectedAsset({
+      assetKey: thumbnailKey('photo-1'),
+      path: thumbnailPath('photo-1'),
+      variant: THUMBNAIL,
+      transport,
+    });
+    asset.release();
+
+    beginPrivateMediaShutdown();
+
+    await expect(
+      acquireProtectedAsset({
+        assetKey: thumbnailKey('photo-1'),
+        path: thumbnailPath('photo-1'),
+        variant: THUMBNAIL,
+        transport,
+      }),
+    ).rejects.toMatchObject({ kind: 'cancelled' });
+    expect(transport.fetches.calls).toHaveLength(1);
+    await flushPrivateMediaPurge();
+  });
 });

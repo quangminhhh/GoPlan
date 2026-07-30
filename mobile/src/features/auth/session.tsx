@@ -145,9 +145,15 @@ export function SessionProvider({ children }: PropsWithChildren) {
     try {
       await rotateTokens(auth.tokens);
     } catch {
+      // The password-change endpoint already revoked the previous pair. A
+      // SecureStore failure therefore ends the session just as definitively as
+      // an explicit sign-out, including the private-media gate and purge.
+      beginPrivateMediaShutdown();
+      await waitForPrivateNetworkIdle();
       await clearTokens();
       setUser(null);
       setStatus('signedOut');
+      await flushPrivateMediaPurge();
       return 'signedOut';
     }
     setUser(auth.user);

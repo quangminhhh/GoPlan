@@ -8,7 +8,7 @@
  * without saying which id was stale (D17).
  */
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { PHOTO_BULK_DOWNLOAD_MAX_SELECTION } from '../constants';
 import { downloadAndShareTripPhotoArchive, type NativePhotoActions } from '../downloads';
 import { PHOTO_ERROR_MESSAGES, type PhotoFailure } from '../errors';
@@ -61,7 +61,17 @@ export function usePhotoSelection({
   const controllerRef = useRef<AbortController | null>(null);
   const downloadingRef = useRef(false);
 
+  useEffect(
+    () => () => {
+      // Navigating away must not leave an invisible download running until it
+      // unexpectedly opens a share sheet on another screen.
+      controllerRef.current?.abort();
+    },
+    [],
+  );
+
   const exit = useCallback(() => {
+    controllerRef.current?.abort();
     setSelectionMode(false);
     setSelected(new Set());
     setDownload({ status: 'idle' });

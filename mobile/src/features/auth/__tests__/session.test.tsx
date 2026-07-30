@@ -29,6 +29,8 @@ import { refreshTokens, rotateTokens } from '@/shared/api/refresh';
 // eslint-disable-next-line import/first
 import { getAccessToken, getRefreshToken, setRefreshToken } from '@/shared/api/token-store';
 // eslint-disable-next-line import/first
+import { isPrivateMediaSessionOpen } from '@/shared/media/privateMediaLifecycle';
+// eslint-disable-next-line import/first
 import { fetchMe, logoutRequest } from '../api';
 // eslint-disable-next-line import/first
 import { SessionProvider, useSession } from '../session';
@@ -154,5 +156,6 @@ describe('SessionProvider', () => {
     expect(result.current.status).toBe('signedOut');
     expect(result.current.user).toBeNull();
     await expect(getRefreshToken()).resolves.toBeNull();
+    expect(isPrivateMediaSessionOpen()).toBe(false);
   });
 });
