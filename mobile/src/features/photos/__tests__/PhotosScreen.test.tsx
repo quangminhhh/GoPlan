@@ -1,7 +1,13 @@
 const mockUseTripPhotos = jest.fn();
+const mockUsePhotoUpload = jest.fn();
 
 jest.mock('expo-router', () => ({
   useLocalSearchParams: () => ({ tripId: 'trip-1' }),
+  Stack: { Screen: () => null },
+}));
+
+jest.mock('../hooks/usePhotoUpload', () => ({
+  usePhotoUpload: (...args: unknown[]) => mockUsePhotoUpload(...args),
 }));
 
 jest.mock('../hooks/useTripPhotos', () => ({
@@ -66,8 +72,22 @@ function hookState(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function uploadState(overrides: Record<string, unknown> = {}) {
+  return {
+    snapshot: null,
+    isOpen: false,
+    picking: false,
+    pick: jest.fn(async () => undefined),
+    start: jest.fn(),
+    stop: jest.fn(),
+    close: jest.fn(async () => undefined),
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
+  mockUsePhotoUpload.mockReturnValue(uploadState());
 });
 
 it('passes the route trip id to the hook', async () => {
@@ -148,4 +168,67 @@ it('routes a page failure to the footer instead of the banner', async () => {
 
   expect(screen.getByTestId('photo-grid-page-error')).toBeTruthy();
   expect(screen.queryByTestId('photos-inline-error')).toBeNull();
+});
+
+it('offers an upload affordance from the empty state', async () => {
+  const pick = jest.fn(async () => undefined);
+  mockUseTripPhotos.mockReturnValue(hookState());
+  mockUsePhotoUpload.mockReturnValue(uploadState({ pick }));
+  await render(<PhotosScreen />);
+
+  await fireEvent.press(screen.getByText('Upload photos'));
+
+  expect(pick).toHaveBeenCalledTimes(1);
+});
+
+it('shows the upload sheet once a selection exists', async () => {
+  mockUseTripPhotos.mockReturnValue(hookState({ photos: [photo('p1')] }));
+  mockUsePhotoUpload.mockReturnValue(
+    uploadState({
+      isOpen: true,
+      snapshot: {
+        phase: 'selected',
+        items: [],
+        selectedCount: 12,
+        processedCount: 0,
+        uploadedCount: 0,
+        rejectedCount: 0,
+        pendingCount: 12,
+        unknownCount: 0,
+        failedCount: 0,
+        batchesUploaded: 0,
+        currentBatchSize: 0,
+        batchBytesSent: 0,
+        batchBytesTotal: null,
+        error: null,
+      },
+    }),
+  );
+
+  await render(<PhotosScreen />);
+
+  expect(screen.getByTestId('photo-upload-sheet')).toBeTruthy();
+  expect(screen.getByText('12 selected')).toBeTruthy();
+  // Nothing is uploaded until the user says so.
+  expect(screen.getByLabelText('Start upload')).toBeTruthy();
+});
+
+it('feeds uploaded photos into the grid and reconciles on an uncertain outcome', async () => {
+  const prependUploaded = jest.fn();
+  const reconcile = jest.fn(async () => undefined);
+  mockUseTripPhotos.mockReturnValue(hookState({ photos: [photo('p1')], prependUploaded, reconcile }));
+  await render(<PhotosScreen />);
+
+  const options = mockUsePhotoUpload.mock.calls[0][0] as {
+    tripId: string;
+    onUploaded: (photos: unknown[]) => void;
+    onReconcile: () => void;
+  };
+  expect(options.tripId).toBe('trip-1');
+
+  options.onUploaded([photo('new')]);
+  expect(prependUploaded).toHaveBeenCalledWith([photo('new')]);
+
+  options.onReconcile();
+  expect(reconcile).toHaveBeenCalledTimes(1);
 });

@@ -1,0 +1,540 @@
+import { AxiosError } from 'axios';
+import type { PickedImage, PreprocessedImage } from '@/shared/media/types';
+import { ImagePreprocessError } from '@/shared/media/types';
+import { createUploadSession, type UploadSessionDeps, type UploadSnapshot } from '../uploadSession';
+import { PHOTO_UPLOAD_BATCH_LIMITS } from '../constants';
+import type { TripPhoto } from '../types';
+import type { PreparedUpload } from '../uploadTypes';
+
+const MIB = 1024 * 1024;
+
+function pickedImage(index: number, width = 2560, height = 1920): PickedImage {
+  return { uri: `file:///src/${index}.heic`, width, height, fileName: `IMG_${index}.HEIC` };
+}
+
+function encoded(image: PickedImage, bytes: number): PreprocessedImage {
+  return {
+    uri: `file:///encoded/${image.uri.split('/').pop()}.jpg`,
+    name: 'photo.jpg',
+    type: 'image/jpeg',
+    bytes,
+    width: image.width,
+    height: image.height,
+  };
+}
+
+function serverPhoto(id: string): TripPhoto {
+  return {
+    id,
+    created_at: '2026-07-31T10:00:00Z',
+    uploaded_by: { id: 'u1', display_name: 'Mai', identify_tag: 'mai', avatar_url: null },
+    width: 2560,
+    height: 1920,
+    thumbnail_width: 480,
+    thumbnail_height: 360,
+    medium_width: 2560,
+    medium_height: 1920,
+    can_delete: true,
+  };
+}
+
+function axiosFailure(status: number, body: unknown): AxiosError {
+  const config = { headers: {} } as never;
+  return new AxiosError('failed', 'ERR_BAD_REQUEST', config, {}, {
+    status,
+    statusText: '',
+    headers: {},
+    config,
+    data: body,
+  });
+}
+
+function networkFailure(): AxiosError {
+  const config = { headers: {} } as never;
+  return new AxiosError('Network Error', 'ERR_NETWORK', config, {});
+}
+
+interface Harness {
+  deps: UploadSessionDeps;
+  snapshots: UploadSnapshot[];
+  last(): UploadSnapshot;
+  uploads: PreparedUpload[][];
+  tempFiles: Set<string>;
+  encoderOutputs: Set<string>;
+  /** Highest number of temp files that existed at any single moment. */
+  peakTempFiles: number;
+  uploaded: TripPhoto[];
+  reconciles: number;
+  tripNotFound: number;
+  leases: number;
+  peakLeases: number;
+}
+
+function createHarness(
+  overrides: Partial<UploadSessionDeps> & {
+    upload?: (files: PreparedUpload[], attempt: number) => Promise<TripPhoto[]>;
+    encodedBytes?: number;
+    availableBytes?: () => number | null;
+  } = {},
+): Harness {
+  const harness: Partial<Harness> & { snapshots: UploadSnapshot[] } = {
+    snapshots: [],
+    uploads: [],
+    tempFiles: new Set<string>(),
+    encoderOutputs: new Set<string>(),
+    peakTempFiles: 0,
+    uploaded: [],
+    reconciles: 0,
+    tripNotFound: 0,
+    leases: 0,
+    peakLeases: 0,
+  };
+  let attempt = 0;
+  let tempCounter = 0;
+
+  const deps: UploadSessionDeps = {
+    async preprocess(image) {
+      const output = encoded(image, overrides.encodedBytes ?? 1 * MIB);
+      harness.encoderOutputs!.add(output.uri);
+      return output;
+    },
+    async adopt({ uri, bytes }) {
+      harness.encoderOutputs!.delete(uri);
+      tempCounter += 1;
+      const adopted = `file:///temp/${tempCounter}.jpg`;
+      harness.tempFiles!.add(adopted);
+      harness.peakTempFiles = Math.max(harness.peakTempFiles!, harness.tempFiles!.size);
+      return { uri: adopted, bytes };
+    },
+    async discardTemp(uri) {
+      harness.tempFiles!.delete(uri);
+    },
+    async discardEncoderOutput(uri) {
+      harness.encoderOutputs!.delete(uri);
+    },
+    async uploadBatch(files, onProgress) {
+      attempt += 1;
+      harness.uploads!.push(files);
+      onProgress(files.reduce((sum, file) => sum + file.bytes, 0), null);
+      if (overrides.upload) {
+        return overrides.upload(files, attempt);
+      }
+      return files.map((file) => serverPhoto(`server-${file.id}`));
+    },
+    availableBytes: overrides.availableBytes ?? (() => 100 * 1024 * MIB),
+    acquireLease() {
+      harness.leases! += 1;
+      harness.peakLeases = Math.max(harness.peakLeases!, harness.leases!);
+      return () => {
+        harness.leases! -= 1;
+      };
+    },
+    onSnapshot(snapshot) {
+      harness.snapshots.push(snapshot);
+    },
+    onUploaded(photos) {
+      harness.uploaded!.push(...photos);
+    },
+    onReconcile() {
+      harness.reconciles! += 1;
+    },
+    onTripNotFound() {
+      harness.tripNotFound! += 1;
+    },
+    ...(overrides.limits ? { limits: overrides.limits } : {}),
+    ...(overrides.diskReserveBytes !== undefined
+      ? { diskReserveBytes: overrides.diskReserveBytes }
+      : {}),
+  };
+
+  harness.deps = deps;
+  harness.last = () => harness.snapshots[harness.snapshots.length - 1];
+  return harness as Harness;
+}
+
+function selection(count: number, width = 2560, height = 1920) {
+  return {
+    images: Array.from({ length: count }, (_unused, index) => pickedImage(index, width, height)),
+    unreadable: [],
+  };
+}
+
+describe('bounded pipeline', () => {
+  it('uploads every batch and reports completion', async () => {
+    const harness = createHarness();
+    const session = createUploadSession(selection(5), harness.deps);
+
+    await session.start();
+
+    expect(harness.uploads).toHaveLength(1);
+    expect(harness.uploads[0]).toHaveLength(5);
+    expect(harness.last().phase).toBe('complete');
+    expect(harness.last().uploadedCount).toBe(5);
+    expect(harness.uploaded).toHaveLength(5);
+  });
+
+  it('never holds more than the current batch plus one candidate on disk', async () => {
+    // Sixty 4:3 photos: the pixel ceiling forces batches of 17, so a naive
+    // implementation would spool all sixty encodes before the first request.
+    const harness = createHarness();
+    const session = createUploadSession(selection(60), harness.deps);
+
+    await session.start();
+
+    const perBatch = Math.floor(PHOTO_UPLOAD_BATCH_LIMITS.maxPixels / (2560 * 1920));
+    expect(harness.peakTempFiles).toBeLessThanOrEqual(perBatch + 1);
+    expect(harness.peakTempFiles).toBeLessThan(60);
+    expect(harness.last().uploadedCount).toBe(60);
+  });
+
+  it('splits on the pixel ceiling, so no request carries twenty 4:3 photos', async () => {
+    const harness = createHarness();
+    const session = createUploadSession(selection(60), harness.deps);
+
+    await session.start();
+
+    for (const batch of harness.uploads) {
+      expect(batch.length).toBeLessThanOrEqual(17);
+      expect(batch.reduce((sum, file) => sum + file.width * file.height, 0)).toBeLessThanOrEqual(
+        PHOTO_UPLOAD_BATCH_LIMITS.maxPixels,
+      );
+    }
+  });
+
+  it('preprocesses one file at a time and never encodes while a request is in flight', async () => {
+    const events: string[] = [];
+    const harness = createHarness({
+      async upload(files) {
+        events.push(`upload:${files.length}`);
+        await Promise.resolve();
+        return files.map((file) => serverPhoto(file.id));
+      },
+    });
+    const original = harness.deps.preprocess;
+    harness.deps.preprocess = async (image, target) => {
+      events.push('encode');
+      return original(image, target);
+    };
+
+    const session = createUploadSession(selection(3), harness.deps);
+    await session.start();
+
+    expect(events).toEqual(['encode', 'encode', 'encode', 'upload:3']);
+  });
+
+  it('cleans up a batch temp files as soon as it lands', async () => {
+    const harness = createHarness();
+    const session = createUploadSession(selection(3), harness.deps);
+
+    await session.start();
+
+    expect(harness.tempFiles.size).toBe(0);
+    expect(harness.encoderOutputs.size).toBe(0);
+  });
+
+  it('holds a transfer lease for the whole run so a background purge waits', async () => {
+    const harness = createHarness();
+    const session = createUploadSession(selection(3), harness.deps);
+
+    await session.start();
+
+    expect(harness.peakLeases).toBe(1);
+    expect(harness.leases).toBe(0);
+  });
+});
+
+describe('per-file rejection', () => {
+  it('keeps uploading the rest when one file cannot be encoded', async () => {
+    const harness = createHarness();
+    let calls = 0;
+    const original = harness.deps.preprocess;
+    harness.deps.preprocess = async (image, target) => {
+      calls += 1;
+      if (calls === 2) {
+        throw new ImagePreprocessError('UNREADABLE', 'Could not read this photo.');
+      }
+      return original(image, target);
+    };
+
+    const session = createUploadSession(selection(3), harness.deps);
+    await session.start();
+
+    expect(harness.last().rejectedCount).toBe(1);
+    expect(harness.last().uploadedCount).toBe(2);
+    expect(harness.uploads[0]).toHaveLength(2);
+  });
+
+  it('rejects an asset the picker could not describe, keeping its place in the numbering', async () => {
+    const harness = createHarness();
+    const session = createUploadSession(
+      { images: [pickedImage(0), pickedImage(2)], unreadable: [{ index: 1, fileName: 'IMG_1.HEIC' }] },
+      harness.deps,
+    );
+
+    await session.start();
+
+    const rejected = harness.last().items.filter((item) => item.state === 'rejected');
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].index).toBe(2);
+    expect(harness.last().uploadedCount).toBe(2);
+  });
+
+  it('reports a storage failure per file instead of failing the selection', async () => {
+    const harness = createHarness();
+    let adopts = 0;
+    const original = harness.deps.adopt;
+    harness.deps.adopt = async (input) => {
+      adopts += 1;
+      if (adopts === 1) {
+        throw new Error('no space');
+      }
+      return original(input);
+    };
+
+    const session = createUploadSession(selection(3), harness.deps);
+    await session.start();
+
+    expect(harness.last().rejectedCount).toBe(1);
+    expect(harness.last().uploadedCount).toBe(2);
+    // The encoder output for the failed adopt is not left behind.
+    expect(harness.encoderOutputs.size).toBe(0);
+  });
+});
+
+describe('server outcomes', () => {
+  it('preserves earlier batches and stops on a 429', async () => {
+    const harness = createHarness({
+      encodedBytes: 10 * MIB,
+      async upload(files, attempt) {
+        if (attempt === 2) {
+          throw axiosFailure(429, { detail: 'Throttled.' });
+        }
+        return files.map((file) => serverPhoto(file.id));
+      },
+    });
+    // 10 MiB each means five per batch on the byte ceiling.
+    const session = createUploadSession(selection(12), harness.deps);
+
+    await session.start();
+
+    expect(harness.last().phase).toBe('throttled');
+    expect(harness.last().error?.message).toBe('Upload limit reached. Try again later.');
+    expect(harness.last().uploadedCount).toBe(5);
+    expect(harness.uploaded).toHaveLength(5);
+    // The throttled batch never landed, so it is pending — not failed.
+    expect(harness.last().failedCount).toBe(0);
+    expect(harness.last().unknownCount).toBe(0);
+  });
+
+  it('marks a batch unknown after a 5xx and never offers to retry it', async () => {
+    const harness = createHarness({
+      encodedBytes: 10 * MIB,
+      async upload(files, attempt) {
+        if (attempt === 2) {
+          throw axiosFailure(500, { detail: 'Storage error.', error_code: 'PHOTO_STORAGE_ERROR' });
+        }
+        return files.map((file) => serverPhoto(file.id));
+      },
+    });
+    const session = createUploadSession(selection(12), harness.deps);
+
+    await session.start();
+
+    // The server may already have committed those rows before failing to build
+    // the response, so calling them "failed" and retrying would duplicate them.
+    expect(harness.last().unknownCount).toBe(5);
+    expect(harness.last().failedCount).toBe(0);
+    expect(harness.last().uploadedCount).toBe(5);
+    expect(harness.reconciles).toBe(1);
+    expect(harness.uploads).toHaveLength(2);
+  });
+
+  it('treats a network drop exactly like a 5xx', async () => {
+    const harness = createHarness({
+      async upload() {
+        throw networkFailure();
+      },
+    });
+    const session = createUploadSession(selection(3), harness.deps);
+
+    await session.start();
+
+    expect(harness.last().unknownCount).toBe(3);
+    expect(harness.last().failedCount).toBe(0);
+    expect(harness.reconciles).toBe(1);
+  });
+
+  it('stops on a deterministic 4xx and shows the server wording verbatim', async () => {
+    const harness = createHarness({
+      async upload() {
+        throw axiosFailure(400, {
+          detail: 'Total image dimensions exceed the limit.',
+          error_code: 'PHOTO_DIMENSIONS_TOO_LARGE',
+        });
+      },
+    });
+    const session = createUploadSession(selection(3), harness.deps);
+
+    await session.start();
+
+    expect(harness.last().phase).toBe('partial');
+    expect(harness.last().failedCount).toBe(3);
+    expect(harness.last().unknownCount).toBe(0);
+    expect(harness.last().error?.message).toBe('Total image dimensions exceed the limit.');
+    // A batching bug is fixed in code, not papered over by re-splitting.
+    expect(harness.uploads).toHaveLength(1);
+  });
+
+  it('routes TRIP_NOT_FOUND to the trip-level flow rather than to batch copy', async () => {
+    const harness = createHarness({
+      async upload() {
+        throw axiosFailure(404, { detail: 'Trip not found.', error_code: 'TRIP_NOT_FOUND' });
+      },
+    });
+    const session = createUploadSession(selection(2), harness.deps);
+
+    await session.start();
+
+    expect(harness.last().phase).toBe('tripGone');
+    expect(harness.tripNotFound).toBe(1);
+    expect(harness.reconciles).toBe(0);
+  });
+
+  it('keeps prior successes when a later batch fails', async () => {
+    const harness = createHarness({
+      encodedBytes: 10 * MIB,
+      async upload(files, attempt) {
+        if (attempt === 3) {
+          throw axiosFailure(400, { detail: 'Bad batch.', error_code: 'TOO_MANY_FILES' });
+        }
+        return files.map((file) => serverPhoto(file.id));
+      },
+    });
+    const session = createUploadSession(selection(15), harness.deps);
+
+    await session.start();
+
+    expect(harness.last().uploadedCount).toBe(10);
+    expect(harness.uploaded).toHaveLength(10);
+    expect(harness.last().batchesUploaded).toBe(2);
+  });
+});
+
+describe('background pause and resume', () => {
+  it('lets the current request settle, then pauses without holding prepared files', async () => {
+    const harness = createHarness({ encodedBytes: 10 * MIB });
+    const session = createUploadSession(selection(12), harness.deps);
+
+    const original = harness.deps.uploadBatch;
+    harness.deps.uploadBatch = async (files, onProgress) => {
+      const result = await original(files, onProgress);
+      // Backgrounding lands while the first request is in flight.
+      session.requestPause();
+      return result;
+    };
+
+    await session.start();
+
+    expect(harness.last().phase).toBe('paused');
+    expect(harness.last().uploadedCount).toBe(5);
+    // Nothing prepared but unsent survives the pause: private bytes must not sit
+    // in the cache directory for as long as the app stays backgrounded.
+    expect(harness.tempFiles.size).toBe(0);
+    expect(harness.last().pendingCount).toBe(7);
+  });
+
+  it('reprocesses the stranded file on resume rather than skipping it', async () => {
+    const harness = createHarness({ encodedBytes: 10 * MIB });
+    const session = createUploadSession(selection(12), harness.deps);
+
+    const original = harness.deps.uploadBatch;
+    let paused = false;
+    harness.deps.uploadBatch = async (files, onProgress) => {
+      const result = await original(files, onProgress);
+      if (!paused) {
+        paused = true;
+        session.requestPause();
+      }
+      return result;
+    };
+
+    await session.start();
+    expect(harness.last().phase).toBe('paused');
+
+    await session.start();
+
+    expect(harness.last().uploadedCount).toBe(12);
+    expect(harness.tempFiles.size).toBe(0);
+  });
+
+  it('stops after the current batch when the user asks, and stays stopped', async () => {
+    const harness = createHarness({ encodedBytes: 10 * MIB });
+    const session = createUploadSession(selection(12), harness.deps);
+
+    const original = harness.deps.uploadBatch;
+    harness.deps.uploadBatch = async (files, onProgress) => {
+      const result = await original(files, onProgress);
+      session.requestStop();
+      return result;
+    };
+
+    await session.start();
+
+    expect(harness.last().phase).toBe('stopped');
+    expect(harness.last().uploadedCount).toBe(5);
+    expect(harness.uploads).toHaveLength(1);
+  });
+});
+
+describe('low disk', () => {
+  it('stops scheduling and keeps prior successes when the reserve cannot be held', async () => {
+    let free = 5000 * MIB;
+    const harness = createHarness({
+      encodedBytes: 10 * MIB,
+      availableBytes: () => free,
+    });
+    const session = createUploadSession(selection(12), harness.deps);
+
+    const original = harness.deps.uploadBatch;
+    harness.deps.uploadBatch = async (files, onProgress) => {
+      const result = await original(files, onProgress);
+      free = 10 * MIB;
+      return result;
+    };
+
+    await session.start();
+
+    expect(harness.last().error?.message).toBe('Not enough storage space to prepare these photos.');
+    expect(harness.last().uploadedCount).toBe(5);
+    expect(harness.tempFiles.size).toBe(0);
+  });
+
+  it('proceeds when the platform cannot report free space', async () => {
+    const harness = createHarness({ availableBytes: () => null });
+    const session = createUploadSession(selection(3), harness.deps);
+
+    await session.start();
+
+    expect(harness.last().uploadedCount).toBe(3);
+  });
+});
+
+describe('cancel', () => {
+  it('discards every owned temp file', async () => {
+    const harness = createHarness({ encodedBytes: 10 * MIB });
+    const session = createUploadSession(selection(12), harness.deps);
+
+    const original = harness.deps.uploadBatch;
+    harness.deps.uploadBatch = async (files, onProgress) => {
+      const result = await original(files, onProgress);
+      session.requestStop();
+      return result;
+    };
+    await session.start();
+
+    await session.cancel();
+
+    expect(harness.tempFiles.size).toBe(0);
+    expect(harness.last().phase).toBe('cancelled');
+  });
+});

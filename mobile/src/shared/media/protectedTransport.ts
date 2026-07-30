@@ -174,6 +174,32 @@ export function createNativeFileStore(namespace: string): ProtectedFileStore {
 export const nativeProtectedFileStore = createNativeFileStore(PROTECTED_MEDIA_NAMESPACE);
 export const nativeUploadTempFileStore = createNativeFileStore(UPLOAD_TEMP_NAMESPACE);
 
+/**
+ * Relocates a file into one of the owned namespaces and returns its new URI.
+ *
+ * A rename rather than a byte copy: the encoder's output is already on the same
+ * volume, and streaming ten megabytes through JavaScript to move it a directory
+ * across would be pure waste.
+ */
+export type MoveIntoNamespace = (
+  fromUri: string,
+  namespace: string,
+  fileName: string,
+) => Promise<string>;
+
+export const nativeMoveIntoNamespace: MoveIntoNamespace = async (fromUri, namespace, fileName) => {
+  const directory = new Directory(Paths.cache, namespace);
+  if (!directory.exists) {
+    directory.create({ intermediates: true, idempotent: true });
+  }
+  const destination = new File(directory, fileName);
+  if (destination.exists) {
+    destination.delete();
+  }
+  await new File(fromUri).move(destination);
+  return destination.uri;
+};
+
 export const nativeProtectedTransport: ProtectedTransport = {
   fetch(url: string, init: ProtectedFetchInit): Promise<Response> {
     // expo/fetch rather than the global: it reports a real HTTP status and hands

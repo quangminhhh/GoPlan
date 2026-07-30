@@ -1,11 +1,13 @@
-import { useLocalSearchParams } from 'expo-router';
+import { Stack, useLocalSearchParams } from 'expo-router';
 import { useCallback } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { colors, spacing, typography } from '@/shared/theme/tokens';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 import { Screen } from '@/shared/ui/Screen';
 import { PhotoGrid } from '../components/PhotoGrid';
+import { PhotoUploadSheet } from '../components/PhotoUploadSheet';
 import { PHOTO_ERROR_MESSAGES } from '../errors';
+import { usePhotoUpload } from '../hooks/usePhotoUpload';
 import { useTripPhotos } from '../hooks/useTripPhotos';
 
 /**
@@ -25,8 +27,36 @@ export function PhotosScreen() {
     tripNotFound,
     loadFirstPage,
     loadMore,
+    reconcile,
+    prependUploaded,
     handleAssetNotFound,
   } = useTripPhotos(tripId);
+
+  const handleTripNotFound = useCallback(() => {
+    handleAssetNotFound('', {
+      kind: 'notFound',
+      message: PHOTO_ERROR_MESSAGES.tripNotFound,
+      status: 404,
+      errorCode: 'TRIP_NOT_FOUND',
+    });
+  }, [handleAssetNotFound]);
+
+  const upload = usePhotoUpload({
+    tripId,
+    onUploaded: prependUploaded,
+    onReconcile: () => {
+      void reconcile();
+    },
+    onTripNotFound: handleTripNotFound,
+  });
+
+  const startPicking = useCallback(() => {
+    void upload.pick();
+  }, [upload]);
+
+  const closeUpload = useCallback(() => {
+    void upload.close();
+  }, [upload]);
 
   const retryInitial = useCallback(() => {
     void loadFirstPage('initial');
@@ -78,13 +108,45 @@ export function PhotosScreen() {
     );
   }
 
+  const uploadAction = (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel="Upload photos"
+      disabled={upload.picking}
+      onPress={startPicking}
+      style={styles.action}
+    >
+      <Text style={styles.actionText}>Upload</Text>
+    </Pressable>
+  );
+
+  const uploadSheet = upload.snapshot ? (
+    <PhotoUploadSheet
+      snapshot={upload.snapshot}
+      onStart={upload.start}
+      onStop={upload.stop}
+      onClose={closeUpload}
+    />
+  ) : null;
+
   if (photos.length === 0) {
     return (
       <Screen>
+        <Stack.Screen options={{ headerRight: () => uploadAction }} />
         <View style={styles.centered} testID="photos-empty">
           <Text style={styles.emptyTitle}>No photos yet</Text>
           <Text style={styles.emptyBody}>Photos added to this trip will show up here.</Text>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Upload photos"
+            disabled={upload.picking}
+            onPress={startPicking}
+            style={styles.action}
+          >
+            <Text style={styles.actionText}>Upload photos</Text>
+          </Pressable>
         </View>
+        {uploadSheet}
       </Screen>
     );
   }
@@ -95,6 +157,7 @@ export function PhotosScreen() {
 
   return (
     <Screen edges={['bottom']}>
+      <Stack.Screen options={{ headerRight: () => uploadAction }} />
       <View style={styles.fill}>
         {inlineError ? (
           <View style={styles.banner} testID="photos-inline-error">
@@ -115,6 +178,7 @@ export function PhotosScreen() {
           onAssetNotFound={handleAssetNotFound}
         />
       </View>
+      {uploadSheet}
     </Screen>
   );
 }

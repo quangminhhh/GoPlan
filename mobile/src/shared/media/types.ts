@@ -24,6 +24,19 @@ export type PickImageOutcome =
   | { status: 'picked'; image: PickedImage }
   | { status: 'cancelled' };
 
+/**
+ * Multi-select outcome.
+ *
+ * `unreadable` carries the assets the picker described in a way this app cannot
+ * act on — dimensions of zero, most often an iCloud asset that never
+ * materialised. They are reported per file so the rest of the selection still
+ * uploads, and they are identified by position because a picker-supplied name is
+ * frequently absent and never trustworthy.
+ */
+export type PickImagesOutcome =
+  | { status: 'picked'; images: PickedImage[]; unreadable: { index: number; fileName: string | null }[] }
+  | { status: 'cancelled' };
+
 export interface PreprocessTarget {
   /** Max long edge after processing, in pixels. */
   maxEdgePx: number;
