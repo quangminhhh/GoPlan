@@ -1,0 +1,319 @@
+/**
+ * Session, abort, and purge barriers for every private-media flow (D20).
+ *
+ * The problem this solves is narrow and specific. Protected assets, photo list,
+ * upload and delete all authenticate, so all of them can trigger a token
+ * refresh — `fetchProtectedResponse` directly, the Axios calls through the
+ * response interceptor in `shared/api/client.ts`. A refresh that settles after
+ * `clearTokens()` writes a fresh access token back into a store the user just
+ * signed out of, and a purge queued by the old session deletes files the new one
+ * has already staged.
+ *
+ * The fix lives entirely at the caller: `src/shared/api/refresh.ts` and the Axios
+ * interceptor keep their single-flight and generation semantics untouched. What
+ * changes is that every private-media operation registers its *whole* promise
+ * here — including any interceptor retry nested inside it — so sign-out can
+ * close the gate, abort what is running, and wait for it before revoking.
+ *
+ * No native module is imported here: purgers register themselves, so this module
+ * never needs to know what a file is.
+ */
+
+import { ProtectedAssetError } from './protectedAssetTypes';
+
+/** Fixed, typed set. A purger is never addressed by a caller-supplied path. */
+export type PrivateMediaPurgerName = 'protected-assets' | 'upload-temp';
+
+const SESSION_CLOSED_MESSAGE = 'This session is no longer active.';
+
+const purgers = new Map<PrivateMediaPurgerName, () => Promise<void>>();
+const controllers = new Set<AbortController>();
+const activity = new Set<Promise<unknown>>();
+const generationListeners = new Set<() => void>();
+
+let sessionActive = false;
+let acquisitionOpen = false;
+let sessionEpoch = 0;
+let generation = 0;
+let transferLeases = 0;
+let purgeDeferred = false;
+let purgeTail: Promise<void> = Promise.resolve();
+
+/**
+ * Registered at module scope by each namespace owner. Keeping the list here
+ * rather than passing purge callbacks around means a background purge cleans
+ * both the protected-asset staging directory and the upload temp directory
+ * without either module knowing the other exists.
+ */
+export function registerPrivateMediaPurger(
+  name: PrivateMediaPurgerName,
+  purge: () => Promise<void>,
+): void {
+  purgers.set(name, purge);
+}
+
+export function isPrivateMediaSessionOpen(): boolean {
+  return acquisitionOpen;
+}
+
+/**
+ * Incremented synchronously by every invalidation front half, before any file is
+ * deleted. A staged download compares the epoch it started under against this
+ * value before committing, so a response that arrives after sign-out discards
+ * its file instead of recreating private bytes in a signed-out app.
+ */
+export function getPrivateMediaEpoch(): number {
+  return sessionEpoch;
+}
+
+export function getPrivateMediaGeneration(): number {
+  return generation;
+}
+
+/**
+ * Mounted images subscribe to drop their local URI the moment a purge starts and
+ * to reacquire once the gate is open again. The generation is published twice
+ * per background round trip — once in the front half, once after resume — which
+ * is what keeps a component from re-fetching while the app is still in the
+ * background.
+ */
+export function subscribeToPrivateMediaGeneration(listener: () => void): () => void {
+  generationListeners.add(listener);
+  return () => {
+    generationListeners.delete(listener);
+  };
+}
+
+function publishGeneration(): void {
+  generation += 1;
+  for (const listener of Array.from(generationListeners)) {
+    try {
+      listener();
+    } catch {
+      // A subscriber that throws must not stop the abort loop that follows this
+      // call, which is the part that actually protects the session boundary.
+    }
+  }
+}
+
+export function createSessionClosedError(): ProtectedAssetError {
+  return new ProtectedAssetError('cancelled', SESSION_CLOSED_MESSAGE);
+}
+
+/**
+ * Runs `operation` as tracked private-network activity.
+ *
+ * Registration is synchronous: by the time this returns, sign-out can already
+ * see and abort the operation. The promise leaves the registry only after
+ * everything nested inside it has settled, so an Axios 401 retry counts as part
+ * of the operation that started it rather than as untracked work.
+ */
+export function trackPrivateOperation<T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  if (!acquisitionOpen) {
+    return Promise.reject(createSessionClosedError());
+  }
+
+  const controller = new AbortController();
+  controllers.add(controller);
+
+  let operation: Promise<T>;
+  try {
+    operation = run(controller.signal);
+  } catch (error) {
+    controllers.delete(controller);
+    return Promise.reject(error);
+  }
+
+  activity.add(operation);
+  const settle = (): void => {
+    controllers.delete(controller);
+    activity.delete(operation);
+  };
+  // Both handlers are supplied, so this derived promise can never surface as an
+  // unhandled rejection; the caller still owns the original.
+  operation.then(settle, settle);
+
+  return operation;
+}
+
+/**
+ * Waits for private-network activity that already exists. It never starts a
+ * request or a refresh of its own — sign-out must not be able to extend the
+ * lifetime of the credentials it is about to revoke.
+ */
+export async function waitForPrivateNetworkIdle(): Promise<void> {
+  while (activity.size > 0) {
+    await Promise.allSettled(Array.from(activity));
+  }
+}
+
+/**
+ * Marks a multi-step flow that owns temporary files — preprocess/upload, single
+ * save, ZIP download and share. Backgrounding defers the purge until the last
+ * lease releases so the OS does not delete a file mid-transfer. Sign-out is not
+ * deferrable and overrides every lease.
+ *
+ * @throws ProtectedAssetError `cancelled` when the gate is already closed.
+ */
+export function acquirePrivateTransferLease(): () => void {
+  if (!acquisitionOpen) {
+    throw createSessionClosedError();
+  }
+
+  transferLeases += 1;
+  let released = false;
+
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    transferLeases -= 1;
+    if (transferLeases === 0 && purgeDeferred) {
+      runInvalidationFrontHalf();
+    }
+  };
+}
+
+export function getPrivateTransferLeaseCount(): number {
+  return transferLeases;
+}
+
+async function runAllPurgers(): Promise<void> {
+  for (const purge of Array.from(purgers.values())) {
+    try {
+      await purge();
+    } catch {
+      // Cleanup is best effort by contract: a file the OS refuses to delete must
+      // not leave the queue jammed for the session that comes next.
+    }
+  }
+}
+
+function enqueuePurge(): Promise<void> {
+  const queued = purgeTail.then(runAllPurgers, runAllPurgers);
+  purgeTail = queued;
+  return queued;
+}
+
+/**
+ * Drains the purge queue, including work enqueued while this was awaiting. The
+ * loop matters: a session that starts while the previous session's cleanup is
+ * still running must not open its gate until that cleanup is finished, or the
+ * old purge deletes files the new session has already staged.
+ */
+export async function flushPrivateMediaPurge(): Promise<void> {
+  let awaited: Promise<void> | null = null;
+  while (awaited !== purgeTail) {
+    awaited = purgeTail;
+    await awaited.catch(() => undefined);
+  }
+}
+
+/**
+ * The synchronous half of every session boundary.
+ *
+ * Order is the whole point. The epoch moves and the registry is cleared before
+ * anything is aborted and long before a file is deleted, so there is no window
+ * in which an in-flight completion can observe the old epoch and commit.
+ */
+function runInvalidationFrontHalf(): void {
+  acquisitionOpen = false;
+  purgeDeferred = false;
+  sessionEpoch += 1;
+
+  const aborted = Array.from(controllers);
+  controllers.clear();
+
+  publishGeneration();
+
+  for (const controller of aborted) {
+    controller.abort();
+  }
+
+  void enqueuePurge();
+}
+
+/**
+ * Call at the very start of sign-out, before the logout request — the caller
+ * then awaits `waitForPrivateNetworkIdle()` before reading the refresh token.
+ */
+export function beginPrivateMediaShutdown(): void {
+  sessionActive = false;
+  runInvalidationFrontHalf();
+}
+
+/** Sign-out barrier as one call, for the paths that do not interleave a logout. */
+export async function endPrivateMediaSession(): Promise<void> {
+  beginPrivateMediaShutdown();
+  await waitForPrivateNetworkIdle();
+  await flushPrivateMediaPurge();
+}
+
+/**
+ * Opens a clean session. Cleanup owned by any previous session is drained first
+ * and this session's own purge is awaited second, so the gate only opens once
+ * the staging namespaces are known to be empty.
+ */
+export async function startPrivateMediaSession(): Promise<void> {
+  sessionActive = true;
+  acquisitionOpen = false;
+  await flushPrivateMediaPurge();
+  await enqueuePurge();
+  if (!sessionActive) {
+    // Sign-out landed while the purge ran. Leave the gate shut.
+    return;
+  }
+  acquisitionOpen = true;
+  publishGeneration();
+}
+
+/**
+ * App moved to background. New work is refused either way; whether the purge
+ * runs now or waits depends on an active transfer holding files it still needs.
+ */
+export function suspendPrivateMediaSession(): void {
+  if (!sessionActive || !acquisitionOpen) {
+    return;
+  }
+  acquisitionOpen = false;
+  if (transferLeases > 0) {
+    purgeDeferred = true;
+    return;
+  }
+  runInvalidationFrontHalf();
+}
+
+/**
+ * App returned to foreground. Deferred and queued purges settle, then the gate
+ * opens, and only then is the generation published — mounted images must not be
+ * able to issue a request in the window between those steps.
+ */
+export async function resumePrivateMediaSession(): Promise<void> {
+  if (!sessionActive || acquisitionOpen) {
+    return;
+  }
+  await flushPrivateMediaPurge();
+  if (!sessionActive || acquisitionOpen) {
+    return;
+  }
+  acquisitionOpen = true;
+  publishGeneration();
+}
+
+/**
+ * Resets singleton state between Jest suites. Registered purgers survive: they
+ * are installed at module import, which happens once per module registry.
+ */
+export function __resetPrivateMediaLifecycleForTests(): void {
+  controllers.clear();
+  activity.clear();
+  generationListeners.clear();
+  sessionActive = false;
+  acquisitionOpen = false;
+  sessionEpoch = 0;
+  generation = 0;
+  transferLeases = 0;
+  purgeDeferred = false;
+  purgeTail = Promise.resolve();
+}
