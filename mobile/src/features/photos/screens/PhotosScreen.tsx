@@ -6,8 +6,10 @@ import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 import { Screen } from '@/shared/ui/Screen';
 import { PhotoGrid } from '../components/PhotoGrid';
 import { PhotoUploadSheet } from '../components/PhotoUploadSheet';
+import { PhotoViewer } from '../components/PhotoViewer';
 import { PHOTO_ERROR_MESSAGES } from '../errors';
 import { usePhotoUpload } from '../hooks/usePhotoUpload';
+import { usePhotoViewer } from '../hooks/usePhotoViewer';
 import { useTripPhotos } from '../hooks/useTripPhotos';
 
 /**
@@ -29,6 +31,7 @@ export function PhotosScreen() {
     loadMore,
     reconcile,
     prependUploaded,
+    removePhoto,
     handleAssetNotFound,
   } = useTripPhotos(tripId);
 
@@ -70,9 +73,23 @@ export function PhotosScreen() {
     void loadMore();
   }, [loadMore]);
 
-  const handlePhotoPress = useCallback(() => {
-    // The full-screen viewer arrives with sub-issue 3.4.
-  }, []);
+  const viewer = usePhotoViewer({
+    tripId,
+    photos,
+    hasNextPage,
+    loadMore: handleEndReached,
+    reconcile,
+    removePhoto,
+    onAssetNotFound: handleAssetNotFound,
+  });
+
+  const handleDelete = useCallback(() => {
+    void viewer.confirmDelete();
+  }, [viewer]);
+
+  const handleSave = useCallback(() => {
+    void viewer.save();
+  }, [viewer]);
 
   if (tripNotFound) {
     // Neutral on purpose: a trip that was deleted and a trip the user was
@@ -174,11 +191,27 @@ export function PhotosScreen() {
           onRefresh={refresh}
           onEndReached={handleEndReached}
           onRetryPage={handleEndReached}
-          onPhotoPress={handlePhotoPress}
+          onPhotoPress={viewer.open}
           onAssetNotFound={handleAssetNotFound}
         />
       </View>
       {uploadSheet}
+      {viewer.currentPhoto ? (
+        <PhotoViewer
+          tripId={tripId}
+          photos={photos}
+          currentIndex={viewer.currentIndex}
+          currentPhoto={viewer.currentPhoto}
+          action={viewer.action}
+          onClose={viewer.close}
+          onGoTo={viewer.goTo}
+          onGoToOffset={viewer.goToOffset}
+          onDelete={handleDelete}
+          onSave={handleSave}
+          onDismissAction={viewer.dismissAction}
+          onAssetNotFound={handleAssetNotFound}
+        />
+      ) : null}
     </Screen>
   );
 }
