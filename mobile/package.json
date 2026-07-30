@@ -22,7 +22,7 @@
     "expo-image-manipulator": "57.0.2",
     "expo-image-picker": "57.0.2",
     "expo-linking": "~57.0.1",
-    "expo-media-library": "~57.0.3",
+    "expo-media-library": "57.0.1",
     "expo-router": "~57.0.3",
     "expo-secure-store": "~57.0.0",
     "expo-sharing": "~57.0.8",
