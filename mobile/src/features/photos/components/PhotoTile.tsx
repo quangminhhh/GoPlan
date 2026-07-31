@@ -97,7 +97,7 @@ const styles = StyleSheet.create({
   pressed: { opacity: 0.7 },
   badge: {
     alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.35)',
+    backgroundColor: colors.mediaSelectionOverlay,
     borderColor: colors.background,
     borderRadius: radii.full,
     borderWidth: 1.5,

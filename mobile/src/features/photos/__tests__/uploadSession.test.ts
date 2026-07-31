@@ -5,6 +5,7 @@ import { createUploadSession, type UploadSessionDeps, type UploadSnapshot } from
 import { PHOTO_UPLOAD_BATCH_LIMITS } from '../constants';
 import type { TripPhoto } from '../types';
 import type { PreparedUpload } from '../uploadTypes';
+import { createDeferred } from '@test/fakeProtectedTransport';
 
 const MIB = 1024 * 1024;
 
@@ -324,6 +325,19 @@ describe('server outcomes', () => {
     // The throttled batch never landed, so it is pending — not failed.
     expect(harness.last().failedCount).toBe(0);
     expect(harness.last().unknownCount).toBe(0);
+
+    await session.start();
+
+    expect(harness.last()).toMatchObject({
+      phase: 'complete',
+      uploadedCount: 12,
+      pendingCount: 0,
+      error: null,
+    });
+    expect(harness.uploaded.map((item) => item.id).sort()).toEqual(
+      Array.from({ length: 12 }, (_unused, index) => `pick-${index}`).sort(),
+    );
+    expect(harness.tempFiles.size).toBe(0);
   });
 
   it('marks a batch unknown after a 5xx and never offers to retry it', async () => {
@@ -421,6 +435,38 @@ describe('server outcomes', () => {
 });
 
 describe('background pause and resume', () => {
+  it('rewinds a settled throttled batch before background purge and reprocesses fresh paths', async () => {
+    let harness!: Harness;
+    harness = createHarness({
+      async upload(files, attempt) {
+        expect(files.every((file) => harness.tempFiles.has(file.uri))).toBe(true);
+        if (attempt === 1) {
+          throw axiosFailure(429, { detail: 'Throttled.' });
+        }
+        return files.map((file) => serverPhoto(file.id));
+      },
+    });
+    const session = createUploadSession(selection(3), harness.deps);
+
+    await session.start();
+    expect(harness.last().phase).toBe('throttled');
+    const staleUris = harness.uploads[0].map((file) => file.uri);
+
+    session.requestPause();
+    // `start` is the explicit foreground Resume. It must wait for the idle
+    // background cleanup rather than racing it.
+    await session.start();
+
+    expect(harness.last()).toMatchObject({
+      phase: 'complete',
+      uploadedCount: 3,
+      pendingCount: 0,
+      error: null,
+    });
+    expect(harness.uploads[1].every((file) => !staleUris.includes(file.uri))).toBe(true);
+    expect(harness.tempFiles.size).toBe(0);
+  });
+
   it('lets the current request settle, then pauses without holding prepared files', async () => {
     const harness = createHarness({ encodedBytes: 10 * MIB });
     const session = createUploadSession(selection(12), harness.deps);
@@ -483,6 +529,173 @@ describe('background pause and resume', () => {
     expect(harness.last().phase).toBe('stopped');
     expect(harness.last().uploadedCount).toBe(5);
     expect(harness.uploads).toHaveLength(1);
+  });
+});
+
+describe('private-session cancellation', () => {
+  it('discards a preprocess completion that settles after the lifecycle signal aborts', async () => {
+    const harness = createHarness();
+    const preprocess = createDeferred<PreprocessedImage>();
+    const output = encoded(pickedImage(0), MIB);
+    harness.encoderOutputs.add(output.uri);
+    harness.deps.preprocess = async () => preprocess.promise;
+    const session = createUploadSession(selection(1), harness.deps);
+    const controller = new AbortController();
+
+    const running = session.start(controller.signal);
+    controller.abort();
+    preprocess.resolve(output);
+    await running;
+
+    expect(harness.last().phase).toBe('cancelled');
+    expect(harness.encoderOutputs.size).toBe(0);
+    expect(harness.tempFiles.size).toBe(0);
+    expect(harness.last().uploadedCount).toBe(0);
+  });
+
+  it('discards an adopted file that appears after the lifecycle signal aborts', async () => {
+    const harness = createHarness();
+    const adopt = createDeferred<void>();
+    harness.deps.adopt = async ({ uri, bytes }) => {
+      await adopt.promise;
+      harness.encoderOutputs.delete(uri);
+      const adoptedUri = 'file:///temp/late-adopt.jpg';
+      harness.tempFiles.add(adoptedUri);
+      return { uri: adoptedUri, bytes };
+    };
+    const session = createUploadSession(selection(1), harness.deps);
+    const controller = new AbortController();
+
+    const running = session.start(controller.signal);
+    await Promise.resolve();
+    controller.abort();
+    adopt.resolve();
+    await running;
+
+    expect(harness.last().phase).toBe('cancelled');
+    expect(harness.encoderOutputs.size).toBe(0);
+    expect(harness.tempFiles.size).toBe(0);
+    expect(harness.last().uploadedCount).toBe(0);
+  });
+
+  it('aborts and awaits a preprocess that is still settling before cancel completes', async () => {
+    const harness = createHarness();
+    const preprocessStarted = createDeferred<void>();
+    const preprocess = createDeferred<PreprocessedImage>();
+    const output = encoded(pickedImage(0), MIB);
+    harness.deps.preprocess = async () => {
+      preprocessStarted.resolve();
+      return preprocess.promise;
+    };
+    const session = createUploadSession(selection(1), harness.deps);
+
+    const running = session.start();
+    await preprocessStarted.promise;
+    let cancelSettled = false;
+    const cancelling = session.cancel().then(() => {
+      cancelSettled = true;
+    });
+    await Promise.resolve();
+    expect(cancelSettled).toBe(false);
+
+    harness.encoderOutputs.add(output.uri);
+    preprocess.resolve(output);
+    await Promise.all([running, cancelling]);
+
+    expect(cancelSettled).toBe(true);
+    expect(harness.encoderOutputs.size).toBe(0);
+    expect(harness.tempFiles.size).toBe(0);
+    expect(harness.uploads).toHaveLength(0);
+    expect(harness.last().phase).toBe('cancelled');
+  });
+
+  it('awaits adopt and discards a temp file returned after cancel', async () => {
+    const harness = createHarness();
+    const adoptStarted = createDeferred<void>();
+    const adopt = createDeferred<void>();
+    const lateUri = 'file:///temp/late-cancel-adopt.jpg';
+    harness.deps.adopt = async ({ uri, bytes }) => {
+      adoptStarted.resolve();
+      await adopt.promise;
+      harness.encoderOutputs.delete(uri);
+      harness.tempFiles.add(lateUri);
+      return { uri: lateUri, bytes };
+    };
+    const session = createUploadSession(selection(1), harness.deps);
+
+    const running = session.start();
+    await adoptStarted.promise;
+    let cancelSettled = false;
+    const cancelling = session.cancel().then(() => {
+      cancelSettled = true;
+    });
+    await Promise.resolve();
+    expect(cancelSettled).toBe(false);
+
+    adopt.resolve();
+    await Promise.all([running, cancelling]);
+
+    expect(harness.encoderOutputs.size).toBe(0);
+    expect(harness.tempFiles.size).toBe(0);
+    expect(harness.uploads).toHaveLength(0);
+    expect(harness.uploaded).toHaveLength(0);
+    expect(harness.last().phase).toBe('cancelled');
+  });
+
+  it('aborts an active upload but keeps its files until the request settles', async () => {
+    const harness = createHarness();
+    const uploadStarted = createDeferred<void>();
+    const uploadResult = createDeferred<TripPhoto[]>();
+    let uploadSignal: AbortSignal | undefined;
+    let requestFiles: PreparedUpload[] = [];
+    harness.deps.uploadBatch = async (files, _onProgress, signal) => {
+      requestFiles = files;
+      uploadSignal = signal;
+      harness.uploads.push(files);
+      uploadStarted.resolve();
+      // Deliberately ignore abort. Native networking may take time to settle,
+      // and cancel must not unlink files while it can still be reading them.
+      return uploadResult.promise;
+    };
+    const session = createUploadSession(selection(2), harness.deps);
+
+    const running = session.start();
+    await uploadStarted.promise;
+    let cancelSettled = false;
+    const cancelling = session.cancel().then(() => {
+      cancelSettled = true;
+    });
+
+    expect(uploadSignal?.aborted).toBe(true);
+    await Promise.resolve();
+    expect(cancelSettled).toBe(false);
+    expect(requestFiles.every((file) => harness.tempFiles.has(file.uri))).toBe(true);
+
+    uploadResult.resolve(requestFiles.map((file) => serverPhoto(file.id)));
+    await Promise.all([running, cancelling]);
+
+    expect(harness.tempFiles.size).toBe(0);
+    expect(harness.uploaded).toHaveLength(0);
+    expect(harness.last()).toMatchObject({
+      phase: 'cancelled',
+      uploadedCount: 0,
+      unknownCount: 2,
+    });
+  });
+
+  it('is terminal after cancel and does not restart preprocessing', async () => {
+    const harness = createHarness();
+    const preprocess = jest.spyOn(harness.deps, 'preprocess');
+    const session = createUploadSession(selection(1), harness.deps);
+
+    await session.cancel();
+    await session.start();
+    session.requestPause();
+    session.requestStop();
+
+    expect(preprocess).not.toHaveBeenCalled();
+    expect(harness.uploads).toHaveLength(0);
+    expect(harness.last().phase).toBe('cancelled');
   });
 });
 

@@ -224,6 +224,115 @@ describe('bulk download', () => {
     });
   });
 
+  it('keeps progress and Cancel visible when selection changes during a ZIP stream', async () => {
+    const finish = createDeferred<{ status: 'shared'; fileName: string }>();
+    mockDownloadAndShare.mockImplementation(
+      async (input: { onProgress?: (written: number, total: number | null) => void }) => {
+        input.onProgress?.(2048, 8192);
+        return finish.promise;
+      },
+    );
+    const { result } = await renderHook(() => usePhotoSelection(options()));
+    await act(async () => {
+      result.current.enterSelection('p1');
+    });
+    let pending!: Promise<void>;
+    await act(async () => {
+      pending = result.current.startDownload();
+    });
+
+    await act(async () => {
+      result.current.toggle('p2');
+      result.current.selectLoaded();
+      result.current.clear();
+      result.current.enterSelection('p3');
+    });
+
+    // Every mutation path is frozen to the request snapshot, and none may reset
+    // the active progress state or hide Cancel.
+    expect(result.current.selectedIds).toEqual(['p1']);
+    expect(result.current.download).toEqual({
+      status: 'downloading',
+      bytesWritten: 2048,
+      totalBytes: 8192,
+    });
+
+    await act(async () => {
+      finish.resolve({ status: 'shared', fileName: 'a.zip' });
+      await pending;
+    });
+  });
+
+  it('coalesces a burst of chunk progress to a bounded React update rate', async () => {
+    const finish = createDeferred<{ status: 'shared'; fileName: string }>();
+    let emit: ((written: number, total: number | null) => void) | undefined;
+    mockDownloadAndShare.mockImplementation(
+      async (input: { onProgress?: (written: number, total: number | null) => void }) => {
+        emit = input.onProgress;
+        return finish.promise;
+      },
+    );
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_000);
+    const { result } = await renderHook(() => usePhotoSelection(options()));
+    await act(async () => {
+      result.current.enterSelection('p1');
+    });
+    let pending!: Promise<void>;
+    await act(async () => {
+      pending = result.current.startDownload();
+      emit?.(1, 100);
+      emit?.(2, 100);
+      emit?.(3, 100);
+    });
+    expect(result.current.download).toMatchObject({ status: 'downloading', bytesWritten: 1 });
+
+    now.mockReturnValue(1_100);
+    await act(async () => {
+      emit?.(4, 100);
+    });
+    expect(result.current.download).toMatchObject({ status: 'downloading', bytesWritten: 4 });
+
+    await act(async () => {
+      finish.resolve({ status: 'shared', fileName: 'a.zip' });
+      await pending;
+    });
+    now.mockRestore();
+  });
+
+  it('does not re-render byte progress when the archive length is unknown', async () => {
+    const finish = createDeferred<{ status: 'shared'; fileName: string }>();
+    let emit: ((written: number, total: number | null) => void) | undefined;
+    mockDownloadAndShare.mockImplementation(
+      async (input: { onProgress?: (written: number, total: number | null) => void }) => {
+        emit = input.onProgress;
+        return finish.promise;
+      },
+    );
+    const { result } = await renderHook(() => usePhotoSelection(options()));
+    await act(async () => {
+      result.current.enterSelection('p1');
+    });
+
+    let pending!: Promise<void>;
+    await act(async () => {
+      pending = result.current.startDownload();
+      for (let chunk = 1; chunk <= 100; chunk += 1) {
+        emit?.(chunk * 1024, null);
+      }
+    });
+
+    expect(result.current.download).toEqual({
+      status: 'downloading',
+      bytesWritten: 0,
+      totalBytes: null,
+    });
+
+    await act(async () => {
+      finish.resolve({ status: 'shared', fileName: 'a.zip' });
+      await pending;
+    });
+  });
+
   it('aborts an in-flight archive when selection mode is exited', async () => {
     const finish = createDeferred<{ status: 'cancelled' }>();
     mockDownloadAndShare.mockImplementation(() => finish.promise);
@@ -294,6 +403,10 @@ describe('all-or-nothing bulk 404 (D17)', () => {
     expect(opts.reconcile).toHaveBeenCalledTimes(1);
     expect(result.current.selectedCount).toBe(0);
     expect(result.current.selectionMode).toBe(false);
+    expect(result.current.download).toEqual({
+      status: 'message',
+      message: 'Some selected photos are no longer available.',
+    });
     // One request, not a retry loop against a 30/hour budget.
     expect(mockDownloadAndShare).toHaveBeenCalledTimes(1);
   });
@@ -316,6 +429,10 @@ describe('all-or-nothing bulk 404 (D17)', () => {
 
     expect(result.current.selectedCount).toBe(0);
     expect(result.current.selectionMode).toBe(false);
+    expect(result.current.download).toEqual({
+      status: 'message',
+      message: 'Some selected photos are no longer available.',
+    });
   });
 
   it('never leaks a photo id into the message', async () => {
@@ -403,6 +520,28 @@ describe('all-or-nothing bulk 404 (D17)', () => {
 
     expect(result.current.selectedCount).toBe(1);
     expect(result.current.download).toMatchObject({ status: 'error' });
+  });
+
+  it('maps an unexpected native/download rejection and leaves the action retryable', async () => {
+    mockDownloadAndShare.mockRejectedValue(new Error('native failure'));
+    const { result } = await renderHook(() => usePhotoSelection(options()));
+    await act(async () => {
+      result.current.enterSelection('p1');
+    });
+    await act(async () => {
+      await result.current.startDownload();
+    });
+
+    expect(result.current.download).toMatchObject({
+      status: 'error',
+      failure: { kind: 'server' },
+    });
+
+    mockDownloadAndShare.mockResolvedValue({ status: 'shared', fileName: 'retry.zip' });
+    await act(async () => {
+      await result.current.startDownload();
+    });
+    expect(mockDownloadAndShare).toHaveBeenCalledTimes(2);
   });
 
   it('treats a cancelled download as an ordinary outcome', async () => {

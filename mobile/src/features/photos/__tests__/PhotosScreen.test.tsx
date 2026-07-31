@@ -1,5 +1,7 @@
 const mockUseTripPhotos = jest.fn();
 const mockUsePhotoUpload = jest.fn();
+const mockUsePhotoViewer = jest.fn();
+const mockUsePhotoSelection = jest.fn();
 
 jest.mock('expo-router', () => ({
   useLocalSearchParams: () => ({ tripId: 'trip-1' }),
@@ -12,6 +14,14 @@ jest.mock('../hooks/usePhotoUpload', () => ({
 
 jest.mock('../hooks/useTripPhotos', () => ({
   useTripPhotos: (...args: unknown[]) => mockUseTripPhotos(...args),
+}));
+
+jest.mock('../hooks/usePhotoViewer', () => ({
+  usePhotoViewer: (...args: unknown[]) => mockUsePhotoViewer(...args),
+}));
+
+jest.mock('../hooks/usePhotoSelection', () => ({
+  usePhotoSelection: (...args: unknown[]) => mockUsePhotoSelection(...args),
 }));
 
 jest.mock('@/shared/media/AuthenticatedImage', () => {
@@ -77,7 +87,9 @@ function uploadState(overrides: Record<string, unknown> = {}) {
     snapshot: null,
     isOpen: false,
     picking: false,
+    pickFailure: null,
     pick: jest.fn(async () => undefined),
+    dismissPickFailure: jest.fn(),
     start: jest.fn(),
     stop: jest.fn(),
     close: jest.fn(async () => undefined),
@@ -85,9 +97,48 @@ function uploadState(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function viewerState(overrides: Record<string, unknown> = {}) {
+  return {
+    openPhotoId: null,
+    currentIndex: -1,
+    currentPhoto: null,
+    action: { status: 'idle' },
+    open: jest.fn(),
+    close: jest.fn(),
+    goTo: jest.fn(),
+    goToOffset: jest.fn(),
+    confirmDelete: jest.fn(async () => undefined),
+    save: jest.fn(async () => undefined),
+    dismissAction: jest.fn(),
+    ...overrides,
+  };
+}
+
+function selectionState(overrides: Record<string, unknown> = {}) {
+  return {
+    selectionMode: false,
+    selectedIds: [],
+    selectedCount: 0,
+    download: { status: 'idle' },
+    requestsUsed: 0,
+    enterSelection: jest.fn(),
+    toggle: jest.fn(),
+    isSelected: jest.fn(() => false),
+    selectLoaded: jest.fn(),
+    clear: jest.fn(),
+    exit: jest.fn(),
+    startDownload: jest.fn(async () => undefined),
+    cancelDownload: jest.fn(),
+    dismissMessage: jest.fn(),
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   mockUsePhotoUpload.mockReturnValue(uploadState());
+  mockUsePhotoViewer.mockReturnValue(viewerState());
+  mockUsePhotoSelection.mockReturnValue(selectionState());
 });
 
 it('passes the route trip id to the hook', async () => {
@@ -154,6 +205,78 @@ it('renders the grid and keeps photos while a background refresh fails', async (
   expect(screen.getByTestId('photo-tile-p1')).toBeTruthy();
   expect(screen.getByTestId('photos-inline-error')).toBeTruthy();
   expect(screen.getByText('Cannot reach the server.')).toBeTruthy();
+});
+
+it('keeps an empty gallery refreshable when a background reconcile fails', async () => {
+  const loadFirstPage = jest.fn(async () => undefined);
+  mockUseTripPhotos.mockReturnValue(
+    hookState({
+      errorSource: 'background',
+      error: { kind: 'network', message: 'Cannot reach the server.' },
+      loadFirstPage,
+    }),
+  );
+  await render(<PhotosScreen />);
+
+  expect(screen.getByTestId('photos-empty')).toBeTruthy();
+  expect(screen.getByTestId('photo-grid')).toBeTruthy();
+  expect(screen.getByTestId('photos-inline-error')).toBeTruthy();
+
+  screen.getByTestId('photo-grid').props.refreshControl.props.onRefresh();
+  expect(loadFirstPage).toHaveBeenCalledWith('refresh');
+});
+
+it('renders viewer and stale-selection feedback after their modal UI closes', async () => {
+  const dismissViewer = jest.fn();
+  mockUseTripPhotos.mockReturnValue(hookState());
+  mockUsePhotoViewer.mockReturnValue(
+    viewerState({
+      action: { status: 'message', message: 'Photo deleted.' },
+      dismissAction: dismissViewer,
+    }),
+  );
+  const first = await render(<PhotosScreen />);
+
+  expect(screen.getByTestId('photos-feedback-toast')).toBeTruthy();
+  expect(screen.getByText('Photo deleted.')).toBeTruthy();
+  await fireEvent.press(screen.getByTestId('photos-feedback-toast'));
+  expect(dismissViewer).toHaveBeenCalledTimes(1);
+
+  const dismissSelection = jest.fn();
+  mockUsePhotoViewer.mockReturnValue(viewerState());
+  mockUsePhotoSelection.mockReturnValue(
+    selectionState({
+      download: {
+        status: 'message',
+        message: 'Some selected photos are no longer available.',
+      },
+      dismissMessage: dismissSelection,
+    }),
+  );
+  await first.rerender(<PhotosScreen />);
+
+  expect(screen.getByText('Some selected photos are no longer available.')).toBeTruthy();
+  await fireEvent.press(screen.getByTestId('photos-feedback-toast'));
+  expect(dismissSelection).toHaveBeenCalledTimes(1);
+});
+
+it('shows and dismisses a picker failure without opening an upload sheet', async () => {
+  const dismissPickFailure = jest.fn();
+  mockUseTripPhotos.mockReturnValue(hookState());
+  mockUsePhotoUpload.mockReturnValue(
+    uploadState({
+      pickFailure: { kind: 'server', message: 'Something went wrong. Please try again.' },
+      dismissPickFailure,
+    }),
+  );
+  await render(<PhotosScreen />);
+
+  expect(screen.getByTestId('photos-feedback-toast')).toBeTruthy();
+  expect(screen.getByText('Something went wrong. Please try again.')).toBeTruthy();
+  expect(screen.queryByTestId('photo-upload-sheet')).toBeNull();
+
+  await fireEvent.press(screen.getByTestId('photos-feedback-toast'));
+  expect(dismissPickFailure).toHaveBeenCalledTimes(1);
 });
 
 it('routes a page failure to the footer instead of the banner', async () => {

@@ -1,4 +1,5 @@
 import type { ProtectedAssetVariant } from '@/shared/media/protectedAssetTypes';
+import { spacing } from '@/shared/theme/tokens';
 import type { TripPhotoAssetVariantName } from './types';
 
 /**
@@ -25,7 +26,7 @@ export const TRIP_PHOTO_VARIANTS: Record<TripPhotoAssetVariantName, ProtectedAss
 };
 
 /** Grid geometry. At 375 pt this yields three columns. */
-export const PHOTO_GRID_GAP = 2;
+export const PHOTO_GRID_GAP = spacing.xxs;
 export const PHOTO_GRID_TARGET_TILE_WIDTH = 110;
 export const PHOTO_GRID_MIN_COLUMNS = 3;
 

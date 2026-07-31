@@ -10,7 +10,7 @@ jest.mock('@/shared/media/AuthenticatedImage', () => {
 // eslint-disable-next-line import/first
 import { fireEvent, render, screen } from '@testing-library/react-native';
 // eslint-disable-next-line import/first
-import { useWindowDimensions } from 'react-native';
+import { StyleSheet, useWindowDimensions } from 'react-native';
 // eslint-disable-next-line import/first
 import { PHOTO_GRID_GAP, PHOTO_GRID_MIN_COLUMNS } from '../constants';
 // eslint-disable-next-line import/first
@@ -173,5 +173,12 @@ describe('PhotoGrid', () => {
     const wideTile = screen.getByTestId('authenticated-trip-photo:trip-1:p1:thumbnail').props.width;
     expect(wideTile).toBe(computePhotoGridLayout(768).tileSize);
     expect(wideTile).not.toBe(narrowTile);
+  });
+
+  it('adds the measured selection overlay height below the final row', async () => {
+    await renderGrid([photo('p1')], { bottomInset: 142 });
+
+    const style = StyleSheet.flatten(screen.getByTestId('photo-grid').props.contentContainerStyle);
+    expect(style.paddingBottom).toBeGreaterThan(142);
   });
 });

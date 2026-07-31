@@ -17,6 +17,7 @@ import {
   suspendPrivateMediaSession,
   waitForPrivateNetworkIdle,
 } from '@/shared/media/privateMediaLifecycle';
+import { registerDefaultPrivateMediaPurgers } from '@/shared/media/privateMediaPurgers';
 import { clearTokens, getRefreshToken, setAccessToken, setRefreshToken } from '@/shared/api/token-store';
 import { fetchMe, logoutRequest } from './api';
 import type { AuthResponse, AuthUser } from './types';
@@ -34,6 +35,16 @@ export interface SessionContextValue {
 
 const SessionContext = createContext<SessionContextValue | null>(null);
 
+// Expo Router evaluates photo routes lazily. Register their storage namespaces
+// from the auth root so a cold restore always purges crash-left private files.
+registerDefaultPrivateMediaPurgers();
+
+function appAllowsPrivateMedia(): boolean {
+  // iOS uses `inactive` for transient overlays such as the share sheet. Only a
+  // real background transition is a private-media boundary in this feature.
+  return AppState.currentState !== 'background';
+}
+
 export function SessionProvider({ children }: PropsWithChildren) {
   const [status, setStatus] = useState<SessionStatus>('restoring');
   const [user, setUser] = useState<AuthUser | null>(null);
@@ -45,7 +56,7 @@ export function SessionProvider({ children }: PropsWithChildren) {
       // Cleanup of private media left by a previous process runs to completion
       // before the token restore, so no protected route can render against
       // files an earlier session staged.
-      await startPrivateMediaSession();
+      await startPrivateMediaSession(appAllowsPrivateMedia());
       const access = await refreshTokens();
       if (cancelled) return;
       if (!access) {
@@ -106,7 +117,7 @@ export function SessionProvider({ children }: PropsWithChildren) {
     setAccessToken(auth.tokens.access);
     await setRefreshToken(auth.tokens.refresh);
     // A clean epoch before any protected asset can be requested.
-    await startPrivateMediaSession();
+    await startPrivateMediaSession(appAllowsPrivateMedia());
     setUser(auth.user);
     setStatus('signedIn');
   }, []);

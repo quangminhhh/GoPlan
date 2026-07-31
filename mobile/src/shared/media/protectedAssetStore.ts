@@ -28,6 +28,7 @@ import {
   ProtectedAssetError,
   type ProtectedAssetVariant,
   type ProtectedCacheBucket,
+  type ProtectedFileSink,
   type ProtectedFileStore,
   type ProtectedTransport,
 } from './protectedAssetTypes';
@@ -74,6 +75,15 @@ interface InFlightLoad {
 const entries = new Map<string, CacheEntry>();
 const inFlight = new Map<string, InFlightLoad>();
 /**
+ * Explicit invalidation is a per-key hard boundary. Session epochs protect the
+ * whole namespace, while this version prevents an older cache check or staging
+ * operation from resurrecting one photo after delete/PHOTO_NOT_FOUND removed it.
+ *
+ * Versions deliberately survive a normal purge: clearing them would create an
+ * ABA window where an old `0` becomes current `0` again in a later session.
+ */
+const assetVersions = new Map<string, number>();
+/**
  * Seeded with the production store so the very first `purgeAll()` of a process
  * finds files a previous process left behind, before anything has been staged.
  */
@@ -84,6 +94,14 @@ let clock = 0;
 function tick(): number {
   clock += 1;
   return clock;
+}
+
+function assetVersion(assetKey: string): number {
+  return assetVersions.get(assetKey) ?? 0;
+}
+
+function invalidateAssetVersion(assetKey: string): void {
+  assetVersions.set(assetKey, assetVersion(assetKey) + 1);
 }
 
 export interface AcquiredProtectedAsset {
@@ -116,23 +134,43 @@ async function evictBucket(bucket: ProtectedCacheBucket, justCommittedKey?: stri
   const limits = CACHE_LIMITS[bucket];
   const inBucket = Array.from(entries.values()).filter((entry) => entry.bucket === bucket);
 
-  let count = inBucket.length;
-  let bytes = inBucket.reduce((total, entry) => total + entry.bytes, 0);
-  if (count <= limits.maxEntries && bytes <= limits.maxBytes) {
+  const initialBytes = inBucket.reduce((total, entry) => total + entry.bytes, 0);
+  if (inBucket.length <= limits.maxEntries && initialBytes <= limits.maxBytes) {
     return;
   }
 
   const evictable = inBucket
-    .filter((entry) => entry.refCount === 0 && entry.assetKey !== justCommittedKey)
+    .filter(
+      (entry) =>
+        entry.refCount === 0 &&
+        entry.assetKey !== justCommittedKey &&
+        !inFlight.has(entry.assetKey),
+    )
     .sort((left, right) => left.lastUsedAt - right.lastUsedAt);
 
   for (const entry of evictable) {
-    if (count <= limits.maxEntries && bytes <= limits.maxBytes) {
+    const currentEntries = Array.from(entries.values()).filter(
+      (candidate) => candidate.bucket === bucket,
+    );
+    const currentBytes = currentEntries.reduce(
+      (total, candidate) => total + candidate.bytes,
+      0,
+    );
+    if (currentEntries.length <= limits.maxEntries && currentBytes <= limits.maxBytes) {
       break;
     }
+
+    // `discard()` yields. A cache hit can reserve a later candidate while an
+    // earlier file is being removed, so the snapshot above is never authority
+    // for deletion after an await.
+    if (
+      entries.get(entry.assetKey) !== entry ||
+      entry.refCount !== 0 ||
+      inFlight.has(entry.assetKey)
+    ) {
+      continue;
+    }
     entries.delete(entry.assetKey);
-    count -= 1;
-    bytes -= entry.bytes;
     await entry.store.discard(entry.uri);
   }
 }
@@ -144,44 +182,107 @@ interface StageOptions {
   transport: ProtectedTransport;
   signal: AbortSignal;
   epochAtStart: number;
+  assetVersionAtStart: number;
+}
+
+function readStreamChunk(
+  signal: AbortSignal,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (signal.aborted) {
+    return Promise.reject(createSessionClosedError());
+  }
+
+  return new Promise((resolve, reject) => {
+    const abort = (): void => {
+      reject(createSessionClosedError());
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    reader.read().then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', abort);
+    });
+  });
 }
 
 async function stageAsset(options: StageOptions): Promise<CacheEntry> {
-  const { assetKey, path, variant, transport, signal, epochAtStart } = options;
+  const {
+    assetKey,
+    path,
+    variant,
+    transport,
+    signal,
+    epochAtStart,
+    assetVersionAtStart,
+  } = options;
 
   const response = await fetchProtectedResponse({ path, signal, transport });
-
-  const contentType = response.headers.get('content-type') ?? '';
-  if (!contentType.trim().toLowerCase().startsWith('image/')) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new ProtectedAssetError('invalidContent', INVALID_CONTENT_MESSAGE, { status: response.status });
-  }
-
-  // Both checks are needed. `Content-Length` rejects an oversized body before a
-  // single byte is written; the streamed count catches a response that lies or
-  // omits the header. The caps sit above the raw-RGB size of each variant, so a
-  // legitimate asset is never rejected — only a proxy error page would be.
-  const declaredLength = Number(response.headers.get('content-length'));
-  if (Number.isFinite(declaredLength) && declaredLength > variant.maxBytes) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new ProtectedAssetError('invalidContent', INVALID_CONTENT_MESSAGE, { status: response.status });
-  }
-
   const body = response.body;
-  if (!body) {
-    throw new ProtectedAssetError('invalidContent', INVALID_CONTENT_MESSAGE, { status: response.status });
-  }
-
-  const sink = await transport.files.createSink(createOpaqueFileName(extensionForContentType(contentType)));
-  const reader = body.getReader();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let sink: ProtectedFileSink | null = null;
+  let detachAbort = (): void => {};
   let received = 0;
+  const throwIfInvalidated = (): void => {
+    if (
+      signal.aborted ||
+      getPrivateMediaEpoch() !== epochAtStart ||
+      assetVersion(assetKey) !== assetVersionAtStart ||
+      !isPrivateMediaSessionOpen()
+    ) {
+      throw createSessionClosedError();
+    }
+  };
 
   try {
+    // Own the response body before the first post-fetch boundary. If shutdown
+    // landed as the headers resolved, this catch still has something to cancel.
+    throwIfInvalidated();
+
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!contentType.trim().toLowerCase().startsWith('image/')) {
+      throw new ProtectedAssetError('invalidContent', INVALID_CONTENT_MESSAGE, {
+        status: response.status,
+      });
+    }
+
+    // Both checks are needed. `Content-Length` rejects an oversized body before
+    // a byte is written; the streamed count catches a lying/absent header.
+    const declaredLength = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > variant.maxBytes) {
+      throw new ProtectedAssetError('invalidContent', INVALID_CONTENT_MESSAGE, {
+        status: response.status,
+      });
+    }
+    if (!body) {
+      throw new ProtectedAssetError('invalidContent', INVALID_CONTENT_MESSAGE, {
+        status: response.status,
+      });
+    }
+
+    // Lock and observe the body before awaiting filesystem work. `createSink`
+    // can reject or finish after an abort; in both cases this scope still owns
+    // the reader and can cancel it, then discard any late sink it receives.
+    reader = body.getReader();
+    const ownedReader = reader;
+    const cancelReader = (): void => {
+      void ownedReader.cancel().catch(() => undefined);
+    };
+    if (signal.aborted) {
+      cancelReader();
+    } else {
+      signal.addEventListener('abort', cancelReader);
+      detachAbort = () => signal.removeEventListener('abort', cancelReader);
+    }
+    throwIfInvalidated();
+
+    sink = await transport.files.createSink(
+      createOpaqueFileName(extensionForContentType(contentType)),
+    );
+    throwIfInvalidated();
+
     for (;;) {
-      if (signal.aborted || getPrivateMediaEpoch() !== epochAtStart) {
-        throw createSessionClosedError();
-      }
-      const { done, value } = await reader.read();
+      throwIfInvalidated();
+      const { done, value } = await readStreamChunk(signal, ownedReader);
+      throwIfInvalidated();
       if (done) {
         break;
       }
@@ -193,20 +294,36 @@ async function stageAsset(options: StageOptions): Promise<CacheEntry> {
         throw new ProtectedAssetError('invalidContent', INVALID_CONTENT_MESSAGE);
       }
       await sink.write(value);
+      throwIfInvalidated();
     }
     await sink.close();
+    throwIfInvalidated();
   } catch (error) {
-    await reader.cancel().catch(() => undefined);
-    await sink.discard();
+    if (reader) {
+      await reader.cancel().catch(() => undefined);
+    } else {
+      await body?.cancel().catch(() => undefined);
+    }
+    await sink?.discard().catch(() => undefined);
     throw error;
+  } finally {
+    detachAbort();
+  }
+
+  // The successful stream path necessarily created a sink. Keep this explicit
+  // instead of asserting away the nullable ownership state above.
+  if (!sink) {
+    throw new ProtectedAssetError('server', INVALID_CONTENT_MESSAGE);
   }
 
   // Commit barrier. A completion belonging to a session that has already ended
-  // must never put private bytes back on disk, so the epoch is re-read after the
-  // last await rather than trusted from before it.
-  if (signal.aborted || getPrivateMediaEpoch() !== epochAtStart || !isPrivateMediaSessionOpen()) {
-    await sink.discard();
-    throw createSessionClosedError();
+  // or an asset explicitly invalidated must never put private bytes back on
+  // disk, so every boundary is re-read after the last await.
+  try {
+    throwIfInvalidated();
+  } catch (error) {
+    await sink.discard().catch(() => undefined);
+    throw error;
   }
 
   knownStores.add(transport.files);
@@ -221,13 +338,32 @@ async function stageAsset(options: StageOptions): Promise<CacheEntry> {
     store: transport.files,
   };
   entries.set(assetKey, entry);
-  await evictBucket(variant.bucket, assetKey);
+
+  try {
+    await evictBucket(variant.bucket, assetKey);
+    // Eviction yields. Explicit invalidation may have removed this entry and a
+    // fresh request may already have installed a replacement under the key.
+    // Never return/pin the old URI, and never delete the replacement.
+    throwIfInvalidated();
+    if (entries.get(assetKey) !== entry) {
+      throw createSessionClosedError();
+    }
+  } catch (error) {
+    if (entries.get(assetKey) === entry) {
+      entries.delete(assetKey);
+    }
+    await sink.discard().catch(() => undefined);
+    throw error;
+  }
 
   return entry;
 }
 
-function startLoad(options: Omit<StageOptions, 'signal' | 'epochAtStart'>): InFlightLoad {
+function startLoad(
+  options: Omit<StageOptions, 'signal' | 'epochAtStart' | 'assetVersionAtStart'>,
+): InFlightLoad {
   const controller = new AbortController();
+  const versionAtStart = assetVersion(options.assetKey);
   const load: InFlightLoad = {
     controller,
     waiters: 0,
@@ -239,7 +375,12 @@ function startLoad(options: Omit<StageOptions, 'signal' | 'epochAtStart'>): InFl
     const epochAtStart = getPrivateMediaEpoch();
     const linked = linkAbortSignals([controller.signal, lifecycleSignal]);
     try {
-      return await stageAsset({ ...options, signal: linked.signal, epochAtStart });
+      return await stageAsset({
+        ...options,
+        signal: linked.signal,
+        epochAtStart,
+        assetVersionAtStart: versionAtStart,
+      });
     } finally {
       linked.dispose();
     }
@@ -256,8 +397,26 @@ function startLoad(options: Omit<StageOptions, 'signal' | 'epochAtStart'>): InFl
   return load;
 }
 
-function pin(entry: CacheEntry): AcquiredProtectedAsset {
-  entry.refCount += 1;
+function assertAcquireStillCurrent(
+  assetKey: string,
+  requestEpoch: number,
+  requestAssetVersion: number,
+  signal?: AbortSignal,
+): void {
+  if (
+    signal?.aborted ||
+    !isPrivateMediaSessionOpen() ||
+    getPrivateMediaEpoch() !== requestEpoch ||
+    assetVersion(assetKey) !== requestAssetVersion
+  ) {
+    throw createSessionClosedError();
+  }
+}
+
+function pin(entry: CacheEntry, alreadyReserved = false): AcquiredProtectedAsset {
+  if (!alreadyReserved) {
+    entry.refCount += 1;
+  }
   entry.lastUsedAt = tick();
   let released = false;
 
@@ -272,6 +431,9 @@ function pin(entry: CacheEntry): AcquiredProtectedAsset {
       // Deliberately not deleted here — see the module comment. The entry simply
       // becomes eligible for LRU eviction and stays reusable until then.
       entry.lastUsedAt = tick();
+      // A bucket can exceed its caps while every entry is pinned. Releasing the
+      // last consumer is the first moment the LRU can restore the budget.
+      void evictBucket(entry.bucket).catch(() => undefined);
     },
   };
 }
@@ -293,16 +455,57 @@ export async function acquireProtectedAsset(
     throw createSessionClosedError();
   }
 
-  const cached = entries.get(assetKey);
-  if (cached) {
-    // The cache directory is reclaimable, so a registry hit is a hypothesis
-    // until the file is confirmed to still be there.
-    if (await cached.store.exists(cached.uri)) {
-      return pin(cached);
+  const requestEpoch = getPrivateMediaEpoch();
+  const requestAssetVersion = assetVersion(assetKey);
+  for (;;) {
+    assertAcquireStillCurrent(assetKey, requestEpoch, requestAssetVersion, signal);
+
+    const cached = entries.get(assetKey);
+    if (!cached) {
+      break;
     }
+
+    // The cache directory is reclaimable, so a registry hit is a hypothesis
+    // until the file is confirmed to still be there. Reserve it before the
+    // asynchronous check so a release-triggered LRU pass cannot delete the file
+    // between `exists()` and `pin()`.
+    cached.refCount += 1;
+    let exists: boolean;
+    try {
+      exists = await cached.store.exists(cached.uri);
+    } catch (error) {
+      cached.refCount = Math.max(0, cached.refCount - 1);
+      throw error;
+    }
+
+    try {
+      // A false result is just as asynchronous as a true one. Check the session
+      // and per-key boundaries before it can fall through into a fresh fetch.
+      assertAcquireStillCurrent(assetKey, requestEpoch, requestAssetVersion, signal);
+    } catch (error) {
+      cached.refCount = Math.max(0, cached.refCount - 1);
+      throw error;
+    }
+
+    // `exists()` yields. An explicit invalidation may remove this entry and a
+    // retry may commit a replacement under the same key before the check
+    // completes. Never pin the stale URI or delete the replacement.
+    if (entries.get(assetKey) !== cached) {
+      cached.refCount = Math.max(0, cached.refCount - 1);
+      continue;
+    }
+
+    if (exists) {
+      return pin(cached, true);
+    }
+    cached.refCount = Math.max(0, cached.refCount - 1);
+    // No await separates the identity check above from this delete.
     entries.delete(assetKey);
+    // Loop through the boundary again before a missing cache entry can start a
+    // network load. A concurrent waiter may also have installed a replacement.
   }
 
+  assertAcquireStillCurrent(assetKey, requestEpoch, requestAssetVersion, signal);
   let load = inFlight.get(assetKey);
   if (!load) {
     load = startLoad({ assetKey, path, variant, transport });
@@ -322,6 +525,10 @@ export async function acquireProtectedAsset(
 
   try {
     const entry = await Promise.race([load.promise, cancellation]);
+    assertAcquireStillCurrent(assetKey, requestEpoch, requestAssetVersion, signal);
+    if (entries.get(assetKey) !== entry) {
+      throw createSessionClosedError();
+    }
     return pin(entry);
   } finally {
     detachAbort();
@@ -348,6 +555,7 @@ async function dropEntry(entry: CacheEntry): Promise<void> {
  * longer exists on the server is exactly wrong.
  */
 export async function invalidateProtectedAsset(assetKey: string): Promise<void> {
+  invalidateAssetVersion(assetKey);
   const load = inFlight.get(assetKey);
   if (load) {
     inFlight.delete(assetKey);
@@ -364,14 +572,29 @@ export async function invalidateProtectedAsset(assetKey: string): Promise<void> 
  * used when membership is lost (`TRIP_NOT_FOUND`).
  */
 export async function invalidateProtectedAssets(prefix: string): Promise<void> {
-  for (const [assetKey, load] of Array.from(inFlight.entries())) {
+  const matchingKeys = new Set<string>();
+  for (const assetKey of inFlight.keys()) {
     if (assetKey.startsWith(prefix)) {
+      matchingKeys.add(assetKey);
+    }
+  }
+  for (const assetKey of entries.keys()) {
+    if (assetKey.startsWith(prefix)) {
+      matchingKeys.add(assetKey);
+    }
+  }
+  for (const assetKey of matchingKeys) {
+    invalidateAssetVersion(assetKey);
+  }
+
+  for (const [assetKey, load] of Array.from(inFlight.entries())) {
+    if (matchingKeys.has(assetKey)) {
       inFlight.delete(assetKey);
       load.controller.abort();
     }
   }
   for (const entry of Array.from(entries.values())) {
-    if (entry.assetKey.startsWith(prefix)) {
+    if (matchingKeys.has(entry.assetKey)) {
       await dropEntry(entry);
     }
   }
@@ -395,6 +618,7 @@ registerPrivateMediaPurger('protected-assets', purgeProtectedAssets);
 export function __resetProtectedAssetStoreForTests(): void {
   entries.clear();
   inFlight.clear();
+  assetVersions.clear();
   knownStores.clear();
   knownStores.add(nativeProtectedFileStore);
   clock = 0;

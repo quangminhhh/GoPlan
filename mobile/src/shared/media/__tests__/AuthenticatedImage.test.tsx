@@ -108,6 +108,32 @@ describe('rendering', () => {
     expect(image.props.accessibilityLabel).toBe('Open photo uploaded by Mai');
   });
 
+  it('uses a caller-supplied background for contain letterboxing and loading', async () => {
+    const gate = createDeferred<void>();
+    const transport = createFakeTransport(async () => {
+      await gate.promise;
+      return imageResponse([bytes(16)]).response;
+    });
+
+    await renderImage(transport, { backgroundColor: '#000000', contentFit: 'contain' });
+
+    const placeholder = await screen.findByTestId(
+      `authenticated-image-placeholder-${ASSET_KEY}`,
+    );
+    expect(placeholder.props.style).toEqual(
+      expect.arrayContaining([expect.objectContaining({ backgroundColor: '#000000' })]),
+    );
+
+    await act(async () => {
+      gate.resolve();
+    });
+
+    const image = await screen.findByTestId(`authenticated-image-${ASSET_KEY}`);
+    expect(image.props.style).toEqual(
+      expect.arrayContaining([expect.objectContaining({ backgroundColor: '#000000' })]),
+    );
+  });
+
   it('never uses a persistent disk cache for member-only content (D3)', async () => {
     const transport = createFakeTransport(() => imageResponse([bytes(16)]).response);
 

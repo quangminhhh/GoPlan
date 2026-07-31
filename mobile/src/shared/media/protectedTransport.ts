@@ -116,12 +116,22 @@ export function createNativeFileStore(namespace: string): ProtectedFileStore {
 
   return {
     async createSink(fileName: string): Promise<ProtectedFileSink> {
-      const file = new File(directory(), fileName);
-      if (file.exists) {
-        file.delete();
+      let file: File | null = null;
+      try {
+        file = new File(directory(), fileName);
+        if (file.exists) {
+          file.delete();
+        }
+        file.create();
+        return new NativeFileSink(file);
+      } catch (error) {
+        // No URI has reached the caller, so only the store can clean up a file
+        // created before writableStream()/getWriter() rejected.
+        if (file) {
+          await deleteQuietly(file.uri);
+        }
+        throw error;
       }
-      file.create();
-      return new NativeFileSink(file);
     },
 
     async exists(uri: string): Promise<boolean> {

@@ -11,7 +11,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { PHOTO_BULK_DOWNLOAD_MAX_SELECTION } from '../constants';
 import { downloadAndShareTripPhotoArchive, type NativePhotoActions } from '../downloads';
-import { PHOTO_ERROR_MESSAGES, type PhotoFailure } from '../errors';
+import {
+  isCancelledFailure,
+  PHOTO_ERROR_MESSAGES,
+  toPhotoFailure,
+  type PhotoFailure,
+} from '../errors';
 import type { TripPhoto } from '../types';
 
 export type SelectionDownloadState =
@@ -19,6 +24,9 @@ export type SelectionDownloadState =
   | { status: 'downloading'; bytesWritten: number; totalBytes: number | null }
   | { status: 'message'; message: string }
   | { status: 'error'; failure: PhotoFailure };
+
+/** Caps React updates during a chunk-heavy ZIP stream at roughly 10 fps. */
+export const DOWNLOAD_PROGRESS_UPDATE_INTERVAL_MS = 100;
 
 export interface UsePhotoSelectionOptions {
   tripId: string;
@@ -60,6 +68,7 @@ export function usePhotoSelection({
   const [requestsUsed, setRequestsUsed] = useState(0);
   const controllerRef = useRef<AbortController | null>(null);
   const downloadingRef = useRef(false);
+  const lastProgressAtRef = useRef(Number.NEGATIVE_INFINITY);
 
   useEffect(
     () => () => {
@@ -78,10 +87,16 @@ export function usePhotoSelection({
   }, []);
 
   const clear = useCallback(() => {
+    if (downloadingRef.current) {
+      return;
+    }
     setSelected(new Set());
   }, []);
 
   const toggle = useCallback((photoId: string) => {
+    if (downloadingRef.current) {
+      return;
+    }
     setSelected((current) => {
       const next = new Set(current);
       if (next.has(photoId)) {
@@ -95,11 +110,18 @@ export function usePhotoSelection({
       next.add(photoId);
       return next;
     });
-    setDownload((current) => (current.status === 'idle' ? current : { status: 'idle' }));
+    setDownload((current) =>
+      current.status === 'downloading' || current.status === 'idle'
+        ? current
+        : { status: 'idle' },
+    );
   }, []);
 
   const enterSelection = useCallback(
     (photoId: string) => {
+      if (downloadingRef.current) {
+        return;
+      }
       setSelectionMode(true);
       setSelected(new Set([photoId]));
       setDownload({ status: 'idle' });
@@ -114,6 +136,9 @@ export function usePhotoSelection({
    * "Select loaded" while more pages remain, so nothing implies otherwise.
    */
   const selectLoaded = useCallback(() => {
+    if (downloadingRef.current) {
+      return;
+    }
     setSelected(new Set(photos.slice(0, PHOTO_BULK_DOWNLOAD_MAX_SELECTION).map((photo) => photo.id)));
   }, [photos]);
 
@@ -125,6 +150,20 @@ export function usePhotoSelection({
     setDownload({ status: 'idle' });
   }, []);
 
+  const publishProgress = useCallback((bytesWritten: number, totalBytes: number | null) => {
+    // An archive without Content-Length has indeterminate UI, so publishing
+    // each byte would only re-render identical copy.
+    if (totalBytes === null) {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastProgressAtRef.current < DOWNLOAD_PROGRESS_UPDATE_INTERVAL_MS) {
+      return;
+    }
+    lastProgressAtRef.current = now;
+    setDownload({ status: 'downloading', bytesWritten, totalBytes });
+  }, []);
+
   const startDownload = useCallback(async () => {
     const photoIds = Array.from(selected);
     if (photoIds.length === 0 || downloadingRef.current) {
@@ -134,6 +173,7 @@ export function usePhotoSelection({
     downloadingRef.current = true;
     const controller = new AbortController();
     controllerRef.current = controller;
+    lastProgressAtRef.current = Number.NEGATIVE_INFINITY;
     setDownload({ status: 'downloading', bytesWritten: 0, totalBytes: null });
     setRequestsUsed((current) => current + 1);
 
@@ -143,8 +183,7 @@ export function usePhotoSelection({
         photoIds,
         signal: controller.signal,
         ...(native ? { native } : {}),
-        onProgress: (bytesWritten, totalBytes) =>
-          setDownload({ status: 'downloading', bytesWritten, totalBytes }),
+        onProgress: publishProgress,
       });
 
       if (outcome.status === 'shared') {
@@ -176,6 +215,9 @@ export function usePhotoSelection({
         setDownload({ status: 'message', message: PHOTO_ERROR_MESSAGES.bulkStale });
         try {
           await reconcile();
+        } catch {
+          // The bulk 404 is already authoritative. A follow-up list failure
+          // must not replace the useful stale-selection message.
         } finally {
           setSelected(new Set());
           setSelectionMode(false);
@@ -193,11 +235,23 @@ export function usePhotoSelection({
 
       // Everything else keeps the selection so the user can retry deliberately.
       setDownload({ status: 'error', failure: outcome.failure });
+    } catch (caught) {
+      const failure = toPhotoFailure(caught);
+      if (isCancelledFailure(failure)) {
+        setDownload({ status: 'idle' });
+      } else if (failure.kind === 'notFound') {
+        onTripNotFound(failure);
+        setSelected(new Set());
+        setSelectionMode(false);
+        setDownload({ status: 'idle' });
+      } else {
+        setDownload({ status: 'error', failure });
+      }
     } finally {
       downloadingRef.current = false;
       controllerRef.current = null;
     }
-  }, [selected, tripId, native, reconcile, onTripNotFound]);
+  }, [selected, tripId, native, reconcile, onTripNotFound, publishProgress]);
 
   return {
     selectionMode,

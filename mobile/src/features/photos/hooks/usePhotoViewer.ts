@@ -201,11 +201,6 @@ export function usePhotoViewer({
         tripId,
         photoId: photo.id,
         ...(native ? { native } : {}),
-        onProgress: (bytesWritten) => {
-          if (mountedRef.current) {
-            setAction({ status: 'saving', bytesWritten });
-          }
-        },
       });
 
       if (!mountedRef.current) {
@@ -228,6 +223,28 @@ export function usePhotoViewer({
       }
 
       const { failure } = outcome;
+      if (isCancelledFailure(failure)) {
+        setAction({ status: 'idle' });
+        return;
+      }
+      if (failure.kind === 'notFound') {
+        onAssetNotFound(photo.id, failure);
+        setOpenPhotoId(null);
+        setAction({ status: 'idle' });
+        return;
+      }
+      setAction({
+        status: 'error',
+        failure:
+          failure.kind === 'throttled'
+            ? { ...failure, message: PHOTO_ERROR_MESSAGES.downloadThrottled }
+            : failure,
+      });
+    } catch (caught) {
+      if (!mountedRef.current) {
+        return;
+      }
+      const failure = toPhotoFailure(caught);
       if (isCancelledFailure(failure)) {
         setAction({ status: 'idle' });
         return;

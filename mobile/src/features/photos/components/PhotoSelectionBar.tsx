@@ -1,5 +1,11 @@
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import {
+  ActivityIndicator,
+  type LayoutChangeEvent,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import { colors, spacing, typography } from '@/shared/theme/tokens';
 import { PHOTO_BULK_DOWNLOAD_MAX_SELECTION } from '../constants';
 import type { SelectionDownloadState } from '../hooks/usePhotoSelection';
@@ -14,6 +20,7 @@ interface PhotoSelectionBarProps {
   onExit: () => void;
   onDownload: () => void;
   onCancelDownload: () => void;
+  onHeightChange?: (height: number) => void;
 }
 
 function progressLabel(download: SelectionDownloadState): string | null {
@@ -38,15 +45,16 @@ export function PhotoSelectionBar({
   onExit,
   onDownload,
   onCancelDownload,
+  onHeightChange,
 }: PhotoSelectionBarProps) {
-  const insets = useSafeAreaInsets();
   const downloading = download.status === 'downloading';
   const progress = progressLabel(download);
   const atCap = selectedCount >= PHOTO_BULK_DOWNLOAD_MAX_SELECTION;
 
   return (
     <View
-      style={[styles.bar, { paddingBottom: insets.bottom + spacing.sm }]}
+      style={styles.bar}
+      onLayout={(event: LayoutChangeEvent) => onHeightChange?.(event.nativeEvent.layout.height)}
       testID="photo-selection-bar"
     >
       {download.status === 'message' || download.status === 'error' ? (
@@ -83,10 +91,14 @@ export function PhotoSelectionBar({
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={hasNextPage ? 'Select loaded photos' : 'Select all photos'}
+          accessibilityState={{ disabled: downloading }}
+          disabled={downloading}
           onPress={onSelectLoaded}
           style={styles.action}
         >
-          <Text style={styles.actionText}>{hasNextPage ? 'Select loaded' : 'Select all'}</Text>
+          <Text style={[styles.actionText, downloading && styles.disabled]}>
+            {hasNextPage ? 'Select loaded' : 'Select all'}
+          </Text>
         </Pressable>
       </View>
 
@@ -94,12 +106,19 @@ export function PhotoSelectionBar({
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Clear selection"
-          accessibilityState={{ disabled: selectedCount === 0 }}
-          disabled={selectedCount === 0}
+          accessibilityState={{ disabled: selectedCount === 0 || downloading }}
+          disabled={selectedCount === 0 || downloading}
           onPress={onClear}
           style={styles.action}
         >
-          <Text style={[styles.actionText, selectedCount === 0 && styles.disabled]}>Clear</Text>
+          <Text
+            style={[
+              styles.actionText,
+              (selectedCount === 0 || downloading) && styles.disabled,
+            ]}
+          >
+            Clear
+          </Text>
         </Pressable>
 
         {downloading ? (
@@ -144,6 +163,7 @@ const styles = StyleSheet.create({
     gap: spacing.xs,
     left: 0,
     paddingHorizontal: spacing.lg,
+    paddingBottom: spacing.sm,
     paddingTop: spacing.sm,
     position: 'absolute',
     right: 0,

@@ -22,11 +22,11 @@ import {
 } from 'react-native';
 import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
 import { runOnJS } from 'react-native-reanimated';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { AuthenticatedImage } from '@/shared/media/AuthenticatedImage';
 import type { ProtectedAssetError } from '@/shared/media/protectedAssetTypes';
-import { colors, spacing, typography } from '@/shared/theme/tokens';
+import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
 import { tripPhotoAssetKey, tripPhotoAssetPath } from '../api';
 import { TRIP_PHOTO_VARIANTS } from '../constants';
 import { toPhotoFailure, type PhotoFailure } from '../errors';
@@ -40,6 +40,14 @@ export const DISMISS_TRANSLATION = 120;
 
 export function photoViewerPageKey(photoId: string, currentPhotoId: string): string {
   return `${photoId}:${photoId === currentPhotoId ? 'active' : 'neighbour'}`;
+}
+
+export function zoomChangeHandlerForPage(
+  photoId: string,
+  currentPhotoId: string,
+  handler: (zoomed: boolean) => void,
+): ((zoomed: boolean) => void) | undefined {
+  return photoId === currentPhotoId ? handler : undefined;
 }
 
 interface PhotoViewerProps {
@@ -87,6 +95,7 @@ export function PhotoViewer({
   onAssetNotFound,
 }: PhotoViewerProps) {
   const { width, height } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
   const [zoomed, setZoomed] = useState(false);
   const scrollRef = useRef<ScrollView>(null);
   // Putting the native ScrollView recognizer into RNGH's relation graph lets
@@ -178,9 +187,15 @@ export function PhotoViewer({
                     photoId={item.id}
                     width={width}
                     height={height}
+                    sourceWidth={item.medium_width}
+                    sourceHeight={item.medium_height}
                     zoomed={zoomed && item.id === currentPhoto.id}
                     pagerGesture={pagerGesture}
-                    onZoomChange={setZoomed}
+                    onZoomChange={zoomChangeHandlerForPage(
+                      item.id,
+                      currentPhoto.id,
+                      setZoomed,
+                    )}
                   >
                     <AuthenticatedImage
                       assetKey={tripPhotoAssetKey(tripId, item.id, 'medium')}
@@ -189,6 +204,7 @@ export function PhotoViewer({
                       width={width}
                       height={height}
                       contentFit="contain"
+                      backgroundColor={colors.viewerBackground}
                       accessibilityLabel={`Photo uploaded by ${item.uploaded_by.display_name}`}
                       sourceWidth={item.medium_width}
                       sourceHeight={item.medium_height}
@@ -200,7 +216,11 @@ export function PhotoViewer({
             </ScrollView>
           </GestureDetector>
 
-          <View style={styles.topBar} pointerEvents="box-none">
+          <View
+            style={[styles.topBar, { top: insets.top }]}
+            pointerEvents="box-none"
+            testID="photo-viewer-top-bar"
+          >
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Close photo"
@@ -218,7 +238,11 @@ export function PhotoViewer({
             </Text>
           </View>
 
-          <View style={styles.bottomBar} pointerEvents="box-none">
+          <View
+            style={[styles.bottomBar, { bottom: insets.bottom }]}
+            pointerEvents="box-none"
+            testID="photo-viewer-bottom-bar"
+          >
             <View style={styles.metadata}>
               <Text style={styles.uploader}>
                 {currentPhoto.uploaded_by.display_name}
@@ -314,7 +338,7 @@ export function PhotoViewer({
 }
 
 const styles = StyleSheet.create({
-  root: { backgroundColor: '#000000', flex: 1 },
+  root: { backgroundColor: colors.viewerBackground, flex: 1 },
   topBar: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -323,10 +347,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
     position: 'absolute',
     right: 0,
-    top: 0,
   },
   bottomBar: {
-    bottom: 0,
     gap: spacing.sm,
     left: 0,
     paddingHorizontal: spacing.md,
@@ -334,7 +356,7 @@ const styles = StyleSheet.create({
     position: 'absolute',
     right: 0,
   },
-  metadata: { gap: 2 },
+  metadata: { gap: spacing.xxs },
   uploader: { ...typography.label, color: colors.background },
   captured: { ...typography.caption, color: colors.border },
   pageLabel: { ...typography.caption, color: colors.background },
@@ -348,13 +370,13 @@ const styles = StyleSheet.create({
     right: 0,
     top: 0,
     alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.4)',
+    backgroundColor: colors.mediaBusyOverlay,
     justifyContent: 'center',
   },
   toast: {
     backgroundColor: colors.text,
-    borderRadius: 10,
-    bottom: 120,
+    borderRadius: radii.md,
+    bottom: spacing.xl * 4,
     marginHorizontal: spacing.lg,
     padding: spacing.md,
     position: 'absolute',

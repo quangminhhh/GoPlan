@@ -34,10 +34,23 @@ const generationListeners = new Set<() => void>();
 let sessionActive = false;
 let acquisitionOpen = false;
 let sessionEpoch = 0;
+/** Invalidates stale async start/resume continuations across foreground/session ABA transitions. */
+let activationVersion = 0;
 let generation = 0;
 let transferLeases = 0;
 let purgeDeferred = false;
 let purgeTail: Promise<void> = Promise.resolve();
+/**
+ * Moves synchronously whenever work is appended to `purgeTail`.
+ *
+ * Promise settlement alone is not a sufficient hand-off barrier: another
+ * microtask can enqueue cleanup after `flushPrivateMediaPurge()` has observed a
+ * settled tail but before an awaiting start/resume continuation runs. Openers
+ * compare this revision immediately before opening the gate, closing that gap.
+ */
+let purgeRevision = 0;
+/** Last AppState intent, including events that arrive while startup purge runs. */
+let foregroundDesired = true;
 
 /**
  * Registered at module scope by each namespace owner. Keeping the list here
@@ -224,7 +237,14 @@ export function acquirePrivateTransferLease(): () => void {
     released = true;
     transferLeases -= 1;
     if (transferLeases === 0 && purgeDeferred) {
-      runInvalidationFrontHalf();
+      if (sessionActive && foregroundDesired) {
+        // Foreground intent wins even when the async resume continuation has not
+        // run yet. A later suspend flips `foregroundDesired` back to false, so a
+        // lease released for the genuinely backgrounded state still purges.
+        purgeDeferred = false;
+      } else {
+        runInvalidationFrontHalf();
+      }
     }
   };
 }
@@ -245,6 +265,7 @@ async function runAllPurgers(): Promise<void> {
 }
 
 function enqueuePurge(): Promise<void> {
+  purgeRevision += 1;
   const queued = purgeTail.then(runAllPurgers, runAllPurgers);
   purgeTail = queued;
   return queued;
@@ -293,6 +314,7 @@ function runInvalidationFrontHalf(): void {
  * then awaits `waitForPrivateNetworkIdle()` before reading the refresh token.
  */
 export function beginPrivateMediaShutdown(): void {
+  activationVersion += 1;
   sessionActive = false;
   runInvalidationFrontHalf();
 }
@@ -305,21 +327,55 @@ export async function endPrivateMediaSession(): Promise<void> {
 }
 
 /**
+ * Opens only from the latest foreground/session activation and only after a
+ * stable purge-tail hand-off.
+ *
+ * `flushPrivateMediaPurge()` follows work appended while it is awaiting, but an
+ * enqueue can still land after that function's final tail comparison and before
+ * this continuation resumes. The revision comparison catches exactly that
+ * microtask window. No await separates the final comparison from opening the
+ * gate, so cleanup cannot be appended between the check and the state change.
+ */
+async function openAfterStablePurge(activationAtStart: number): Promise<void> {
+  for (;;) {
+    const revisionBeforeDrain = purgeRevision;
+    await flushPrivateMediaPurge();
+
+    if (
+      activationVersion !== activationAtStart ||
+      !sessionActive ||
+      !foregroundDesired
+    ) {
+      return;
+    }
+    if (revisionBeforeDrain !== purgeRevision) {
+      continue;
+    }
+
+    purgeDeferred = false;
+    acquisitionOpen = true;
+    publishGeneration();
+    return;
+  }
+}
+
+/**
  * Opens a clean session. Cleanup owned by any previous session is drained first
  * and this session's own purge is awaited second, so the gate only opens once
  * the staging namespaces are known to be empty.
  */
-export async function startPrivateMediaSession(): Promise<void> {
+export async function startPrivateMediaSession(startInForeground = true): Promise<void> {
+  const activationAtStart = ++activationVersion;
   sessionActive = true;
   acquisitionOpen = false;
-  await flushPrivateMediaPurge();
-  await enqueuePurge();
-  if (!sessionActive) {
-    // Sign-out landed while the purge ran. Leave the gate shut.
-    return;
-  }
-  acquisitionOpen = true;
-  publishGeneration();
+  foregroundDesired = startInForeground;
+
+  // Append this session's cleanup before the first await. AppState can deliver a
+  // suspend followed by a resume in the same turn; if enqueueing happened after
+  // an initial flush, that resume could otherwise open on the old settled tail
+  // while this purge was only just being appended.
+  void enqueuePurge();
+  await openAfterStablePurge(activationAtStart);
 }
 
 /**
@@ -327,6 +383,8 @@ export async function startPrivateMediaSession(): Promise<void> {
  * runs now or waits depends on an active transfer holding files it still needs.
  */
 export function suspendPrivateMediaSession(): void {
+  foregroundDesired = false;
+  activationVersion += 1;
   if (!sessionActive || !acquisitionOpen) {
     return;
   }
@@ -344,23 +402,12 @@ export function suspendPrivateMediaSession(): void {
  * able to issue a request in the window between those steps.
  */
 export async function resumePrivateMediaSession(): Promise<void> {
+  foregroundDesired = true;
   if (!sessionActive || acquisitionOpen) {
     return;
   }
-  await flushPrivateMediaPurge();
-  if (!sessionActive || acquisitionOpen) {
-    return;
-  }
-  // The app can return to the foreground while a transfer that deferred the
-  // background purge is still alive (for example, while an iOS share sheet is
-  // open). In that case no invalidation front half ever ran: the epoch is still
-  // current and the files still belong to this session. Cancel the deferred
-  // purge before reopening, otherwise releasing the lease later would
-  // unexpectedly close a foreground session with no subsequent AppState event
-  // available to reopen it.
-  purgeDeferred = false;
-  acquisitionOpen = true;
-  publishGeneration();
+  const activationAtStart = ++activationVersion;
+  await openAfterStablePurge(activationAtStart);
 }
 
 /**
@@ -374,8 +421,21 @@ export function __resetPrivateMediaLifecycleForTests(): void {
   sessionActive = false;
   acquisitionOpen = false;
   sessionEpoch = 0;
+  activationVersion = 0;
   generation = 0;
   transferLeases = 0;
   purgeDeferred = false;
   purgeTail = Promise.resolve();
+  purgeRevision = 0;
+  foregroundDesired = true;
+}
+
+/** Test-only registry view for cold-start bootstrap coverage. */
+export function __getPrivateMediaPurgerNamesForTests(): PrivateMediaPurgerName[] {
+  return Array.from(purgers.keys());
+}
+
+/** Test-only isolation helper; production registration is process-lifetime. */
+export function __clearPrivateMediaPurgersForTests(): void {
+  purgers.clear();
 }

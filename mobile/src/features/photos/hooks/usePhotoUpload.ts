@@ -10,7 +10,10 @@ import { AppState, type AppStateStatus } from 'react-native';
 import { nativeImageCodec } from '@/shared/media/imageCodec';
 import { pickImages } from '@/shared/media/pickImage';
 import { preprocessImage } from '@/shared/media/preprocessImage';
-import { acquirePrivateTransferLease } from '@/shared/media/privateMediaLifecycle';
+import {
+  acquirePrivateTransferLease,
+  trackPrivateRequest,
+} from '@/shared/media/privateMediaLifecycle';
 import {
   adoptUploadTempFile,
   discardUploadTempFile,
@@ -22,6 +25,11 @@ import {
   type UploadSessionController,
   type UploadSnapshot,
 } from '../uploadSession';
+import {
+  isCancelledFailure,
+  toPhotoFailure,
+  type PhotoFailure,
+} from '../errors';
 import type { TripPhoto } from '../types';
 
 export interface UsePhotoUploadOptions {
@@ -36,7 +44,9 @@ export interface UsePhotoUploadResult {
   /** True while the sheet should be on screen. */
   isOpen: boolean;
   picking: boolean;
+  pickFailure: PhotoFailure | null;
   pick: () => Promise<void>;
+  dismissPickFailure: () => void;
   start: () => void;
   stop: () => void;
   close: () => Promise<void>;
@@ -50,6 +60,7 @@ export function usePhotoUpload({
 }: UsePhotoUploadOptions): UsePhotoUploadResult {
   const [snapshot, setSnapshot] = useState<UploadSnapshot | null>(null);
   const [picking, setPicking] = useState(false);
+  const [pickFailure, setPickFailure] = useState<PhotoFailure | null>(null);
   const sessionRef = useRef<UploadSessionController | null>(null);
   const mountedRef = useRef(true);
   /** Guards a double tap on Start from running the pipeline twice. */
@@ -59,7 +70,7 @@ export function usePhotoUpload({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      void sessionRef.current?.cancel();
+      void sessionRef.current?.cancel().catch(() => undefined);
     };
   }, []);
 
@@ -74,6 +85,7 @@ export function usePhotoUpload({
       return;
     }
     setPicking(true);
+    setPickFailure(null);
     try {
       const outcome = await pickImages();
       if (!mountedRef.current || outcome.status === 'cancelled') {
@@ -87,11 +99,12 @@ export function usePhotoUpload({
           adopt: (input) => adoptUploadTempFile(input),
           discardTemp: (uri) => discardUploadTempFile(uri),
           discardEncoderOutput: (uri) => nativeImageCodec.discard(uri),
-          uploadBatch: (files, onProgress) =>
+          uploadBatch: (files, onProgress, signal) =>
             uploadTripPhotoBatch(
               tripId,
               files.map((file) => ({ uri: file.uri, name: file.name, type: file.type })),
               {
+                signal,
                 onUploadProgress: (event) => onProgress(event.loaded, event.total ?? null),
               },
             ),
@@ -105,6 +118,10 @@ export function usePhotoUpload({
       );
       sessionRef.current = session;
       publish(session.snapshot());
+    } catch (caught) {
+      if (mountedRef.current) {
+        setPickFailure(toPhotoFailure(caught));
+      }
     } finally {
       if (mountedRef.current) {
         setPicking(false);
@@ -119,8 +136,16 @@ export function usePhotoUpload({
       return;
     }
     runningRef.current = true;
-    void session
-      .start()
+    void trackPrivateRequest(undefined, (signal) => session.start(signal))
+      .catch((caught) => {
+        if (isCancelledFailure(toPhotoFailure(caught))) {
+          // Foreground intent and the lifecycle gate settle asynchronously. A
+          // fast Resume tap can arrive while cleanup still owns the gate; that
+          // is retryable and must not terminal-cancel the upload session.
+          return;
+        }
+        return session.cancel().catch(() => undefined);
+      })
       .finally(() => {
         runningRef.current = false;
       });
@@ -130,12 +155,19 @@ export function usePhotoUpload({
     sessionRef.current?.requestStop();
   }, []);
 
+  const dismissPickFailure = useCallback(() => {
+    setPickFailure(null);
+  }, []);
+
   const close = useCallback(async () => {
     const session = sessionRef.current;
     sessionRef.current = null;
-    await session?.cancel();
-    if (mountedRef.current) {
-      setSnapshot(null);
+    try {
+      await session?.cancel();
+    } finally {
+      if (mountedRef.current) {
+        setSnapshot(null);
+      }
     }
   }, []);
 
@@ -146,7 +178,7 @@ export function usePhotoUpload({
    */
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (state: AppStateStatus) => {
-      if (state !== 'active') {
+      if (state === 'background') {
         sessionRef.current?.requestPause();
       }
     });
@@ -157,7 +189,9 @@ export function usePhotoUpload({
     snapshot,
     isOpen: snapshot !== null,
     picking,
+    pickFailure,
     pick,
+    dismissPickFailure,
     start,
     stop,
     close,

@@ -18,14 +18,19 @@ jest.mock('@/shared/media/AuthenticatedImage', () => {
   const { createElement } = jest.requireActual('react');
   return {
     AuthenticatedImage: (props: Record<string, unknown>) =>
-      createElement(View, { testID: `authenticated-${String(props.assetKey)}` }),
+      createElement(View, {
+        backgroundColor: props.backgroundColor,
+        testID: `authenticated-${String(props.assetKey)}`,
+      }),
   };
 });
 
 // eslint-disable-next-line import/first
 import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react-native';
 // eslint-disable-next-line import/first
-import { Alert } from 'react-native';
+import { Alert, StyleSheet } from 'react-native';
+// eslint-disable-next-line import/first
+import { SafeAreaProvider, type EdgeInsets } from 'react-native-safe-area-context';
 // eslint-disable-next-line import/first
 import { State } from 'react-native-gesture-handler';
 // eslint-disable-next-line import/first
@@ -40,6 +45,7 @@ import {
   formatCapturedAt,
   photoViewerPageKey,
   PhotoViewer,
+  zoomChangeHandlerForPage,
 } from '../components/PhotoViewer';
 // eslint-disable-next-line import/first
 import { usePhotoViewer, VIEWER_PREFETCH_THRESHOLD } from '../hooks/usePhotoViewer';
@@ -80,10 +86,13 @@ function networkFailure(): AxiosError {
 
 const noop = () => undefined;
 
-function renderViewer(overrides: Record<string, unknown> = {}) {
+function renderViewer(
+  overrides: Record<string, unknown> = {},
+  safeAreaInsets: EdgeInsets = { top: 0, bottom: 0, left: 0, right: 0 },
+) {
   const photos = (overrides.photos as TripPhoto[]) ?? [photo('p1'), photo('p2'), photo('p3')];
   const currentIndex = (overrides.currentIndex as number) ?? 0;
-  return render(
+  const viewer = (
     <PhotoViewer
       tripId="trip-1"
       photos={photos}
@@ -98,7 +107,17 @@ function renderViewer(overrides: Record<string, unknown> = {}) {
       onDismissAction={noop}
       onAssetNotFound={noop}
       {...overrides}
-    />,
+    />
+  );
+  return render(
+    <SafeAreaProvider
+      initialMetrics={{
+        frame: { x: 0, y: 0, width: 430, height: 932 },
+        insets: safeAreaInsets,
+      }}
+    >
+      {viewer}
+    </SafeAreaProvider>,
   );
 }
 
@@ -139,6 +158,14 @@ describe('PhotoViewer rendering', () => {
     expect(screen.queryByTestId('zoomable-photo-p5')).toBeNull();
   });
 
+  it('lets only the active page control shared zoom state', () => {
+    const handler = jest.fn();
+
+    expect(zoomChangeHandlerForPage('p2', 'p2', handler)).toBe(handler);
+    expect(zoomChangeHandlerForPage('p1', 'p2', handler)).toBeUndefined();
+    expect(zoomChangeHandlerForPage('p3', 'p2', handler)).toBeUndefined();
+  });
+
   it('dismisses after a downward pager pan crosses the threshold', async () => {
     const onClose = jest.fn();
     await renderViewer({ onClose });
@@ -159,6 +186,23 @@ describe('PhotoViewer rendering', () => {
 
     expect(screen.getByTestId('authenticated-trip-photo:trip-1:p1:medium')).toBeTruthy();
     expect(screen.queryByTestId('authenticated-trip-photo:trip-1:p1:thumbnail')).toBeNull();
+  });
+
+  it('keeps contain letterboxing dark so the white viewer controls remain visible', async () => {
+    await renderViewer();
+
+    expect(
+      screen.getByTestId('authenticated-trip-photo:trip-1:p1:medium').props.backgroundColor,
+    ).toBe('#000000');
+  });
+
+  it('keeps absolute controls outside the status bar and home indicator', async () => {
+    await renderViewer({}, { top: 59, bottom: 34, left: 0, right: 0 });
+
+    expect(StyleSheet.flatten(screen.getByTestId('photo-viewer-top-bar').props.style).top).toBe(59);
+    expect(StyleSheet.flatten(screen.getByTestId('photo-viewer-bottom-bar').props.style).bottom).toBe(
+      34,
+    );
   });
 
   it('shows uploader, tag and a localised date', async () => {
@@ -449,6 +493,30 @@ describe('usePhotoViewer save', () => {
       expect.objectContaining({ errorCode: 'PHOTO_NOT_FOUND' }),
     );
     expect(result.current.openPhotoId).toBeNull();
+  });
+
+  it('maps an unexpected native rejection and unlocks Save for a retry', async () => {
+    mockSaveTripPhotoToLibrary
+      .mockRejectedValueOnce(new Error('native bridge failed'))
+      .mockResolvedValueOnce({ status: 'saved' });
+    const { result } = await renderHook(() => usePhotoViewer(hookOptions()));
+    await act(async () => {
+      result.current.open('p1');
+    });
+
+    await act(async () => {
+      await result.current.save();
+    });
+    expect(result.current.action).toMatchObject({
+      status: 'error',
+      failure: { kind: 'server' },
+    });
+
+    await act(async () => {
+      await result.current.save();
+    });
+    expect(result.current.action).toEqual({ status: 'message', message: 'Saved to Photos.' });
+    expect(mockSaveTripPhotoToLibrary).toHaveBeenCalledTimes(2);
   });
 });
 

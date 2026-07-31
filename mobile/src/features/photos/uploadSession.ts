@@ -15,6 +15,10 @@
 import type { PickedImage, PreprocessedImage, PreprocessTarget } from '@/shared/media/types';
 import { ImagePreprocessError } from '@/shared/media/types';
 import {
+  createSessionClosedError,
+  linkAbortSignals,
+} from '@/shared/media/privateMediaLifecycle';
+import {
   addToBatch,
   emptyBatch,
   isUnsendableAlone,
@@ -78,6 +82,7 @@ export interface UploadSessionDeps {
   uploadBatch: (
     files: PreparedUpload[],
     onProgress: (loaded: number, total: number | null) => void,
+    signal?: AbortSignal,
   ) => Promise<TripPhoto[]>;
   availableBytes: () => number | null;
   /** Defers a background purge for as long as the session owns temp files. */
@@ -100,10 +105,15 @@ interface SourceEntry {
   item: UploadItem;
 }
 
+interface ActiveRun {
+  controller: AbortController;
+  promise: Promise<void>;
+}
+
 export interface UploadSessionController {
   snapshot(): UploadSnapshot;
   /** Runs the pipeline. Only ever called from an explicit Start or Resume. */
-  start(): Promise<void>;
+  start(signal?: AbortSignal): Promise<void>;
   /** Stops scheduling after the batch that is currently in flight settles. */
   requestStop(): void;
   /** Backgrounding: same as stop, but resumable. */
@@ -163,6 +173,10 @@ export function createUploadSession(
   let stopRequested = false;
   let pauseRequested = false;
   let running = false;
+  let terminalCancelled = false;
+  let activeRun: ActiveRun | null = null;
+  let cancelPromise: Promise<void> | null = null;
+  let pendingPauseCleanup: Promise<void> | null = null;
   /** Index of the next source to preprocess. Survives a pause. */
   let cursor = 0;
 
@@ -225,14 +239,32 @@ export function createUploadSession(
     return available - bytes >= diskReserve;
   }
 
-  async function discardBatchTemp(batch: UploadBatch): Promise<void> {
-    for (const file of batch.files) {
-      preparedById.delete(file.id);
-      await deps.discardTemp(file.uri);
+  async function discardTempQuietly(uri: string): Promise<void> {
+    try {
+      await deps.discardTemp(uri);
+    } catch {
+      // The lifecycle namespace purge is the final cleanup barrier. A native
+      // deletion failure must not reclassify a completed server upload.
     }
   }
 
-  async function uploadCurrentBatch(): Promise<'continue' | 'stop'> {
+  async function discardEncoderOutputQuietly(uri: string): Promise<void> {
+    try {
+      await deps.discardEncoderOutput(uri);
+    } catch {
+      // The encoder owns its cache namespace. Cancellation still has to settle
+      // and release the transfer lease even when that native cleanup rejects.
+    }
+  }
+
+  async function discardBatchTemp(batch: UploadBatch): Promise<void> {
+    for (const file of batch.files) {
+      preparedById.delete(file.id);
+      await discardTempQuietly(file.uri);
+    }
+  }
+
+  async function uploadCurrentBatch(signal?: AbortSignal): Promise<'continue' | 'stop'> {
     if (currentBatch.files.length === 0) {
       return 'continue';
     }
@@ -248,11 +280,18 @@ export function createUploadSession(
     publish();
 
     try {
-      const photos = await deps.uploadBatch(batch.files, (loaded, totalBytes) => {
-        batchBytesSent = loaded;
-        batchBytesTotal = totalBytes ?? batch.totalBytes;
-        publish();
-      });
+      const photos = await deps.uploadBatch(
+        batch.files,
+        (loaded, totalBytes) => {
+          batchBytesSent = loaded;
+          batchBytesTotal = totalBytes ?? batch.totalBytes;
+          publish();
+        },
+        signal,
+      );
+      if (signal?.aborted) {
+        throw createSessionClosedError();
+      }
       for (const file of batch.files) {
         setState(file.id, 'uploaded');
       }
@@ -330,7 +369,10 @@ export function createUploadSession(
     }
   }
 
-  async function prepareNext(entry: SourceEntry): Promise<PreparedUpload | 'skip' | 'stop'> {
+  async function prepareNext(
+    entry: SourceEntry,
+    signal?: AbortSignal,
+  ): Promise<PreparedUpload | 'skip' | 'stop' | 'cancelled'> {
     if (!entry.image) {
       return 'skip';
     }
@@ -347,7 +389,16 @@ export function createUploadSession(
     let encoded: PreprocessedImage;
     try {
       encoded = await deps.preprocess(entry.image, target);
+      if (signal?.aborted) {
+        await discardEncoderOutputQuietly(encoded.uri);
+        setState(entry.id, 'queued');
+        return 'cancelled';
+      }
     } catch (caught) {
+      if (signal?.aborted) {
+        setState(entry.id, 'queued');
+        return 'cancelled';
+      }
       const reason =
         caught instanceof ImagePreprocessError
           ? caught.message
@@ -360,13 +411,22 @@ export function createUploadSession(
     let adopted: { uri: string; bytes: number };
     try {
       adopted = await deps.adopt({ uri: encoded.uri, bytes: encoded.bytes, mimeType: encoded.type });
+      if (signal?.aborted) {
+        await discardTempQuietly(adopted.uri);
+        setState(entry.id, 'queued');
+        return 'cancelled';
+      }
     } catch {
       // The encoder's output is still the encoder's to clean up; this file just
       // never became ready.
-      await deps.discardEncoderOutput(encoded.uri);
-      setState(entry.id, 'rejected', 'Could not prepare this photo.');
+      await discardEncoderOutputQuietly(encoded.uri);
+      setState(
+        entry.id,
+        signal?.aborted ? 'queued' : 'rejected',
+        signal?.aborted ? undefined : 'Could not prepare this photo.',
+      );
       publish();
-      return 'skip';
+      return signal?.aborted ? 'cancelled' : 'skip';
     }
 
     const prepared: PreparedUpload = {
@@ -380,7 +440,7 @@ export function createUploadSession(
     };
 
     if (isUnsendableAlone(prepared, limits)) {
-      await deps.discardTemp(prepared.uri);
+      await discardTempQuietly(prepared.uri);
       setState(entry.id, 'rejected', 'This photo is too large to upload.');
       publish();
       return 'skip';
@@ -392,13 +452,22 @@ export function createUploadSession(
     return prepared;
   }
 
-  async function run(): Promise<void> {
-    if (running) {
+  async function run(signal: AbortSignal): Promise<void> {
+    // Claim the run before awaiting background maintenance so two fast Resume
+    // taps cannot both pass the guard and start parallel pipelines.
+    running = true;
+    if (pendingPauseCleanup) {
+      await pendingPauseCleanup;
+    }
+    if (signal.aborted) {
+      phase = 'cancelled';
+      publish();
+      running = false;
       return;
     }
-    running = true;
     stopRequested = false;
     pauseRequested = false;
+    error = null;
 
     let releaseLease: (() => void) | null = null;
     try {
@@ -415,6 +484,12 @@ export function createUploadSession(
       publish();
 
       while (cursor < sources.length) {
+        if (signal?.aborted) {
+          await releaseUnsentBatch();
+          phase = 'cancelled';
+          publish();
+          return;
+        }
         if (stopRequested || pauseRequested) {
           break;
         }
@@ -425,7 +500,13 @@ export function createUploadSession(
         phase = 'preprocessing';
         publish();
 
-        const prepared = await prepareNext(entry);
+        const prepared = await prepareNext(entry, signal);
+        if (prepared === 'cancelled') {
+          await releaseUnsentBatch();
+          phase = 'cancelled';
+          publish();
+          return;
+        }
         if (prepared === 'stop') {
           // Low disk. Anything already prepared for the next batch was never
           // sent, so it must not be left occupying the space that ran out.
@@ -441,7 +522,20 @@ export function createUploadSession(
         if (currentBatch.files.length > 0 && wouldExceedBatchLimits(currentBatch, prepared, limits)) {
           // Uploading before adding keeps temp residency at one batch plus this
           // one candidate.
-          if ((await uploadCurrentBatch()) === 'stop') {
+          if ((await uploadCurrentBatch(signal)) === 'stop') {
+            // The candidate was prepared after the cursor advanced but did not
+            // fit the batch that just stopped (notably on 429). It is not part
+            // of `currentBatch`, so explicitly discard and rewind it.
+            preparedById.delete(prepared.id);
+            await discardTempQuietly(prepared.uri);
+            setState(prepared.id, 'queued');
+            const entryIndex = sources.findIndex((source) => source.id === prepared.id);
+            if (entryIndex >= 0 && entryIndex < cursor) {
+              cursor = entryIndex;
+            }
+            if (pauseRequested && currentBatch.files.length > 0) {
+              await pauseNow();
+            }
             return;
           }
           if (stopRequested || pauseRequested) {
@@ -454,7 +548,10 @@ export function createUploadSession(
       }
 
       if (!stopRequested && !pauseRequested) {
-        if ((await uploadCurrentBatch()) === 'stop') {
+        if ((await uploadCurrentBatch(signal)) === 'stop') {
+          if (pauseRequested && currentBatch.files.length > 0) {
+            await pauseNow();
+          }
           return;
         }
       }
@@ -495,7 +592,12 @@ export function createUploadSession(
     currentBatch = emptyBatch();
     for (const file of stranded.files) {
       preparedById.delete(file.id);
-      await deps.discardTemp(file.uri);
+      try {
+        await discardTempQuietly(file.uri);
+      } catch {
+        // `discardTempQuietly` currently cannot reject. Keep the rewind guarded
+        // if the cleanup implementation later grows additional bookkeeping.
+      }
       setState(file.id, 'queued');
       const entryIndex = sources.findIndex((entry) => entry.id === file.id);
       if (entryIndex >= 0 && entryIndex < cursor) {
@@ -506,33 +608,102 @@ export function createUploadSession(
 
   async function pauseNow(): Promise<void> {
     await releaseUnsentBatch();
+    error = null;
     phase = 'paused';
     publish();
   }
 
+  function start(externalSignal?: AbortSignal): Promise<void> {
+    if (terminalCancelled) {
+      return Promise.resolve();
+    }
+    if (activeRun) {
+      return activeRun.promise;
+    }
+
+    const controller = new AbortController();
+    const linked = linkAbortSignals([controller.signal, externalSignal]);
+    const record: ActiveRun = {
+      controller,
+      promise: undefined as unknown as Promise<void>,
+    };
+    record.promise = run(linked.signal).finally(() => {
+      linked.dispose();
+      if (activeRun === record) {
+        activeRun = null;
+      }
+    });
+    activeRun = record;
+    return record.promise;
+  }
+
+  function cancel(): Promise<void> {
+    if (cancelPromise) {
+      return cancelPromise;
+    }
+
+    terminalCancelled = true;
+    stopRequested = true;
+    pauseRequested = false;
+    const runToStop = activeRun;
+    // Abort synchronously. In particular, Axios sees this before `cancel()`
+    // yields, while cleanup deliberately waits until the request has settled so
+    // its multipart file cannot disappear underneath the native client.
+    runToStop?.controller.abort();
+
+    cancelPromise = (async () => {
+      await runToStop?.promise.catch(() => undefined);
+      if (pendingPauseCleanup) {
+        await pendingPauseCleanup.catch(() => undefined);
+      }
+
+      const ownedByUri = new Map<string, PreparedUpload>();
+      for (const file of currentBatch.files) {
+        ownedByUri.set(file.uri, file);
+      }
+      for (const file of preparedById.values()) {
+        ownedByUri.set(file.uri, file);
+      }
+      currentBatch = emptyBatch();
+      preparedById.clear();
+      for (const file of ownedByUri.values()) {
+        await discardTempQuietly(file.uri);
+      }
+
+      phase = 'cancelled';
+      publish();
+    })();
+
+    return cancelPromise;
+  }
+
   return {
     snapshot,
-    start: run,
+    start,
     requestStop(): void {
+      if (terminalCancelled) {
+        return;
+      }
       stopRequested = true;
     },
     requestPause(): void {
+      if (terminalCancelled) {
+        return;
+      }
       pauseRequested = true;
-    },
-    async cancel(): Promise<void> {
-      stopRequested = true;
-      const stranded = currentBatch;
-      currentBatch = emptyBatch();
-      for (const file of stranded.files) {
-        preparedById.delete(file.id);
-        await deps.discardTemp(file.uri);
+      // A throttled run has already settled while retaining its retry batch.
+      // Backgrounding after that point still has to purge and rewind those
+      // paths; otherwise Resume points at files the lifecycle deleted.
+      if (!running && phase === 'throttled' && !pendingPauseCleanup) {
+        const cleanup = pauseNow().catch(() => undefined);
+        pendingPauseCleanup = cleanup;
+        void cleanup.finally(() => {
+          if (pendingPauseCleanup === cleanup) {
+            pendingPauseCleanup = null;
+          }
+        });
       }
-      for (const prepared of Array.from(preparedById.values())) {
-        await deps.discardTemp(prepared.uri);
-      }
-      preparedById.clear();
-      phase = 'cancelled';
-      publish();
     },
+    cancel,
   };
 }

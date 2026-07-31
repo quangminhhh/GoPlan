@@ -207,6 +207,35 @@ describe('loading and pagination', () => {
 
     expect(view.result.current.photos.map((item) => item.id)).toEqual(['newest']);
   });
+
+  it('does not let an older first-page success revive an explicitly invalidated trip', async () => {
+    const view = await renderReady(page([photo('p1'), photo('p2')]));
+    const slow = createDeferred<CursorPage<TripPhoto>>();
+    mockListTripPhotos.mockReturnValueOnce(slow.promise);
+    let pending!: Promise<void>;
+
+    await act(async () => {
+      pending = view.result.current.loadFirstPage('silent');
+      await Promise.resolve();
+    });
+    await act(async () => {
+      view.result.current.handleAssetNotFound('p1', {
+        kind: 'notFound',
+        message: 'gone',
+        status: 404,
+        errorCode: 'TRIP_NOT_FOUND',
+      });
+    });
+
+    await act(async () => {
+      slow.resolve(page([photo('stale')]));
+      await pending;
+    });
+
+    expect(view.result.current.tripNotFound).toBe(true);
+    expect(view.result.current.photos).toEqual([]);
+    expect(mockInvalidateTrip).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('focus and foreground coalescing', () => {
@@ -229,6 +258,147 @@ describe('focus and foreground coalescing', () => {
       await slow.promise;
     });
     expect(view.result.current.photos.map((item) => item.id)).toEqual(['p1']);
+  });
+});
+
+describe('reconcile sequencing', () => {
+  it('invalidates an older load-more request before replacing the first page', async () => {
+    const view = await renderReady(page([photo('p1')], 'cursor-1'));
+    const loadMore = createDeferred<CursorPage<TripPhoto>>();
+    mockListTripPhotos.mockReturnValueOnce(loadMore.promise);
+
+    let pendingLoadMore!: Promise<void>;
+    await act(async () => {
+      pendingLoadMore = view.result.current.loadMore();
+      await Promise.resolve();
+    });
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('fresh')]));
+    await act(async () => {
+      view.result.current.handleAssetNotFound('ghost', {
+        kind: 'notFound',
+        message: 'gone',
+        status: 404,
+      });
+    });
+    await waitFor(() =>
+      expect(view.result.current.photos.map((item) => item.id)).toEqual(['fresh']),
+    );
+
+    await act(async () => {
+      loadMore.resolve(page([photo('stale-page')]));
+      await pendingLoadMore;
+    });
+
+    expect(view.result.current.photos.map((item) => item.id)).toEqual(['fresh']);
+    expect(view.result.current.loadingMore).toBe(false);
+  });
+
+  it('does not let an older reconcile overwrite or tombstone a newer first page', async () => {
+    const view = await renderReady(page([photo('p1')]));
+    const reconcile = createDeferred<CursorPage<TripPhoto>>();
+    mockListTripPhotos.mockReturnValueOnce(reconcile.promise);
+
+    await act(async () => {
+      view.result.current.handleAssetNotFound('p1', {
+        kind: 'notFound',
+        message: 'gone',
+        status: 404,
+      });
+      await Promise.resolve();
+    });
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('p1'), photo('fresh')]));
+    await act(async () => {
+      await view.result.current.loadFirstPage('refresh');
+    });
+
+    await act(async () => {
+      reconcile.resolve(page([photo('stale-reconcile')]));
+      await reconcile.promise;
+    });
+
+    expect(view.result.current.photos.map((item) => item.id)).toEqual(['p1', 'fresh']);
+    expect(mockInvalidateAsset).not.toHaveBeenCalled();
+    expect(view.result.current.refreshing).toBe(false);
+  });
+});
+
+describe('trip identity boundaries', () => {
+  it('hides the old trip immediately and ignores its pending response after rerender', async () => {
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-1-photo')]));
+    const view = await renderHook(
+      ({ activeTripId }: { activeTripId: string }) => useTripPhotos(activeTripId),
+      { initialProps: { activeTripId: 'trip-1' } },
+    );
+    await triggerFocus();
+    await waitFor(() =>
+      expect(view.result.current.photos.map((item) => item.id)).toEqual([
+        'trip-1-photo',
+      ]),
+    );
+
+    const oldTripResponse = createDeferred<CursorPage<TripPhoto>>();
+    mockListTripPhotos.mockReturnValueOnce(oldTripResponse.promise);
+    let oldTripRequest!: Promise<void>;
+    await act(async () => {
+      oldTripRequest = view.result.current.loadFirstPage('silent');
+      await Promise.resolve();
+    });
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-2-photo')]));
+    await view.rerender({ activeTripId: 'trip-2' });
+    // The derived identity guard applies before the reset effect can paint.
+    expect(view.result.current.photos).toEqual([]);
+    expect(view.result.current.status).toBe('loading');
+
+    await triggerFocus();
+    await waitFor(() =>
+      expect(view.result.current.photos.map((item) => item.id)).toEqual([
+        'trip-2-photo',
+      ]),
+    );
+    expect(mockListTripPhotos).toHaveBeenLastCalledWith('trip-2');
+
+    await act(async () => {
+      oldTripResponse.resolve(page([photo('stale-trip-1-photo')]));
+      await oldTripRequest;
+    });
+    expect(view.result.current.photos.map((item) => item.id)).toEqual([
+      'trip-2-photo',
+    ]);
+  });
+
+  it('loads a new trip after the previous trip was marked unreadable', async () => {
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-1-photo')]));
+    const view = await renderHook(
+      ({ activeTripId }: { activeTripId: string }) => useTripPhotos(activeTripId),
+      { initialProps: { activeTripId: 'trip-1' } },
+    );
+    await triggerFocus();
+    await waitFor(() => expect(view.result.current.status).toBe('ready'));
+
+    await act(async () => {
+      view.result.current.handleAssetNotFound('trip-1-photo', {
+        kind: 'notFound',
+        message: 'gone',
+        status: 404,
+        errorCode: 'TRIP_NOT_FOUND',
+      });
+    });
+    expect(view.result.current.tripNotFound).toBe(true);
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-2-photo')]));
+    await view.rerender({ activeTripId: 'trip-2' });
+    await triggerFocus();
+
+    await waitFor(() =>
+      expect(view.result.current.photos.map((item) => item.id)).toEqual([
+        'trip-2-photo',
+      ]),
+    );
+    expect(view.result.current.tripNotFound).toBe(false);
+    expect(mockListTripPhotos).toHaveBeenLastCalledWith('trip-2');
   });
 });
 
@@ -274,6 +444,50 @@ describe('local override ledger', () => {
     });
 
     expect(view.result.current.photos.map((item) => item.id)).toEqual(['p2']);
+  });
+
+  it('keeps a local delete through a coalesced ambiguous-404 reconcile', async () => {
+    const view = await renderReady(page([photo('p1'), photo('p2')]));
+    const slow = createDeferred<CursorPage<TripPhoto>>();
+    mockListTripPhotos.mockReturnValueOnce(slow.promise);
+
+    await act(async () => {
+      view.result.current.handleAssetNotFound('ghost', {
+        kind: 'notFound',
+        message: 'gone',
+        status: 404,
+      });
+      await Promise.resolve();
+    });
+    await act(async () => {
+      view.result.current.removePhoto('p1');
+      slow.resolve(page([photo('p1'), photo('p2')]));
+      await slow.promise;
+    });
+
+    expect(view.result.current.photos.map((item) => item.id)).toEqual(['p2']);
+  });
+
+  it('keeps a local upload through a coalesced ambiguous-404 reconcile', async () => {
+    const view = await renderReady(page([photo('p1')]));
+    const slow = createDeferred<CursorPage<TripPhoto>>();
+    mockListTripPhotos.mockReturnValueOnce(slow.promise);
+
+    await act(async () => {
+      view.result.current.handleAssetNotFound('ghost', {
+        kind: 'notFound',
+        message: 'gone',
+        status: 404,
+      });
+      await Promise.resolve();
+    });
+    await act(async () => {
+      view.result.current.prependUploaded([photo('uploaded', '2026-07-31T12:00:00Z')]);
+      slow.resolve(page([photo('p1')]));
+      await slow.promise;
+    });
+
+    expect(view.result.current.photos.map((item) => item.id)).toEqual(['uploaded', 'p1']);
   });
 
   it('sorts merged uploads by the list contract order', async () => {
@@ -389,6 +603,25 @@ describe('D18 404 routing', () => {
     });
 
     await waitFor(() => expect(view.result.current.tripNotFound).toBe(true));
+  });
+
+  it('keeps every photo when ambiguous-404 evidence fails with network or 5xx', async () => {
+    const view = await renderReady(page([photo('p1'), photo('p2')]));
+    mockListTripPhotos.mockRejectedValueOnce(serverError());
+
+    await act(async () => {
+      view.result.current.handleAssetNotFound('p1', {
+        kind: 'notFound',
+        message: 'gone',
+        status: 404,
+      });
+    });
+
+    await waitFor(() =>
+      expect(view.result.current.photos.map((item) => item.id)).toEqual(['p1', 'p2']),
+    );
+    expect(view.result.current.tripNotFound).toBe(false);
+    expect(mockInvalidateAsset).not.toHaveBeenCalled();
   });
 
   it('runs one reconcile no matter how many tiles report an unparseable 404 at once', async () => {

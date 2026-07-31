@@ -1,7 +1,7 @@
 import { Stack, useLocalSearchParams } from 'expo-router';
-import { useCallback } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { colors, spacing, typography } from '@/shared/theme/tokens';
+import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 import { Screen } from '@/shared/ui/Screen';
 import { PhotoGrid } from '../components/PhotoGrid';
@@ -19,6 +19,7 @@ import { useTripPhotos } from '../hooks/useTripPhotos';
  * `useTripPhotos`; batching and upload live in the upload session.
  */
 export function PhotosScreen() {
+  const [selectionBarHeight, setSelectionBarHeight] = useState(0);
   const { tripId } = useLocalSearchParams<{ tripId: string }>();
   const {
     photos,
@@ -52,7 +53,16 @@ export function PhotosScreen() {
     [handleAssetNotFound],
   );
 
-  const upload = usePhotoUpload({
+  const {
+    snapshot: uploadSnapshot,
+    picking: uploadPicking,
+    pickFailure: uploadPickFailure,
+    pick: pickPhotos,
+    dismissPickFailure,
+    start: startUpload,
+    stop: stopUpload,
+    close: closeUploadSession,
+  } = usePhotoUpload({
     tripId,
     onUploaded: prependUploaded,
     onReconcile: () => {
@@ -62,12 +72,12 @@ export function PhotosScreen() {
   });
 
   const startPicking = useCallback(() => {
-    void upload.pick();
-  }, [upload]);
+    void pickPhotos();
+  }, [pickPhotos]);
 
   const closeUpload = useCallback(() => {
-    void upload.close();
-  }, [upload]);
+    void closeUploadSession();
+  }, [closeUploadSession]);
 
   const retryInitial = useCallback(() => {
     void loadFirstPage('initial');
@@ -81,7 +91,18 @@ export function PhotosScreen() {
     void loadMore();
   }, [loadMore]);
 
-  const viewer = usePhotoViewer({
+  const {
+    currentIndex,
+    currentPhoto,
+    action: viewerAction,
+    open: openViewer,
+    close: closeViewer,
+    goTo: goToPhoto,
+    goToOffset,
+    confirmDelete,
+    save: savePhoto,
+    dismissAction: dismissViewerAction,
+  } = usePhotoViewer({
     tripId,
     photos,
     hasNextPage,
@@ -92,14 +113,27 @@ export function PhotosScreen() {
   });
 
   const handleDelete = useCallback(() => {
-    void viewer.confirmDelete();
-  }, [viewer]);
+    void confirmDelete();
+  }, [confirmDelete]);
 
   const handleSave = useCallback(() => {
-    void viewer.save();
-  }, [viewer]);
+    void savePhoto();
+  }, [savePhoto]);
 
-  const selection = usePhotoSelection({
+  const {
+    selectionMode,
+    selectedCount,
+    download: selectionDownload,
+    enterSelection,
+    toggle: toggleSelection,
+    isSelected,
+    selectLoaded,
+    clear: clearSelection,
+    exit: exitSelection,
+    startDownload,
+    cancelDownload,
+    dismissMessage: dismissSelectionMessage,
+  } = usePhotoSelection({
     tripId,
     photos,
     reconcile,
@@ -110,18 +144,61 @@ export function PhotosScreen() {
   // toggles only while selection mode is on.
   const handleTilePress = useCallback(
     (photoId: string) => {
-      if (selection.selectionMode) {
-        selection.toggle(photoId);
+      if (selectionMode) {
+        toggleSelection(photoId);
         return;
       }
-      viewer.open(photoId);
+      openViewer(photoId);
     },
-    [selection, viewer],
+    [selectionMode, toggleSelection, openViewer],
   );
 
   const handleStartDownload = useCallback(() => {
-    void selection.startDownload();
-  }, [selection]);
+    void startDownload();
+  }, [startDownload]);
+
+  const detachedFeedback = useMemo(() => {
+    if (uploadPickFailure) {
+      return {
+        message: uploadPickFailure.message,
+        dismiss: dismissPickFailure,
+      };
+    }
+    if (
+      !currentPhoto &&
+      (viewerAction.status === 'message' || viewerAction.status === 'error')
+    ) {
+      return {
+        message:
+          viewerAction.status === 'message'
+            ? viewerAction.message
+            : viewerAction.failure.message,
+        dismiss: dismissViewerAction,
+      };
+    }
+    if (
+      !selectionMode &&
+      (selectionDownload.status === 'message' || selectionDownload.status === 'error')
+    ) {
+      return {
+        message:
+          selectionDownload.status === 'message'
+            ? selectionDownload.message
+            : selectionDownload.failure.message,
+        dismiss: dismissSelectionMessage,
+      };
+    }
+    return null;
+  }, [
+    uploadPickFailure,
+    dismissPickFailure,
+    currentPhoto,
+    viewerAction,
+    dismissViewerAction,
+    selectionMode,
+    selectionDownload,
+    dismissSelectionMessage,
+  ]);
 
   if (tripNotFound) {
     // Neutral on purpose: a trip that was deleted and a trip the user was
@@ -161,7 +238,7 @@ export function PhotosScreen() {
     <Pressable
       accessibilityRole="button"
       accessibilityLabel="Upload photos"
-      disabled={upload.picking}
+      disabled={uploadPicking}
       onPress={startPicking}
       style={styles.action}
     >
@@ -169,40 +246,76 @@ export function PhotosScreen() {
     </Pressable>
   );
 
-  const uploadSheet = upload.snapshot ? (
+  const uploadSheet = uploadSnapshot ? (
     <PhotoUploadSheet
-      snapshot={upload.snapshot}
-      onStart={upload.start}
-      onStop={upload.stop}
+      snapshot={uploadSnapshot}
+      onStart={startUpload}
+      onStop={stopUpload}
       onClose={closeUpload}
     />
   ) : null;
 
+  // A failure that arrived while usable list state exists must never replace it.
+  // This includes a successfully loaded empty gallery: keep pull-to-refresh and
+  // show the non-destructive banner instead of hiding the failure behind copy.
+  const inlineError = errorSource === 'refresh' || errorSource === 'background' ? error : null;
+  const pageError = errorSource === 'loadMore' ? error : null;
+
   if (photos.length === 0) {
     return (
-      <Screen>
+      <Screen edges={['bottom']}>
         <Stack.Screen options={{ headerRight: () => uploadAction }} />
-        <View style={styles.centered} testID="photos-empty">
-          <Text style={styles.emptyTitle}>No photos yet</Text>
-          <Text style={styles.emptyBody}>Photos added to this trip will show up here.</Text>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Upload photos"
-            disabled={upload.picking}
-            onPress={startPicking}
-            style={styles.action}
-          >
-            <Text style={styles.actionText}>Upload photos</Text>
-          </Pressable>
+        <View style={styles.fill}>
+          {inlineError ? (
+            <View style={styles.banner} testID="photos-inline-error">
+              <Text style={styles.bannerText}>{inlineError.message}</Text>
+            </View>
+          ) : null}
+          <PhotoGrid
+            tripId={tripId}
+            photos={photos}
+            refreshing={refreshing}
+            loadingMore={false}
+            hasNextPage={false}
+            pageError={null}
+            onRefresh={refresh}
+            onEndReached={handleEndReached}
+            onRetryPage={handleEndReached}
+            onPhotoPress={handleTilePress}
+            onPhotoLongPress={enterSelection}
+            onAssetNotFound={handleAssetNotFound}
+            ListEmptyComponent={
+              <View style={styles.emptyList} testID="photos-empty">
+                <Text style={styles.emptyTitle}>No photos yet</Text>
+                <Text style={styles.emptyBody}>Photos added to this trip will show up here.</Text>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Upload photos"
+                  disabled={uploadPicking}
+                  onPress={startPicking}
+                  style={styles.action}
+                >
+                  <Text style={styles.actionText}>Upload photos</Text>
+                </Pressable>
+              </View>
+            }
+          />
         </View>
         {uploadSheet}
+        {detachedFeedback ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Dismiss message"
+            onPress={detachedFeedback.dismiss}
+            style={styles.toast}
+            testID="photos-feedback-toast"
+          >
+            <Text style={styles.toastText}>{detachedFeedback.message}</Text>
+          </Pressable>
+        ) : null}
       </Screen>
     );
   }
-
-  // A failure that arrived while photos are on screen must never replace them.
-  const inlineError = errorSource === 'refresh' || errorSource === 'background' ? error : null;
-  const pageError = errorSource === 'loadMore' ? error : null;
 
   return (
     <Screen edges={['bottom']}>
@@ -224,40 +337,53 @@ export function PhotosScreen() {
           onEndReached={handleEndReached}
           onRetryPage={handleEndReached}
           onPhotoPress={handleTilePress}
-          onPhotoLongPress={selection.enterSelection}
+          onPhotoLongPress={enterSelection}
           onAssetNotFound={handleAssetNotFound}
-          selectionMode={selection.selectionMode}
-          isSelected={selection.isSelected}
+          selectionMode={selectionMode}
+          isSelected={isSelected}
+          bottomInset={selectionMode ? selectionBarHeight : 0}
         />
-        {selection.selectionMode ? (
+        {selectionMode ? (
           <PhotoSelectionBar
-            selectedCount={selection.selectedCount}
+            selectedCount={selectedCount}
             hasNextPage={hasNextPage}
-            download={selection.download}
-            onSelectLoaded={selection.selectLoaded}
-            onClear={selection.clear}
-            onExit={selection.exit}
+            download={selectionDownload}
+            onSelectLoaded={selectLoaded}
+            onClear={clearSelection}
+            onExit={exitSelection}
             onDownload={handleStartDownload}
-            onCancelDownload={selection.cancelDownload}
+            onCancelDownload={cancelDownload}
+            onHeightChange={setSelectionBarHeight}
           />
         ) : null}
       </View>
       {uploadSheet}
-      {viewer.currentPhoto && !selection.selectionMode ? (
+      {currentPhoto && !selectionMode ? (
         <PhotoViewer
           tripId={tripId}
           photos={photos}
-          currentIndex={viewer.currentIndex}
-          currentPhoto={viewer.currentPhoto}
-          action={viewer.action}
-          onClose={viewer.close}
-          onGoTo={viewer.goTo}
-          onGoToOffset={viewer.goToOffset}
+          currentIndex={currentIndex}
+          currentPhoto={currentPhoto}
+          action={viewerAction}
+          onClose={closeViewer}
+          onGoTo={goToPhoto}
+          onGoToOffset={goToOffset}
           onDelete={handleDelete}
           onSave={handleSave}
-          onDismissAction={viewer.dismissAction}
+          onDismissAction={dismissViewerAction}
           onAssetNotFound={handleAssetNotFound}
         />
+      ) : null}
+      {detachedFeedback ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Dismiss message"
+          onPress={detachedFeedback.dismiss}
+          style={styles.toast}
+          testID="photos-feedback-toast"
+        >
+          <Text style={styles.toastText}>{detachedFeedback.message}</Text>
+        </Pressable>
       ) : null}
     </Screen>
   );
@@ -270,6 +396,12 @@ const styles = StyleSheet.create({
     flex: 1,
     gap: spacing.sm,
     justifyContent: 'center',
+  },
+  emptyList: {
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.xl,
   },
   emptyTitle: { ...typography.heading, color: colors.text },
   emptyBody: { ...typography.body, color: colors.textMuted, textAlign: 'center' },
@@ -284,7 +416,17 @@ const styles = StyleSheet.create({
     marginHorizontal: spacing.lg,
     marginBottom: spacing.sm,
     padding: spacing.sm,
-    borderRadius: 10,
+    borderRadius: radii.md,
   },
   bannerText: { ...typography.caption, color: colors.warning },
+  toast: {
+    backgroundColor: colors.text,
+    borderRadius: radii.md,
+    bottom: spacing.lg,
+    left: spacing.lg,
+    padding: spacing.md,
+    position: 'absolute',
+    right: spacing.lg,
+  },
+  toastText: { ...typography.caption, color: colors.background, textAlign: 'center' },
 });

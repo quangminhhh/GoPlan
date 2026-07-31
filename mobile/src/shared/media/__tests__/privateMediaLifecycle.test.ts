@@ -190,6 +190,24 @@ describe('transfer leases', () => {
     expect(purgeLog).toEqual([]);
   });
 
+  it('cancels a deferred purge when the lease releases before resume continues', async () => {
+    await startPrivateMediaSession();
+    purgeLog.length = 0;
+    const release = acquirePrivateTransferLease();
+
+    suspendPrivateMediaSession();
+    const resuming = resumePrivateMediaSession();
+    // Foreground intent is synchronous, but the purge-tail drain yields. Releasing
+    // here exercises that hand-off rather than the already-settled resume case.
+    release();
+    await resuming;
+    await flushPrivateMediaPurge();
+
+    expect(isPrivateMediaSessionOpen()).toBe(true);
+    expect(getPrivateMediaEpoch()).toBe(0);
+    expect(purgeLog).toEqual([]);
+  });
+
   it('purges immediately on background when nothing holds a lease', async () => {
     await startPrivateMediaSession();
     purgeLog.length = 0;
@@ -241,6 +259,49 @@ describe('transfer leases', () => {
 });
 
 describe('foreground ordering', () => {
+  it('does not open between a same-turn resume and the startup purge enqueue', async () => {
+    const purgeStarted = createDeferred<void>();
+    const purgeGate = createDeferred<void>();
+    let gateWhenPurgeStarted: boolean | undefined;
+    protectedPurge = async () => {
+      gateWhenPurgeStarted = isPrivateMediaSessionOpen();
+      purgeStarted.resolve();
+      await purgeGate.promise;
+    };
+
+    // Do not yield between these calls. This is the AppState ordering that used
+    // to let resume flush the old settled tail before start appended its purge.
+    const starting = startPrivateMediaSession();
+    suspendPrivateMediaSession();
+    const resuming = resumePrivateMediaSession();
+
+    await purgeStarted.promise;
+    expect(gateWhenPurgeStarted).toBe(false);
+    expect(isPrivateMediaSessionOpen()).toBe(false);
+
+    purgeGate.resolve();
+    await Promise.all([starting, resuming]);
+    expect(isPrivateMediaSessionOpen()).toBe(true);
+  });
+
+  it('does not reopen after backgrounding while the startup purge is still running', async () => {
+    const purgeGate = createDeferred<void>();
+    protectedPurge = async () => {
+      await purgeGate.promise;
+    };
+
+    const starting = startPrivateMediaSession();
+    await flushMicrotasks();
+    suspendPrivateMediaSession();
+    purgeGate.resolve();
+    await starting;
+
+    expect(isPrivateMediaSessionOpen()).toBe(false);
+
+    await resumePrivateMediaSession();
+    expect(isPrivateMediaSessionOpen()).toBe(true);
+  });
+
   it('settles the deferred purge, then opens the gate, then publishes the generation', async () => {
     await startPrivateMediaSession();
     const events: string[] = [];
@@ -280,6 +341,42 @@ describe('foreground ordering', () => {
     await resumePrivateMediaSession();
 
     expect(isPrivateMediaSessionOpen()).toBe(false);
+  });
+
+  it('does not let an old resume reopen a newer session before its purge completes', async () => {
+    const oldResumePurge = createDeferred<void>();
+    const newSessionPurgeStarted = createDeferred<void>();
+    const newSessionPurge = createDeferred<void>();
+    let purgeIndex = 0;
+    protectedPurge = async () => {
+      purgeIndex += 1;
+      if (purgeIndex === 2) {
+        await oldResumePurge.promise;
+      }
+      if (purgeIndex === 4) {
+        newSessionPurgeStarted.resolve();
+        await newSessionPurge.promise;
+      }
+    };
+
+    await startPrivateMediaSession();
+    suspendPrivateMediaSession();
+    const oldResume = resumePrivateMediaSession();
+    await flushMicrotasks();
+
+    beginPrivateMediaShutdown();
+    const newSession = startPrivateMediaSession();
+    oldResumePurge.resolve();
+    await newSessionPurgeStarted.promise;
+
+    // The old resume continuation belongs to the previous activation. Even
+    // though the new start has made `sessionActive` true again, it must not open
+    // the gate while that new start's own purge is still running.
+    expect(isPrivateMediaSessionOpen()).toBe(false);
+
+    newSessionPurge.resolve();
+    await Promise.all([oldResume, newSession]);
+    expect(isPrivateMediaSessionOpen()).toBe(true);
   });
 });
 

@@ -18,10 +18,27 @@ import { Image, ScrollView, Text, View } from 'react-native';
 
 interface SharedValue<T> {
   value: T;
+  get(): T;
+  set(next: T | ((current: T) => T)): void;
+}
+
+function createSharedValue<T>(initial: T): SharedValue<T> {
+  return {
+    value: initial,
+    get() {
+      return this.value;
+    },
+    set(next) {
+      this.value =
+        typeof next === 'function'
+          ? (next as (current: T) => T)(this.value)
+          : next;
+    },
+  };
 }
 
 export function useSharedValue<T>(initial: T): SharedValue<T> {
-  return { value: initial };
+  return createSharedValue(initial);
 }
 
 export function useAnimatedStyle(factory: () => object): object {
@@ -33,7 +50,7 @@ export function useAnimatedRef<T>(): { current: T | null } {
 }
 
 export function useDerivedValue<T>(factory: () => T): SharedValue<T> {
-  return { value: factory() };
+  return createSharedValue(factory());
 }
 
 export function withTiming<T>(value: T, _config?: unknown, callback?: (finished: boolean) => void): T {

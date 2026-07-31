@@ -12,8 +12,13 @@ import {
   acquirePrivateTransferLease,
   createSessionClosedError,
   getPrivateMediaEpoch,
+  trackPrivateRequest,
 } from '@/shared/media/privateMediaLifecycle';
-import { ProtectedAssetError, type ProtectedTransport } from '@/shared/media/protectedAssetTypes';
+import {
+  ProtectedAssetError,
+  type ProtectedFileSink,
+  type ProtectedTransport,
+} from '@/shared/media/protectedAssetTypes';
 import { createOpaqueFileName, nativeProtectedTransport } from '@/shared/media/protectedTransport';
 import { buildBulkDownloadBody, tripPhotoAssetPath, tripPhotoBulkDownloadPath } from './api';
 import { nativePhotoActions } from './nativePhotoActions';
@@ -52,6 +57,55 @@ const EXTENSION_BY_CONTENT_TYPE: Record<string, string> = {
 
 function transferWasInvalidated(epochAtStart: number, signal?: AbortSignal): boolean {
   return signal?.aborted === true || getPrivateMediaEpoch() !== epochAtStart;
+}
+
+function cancelReaderOnAbort(
+  signal: AbortSignal,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): () => void {
+  const cancel = (): void => {
+    void reader.cancel().catch(() => undefined);
+  };
+  if (signal.aborted) {
+    cancel();
+    return () => undefined;
+  }
+  signal.addEventListener('abort', cancel);
+  return () => signal.removeEventListener('abort', cancel);
+}
+
+function readStreamChunk(
+  signal: AbortSignal,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (signal.aborted) {
+    return Promise.reject(createSessionClosedError());
+  }
+
+  return new Promise((resolve, reject) => {
+    const abort = (): void => {
+      reject(createSessionClosedError());
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    reader.read().then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', abort);
+    });
+  });
+}
+
+async function cancelOwnedBody(
+  body: ReadableStream<Uint8Array> | null,
+  reader: ReadableStreamDefaultReader<Uint8Array> | null,
+): Promise<void> {
+  if (reader) {
+    await reader.cancel().catch(() => undefined);
+    return;
+  }
+  await body?.cancel().catch(() => undefined);
+}
+
+async function discardSinkQuietly(sink: ProtectedFileSink | null): Promise<void> {
+  await sink?.discard().catch(() => undefined);
 }
 
 /**
@@ -115,95 +169,134 @@ export async function saveTripPhotoToLibrary(
     signal,
   } = options;
 
-  // Asked at the moment the user taps Save, never at launch.
-  const permission = await native.requestAddOnlyPermission();
+  // Asked at the moment the user taps Save, never at launch. Native modules can
+  // reject (bridge unavailable, OS interruption), so this boundary is mapped to
+  // the same stable outcome shape as network and filesystem failures.
+  let permission: Awaited<ReturnType<NativePhotoActions['requestAddOnlyPermission']>>;
+  try {
+    permission = await native.requestAddOnlyPermission();
+  } catch (caught) {
+    return { status: 'failed', failure: toPhotoFailure(caught) };
+  }
   if (!permission.granted) {
     return { status: 'permissionDenied', canAskAgain: permission.canAskAgain };
   }
 
-  let releaseLease: (() => void) | null = null;
   try {
-    releaseLease = acquirePrivateTransferLease();
-  } catch {
-    return { status: 'failed', failure: { kind: 'cancelled', message: 'Cancelled.' } };
-  }
+    return await trackPrivateRequest(signal, async (trackedSignal) => {
+      let releaseLease: (() => void) | null = null;
+      try {
+        releaseLease = acquirePrivateTransferLease();
+      } catch {
+        return { status: 'failed', failure: { kind: 'cancelled', message: 'Cancelled.' } };
+      }
 
-  let stagedUri: string | null = null;
-  try {
-    const epochAtStart = getPrivateMediaEpoch();
-    const response = await fetchProtectedResponse({
-      path: tripPhotoAssetPath(tripId, photoId, 'download'),
-      signal,
-      transport,
+      let stagedUri: string | null = null;
+      try {
+        const epochAtStart = getPrivateMediaEpoch();
+        const throwIfInvalidated = (): void => {
+          if (transferWasInvalidated(epochAtStart, trackedSignal)) {
+            throw createSessionClosedError();
+          }
+        };
+        const response = await fetchProtectedResponse({
+          path: tripPhotoAssetPath(tripId, photoId, 'download'),
+          signal: trackedSignal,
+          transport,
+        });
+        const body = response.body;
+        let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+        let sink: ProtectedFileSink | null = null;
+        let detachAbort = (): void => {};
+        let received = 0;
+        try {
+          // From the moment headers arrive, this scope owns the response body.
+          // Even an abort before sink creation must cancel it so sign-out cannot
+          // leave a native stream detached from the lifecycle barrier.
+          throwIfInvalidated();
+
+          const contentType = response.headers.get('content-type');
+          const disposition = response.headers.get('content-disposition');
+          const normalizedType = contentType?.split(';')[0]?.trim().toLowerCase() ?? '';
+          if (!normalizedType.startsWith('image/')) {
+            throw new ProtectedAssetError(
+              'invalidContent',
+              'This photo could not be downloaded.',
+            );
+          }
+          const declared = Number(response.headers.get('content-length'));
+          if (Number.isFinite(declared) && declared > MEDIUM_MAX_BYTES) {
+            throw new ProtectedAssetError(
+              'invalidContent',
+              'This photo could not be downloaded.',
+            );
+          }
+          if (!body) {
+            throw new ProtectedAssetError(
+              'invalidContent',
+              'This photo could not be downloaded.',
+            );
+          }
+
+          reader = body.getReader();
+          detachAbort = cancelReaderOnAbort(trackedSignal, reader);
+          throwIfInvalidated();
+
+          sink = await transport.files.createSink(
+            createOpaqueFileName(extensionForDownload(contentType, disposition)),
+          );
+          stagedUri = sink.uri;
+          throwIfInvalidated();
+
+          for (;;) {
+            throwIfInvalidated();
+            const { done, value } = await readStreamChunk(trackedSignal, reader);
+            throwIfInvalidated();
+            if (done) {
+              break;
+            }
+            if (!value || value.byteLength === 0) {
+              continue;
+            }
+            received += value.byteLength;
+            if (received > MEDIUM_MAX_BYTES) {
+              throw new ProtectedAssetError('invalidContent', 'This photo could not be downloaded.');
+            }
+            await sink.write(value);
+            throwIfInvalidated();
+            onProgress?.(received);
+          }
+          await sink.close();
+          throwIfInvalidated();
+
+          await native.createAsset(sink.uri);
+          throwIfInvalidated();
+          return { status: 'saved' };
+        } catch (error) {
+          await cancelOwnedBody(body, reader);
+          await discardSinkQuietly(sink);
+          if (sink && stagedUri === sink.uri) {
+            stagedUri = null;
+          }
+          throw error;
+        } finally {
+          detachAbort();
+        }
+      } catch (caught) {
+        return { status: 'failed', failure: toPhotoFailure(caught) };
+      } finally {
+        try {
+          // The staged copy exists only to hand to the library; it is never kept.
+          if (stagedUri) {
+            await transport.files.discard(stagedUri);
+          }
+        } finally {
+          releaseLease?.();
+        }
+      }
     });
-
-    const contentType = response.headers.get('content-type');
-    const disposition = response.headers.get('content-disposition');
-    const normalizedType = contentType?.split(';')[0]?.trim().toLowerCase() ?? '';
-    if (!normalizedType.startsWith('image/')) {
-      await response.body?.cancel().catch(() => undefined);
-      throw new ProtectedAssetError('invalidContent', 'This photo could not be downloaded.');
-    }
-    const declared = Number(response.headers.get('content-length'));
-    if (Number.isFinite(declared) && declared > MEDIUM_MAX_BYTES) {
-      await response.body?.cancel().catch(() => undefined);
-      throw new ProtectedAssetError('invalidContent', 'This photo could not be downloaded.');
-    }
-    const body = response.body;
-    if (!body) {
-      throw new ProtectedAssetError('invalidContent', 'This photo could not be downloaded.');
-    }
-
-    const sink = await transport.files.createSink(
-      createOpaqueFileName(extensionForDownload(contentType, disposition)),
-    );
-    stagedUri = sink.uri;
-
-    const reader = body.getReader();
-    let received = 0;
-    try {
-      for (;;) {
-        if (transferWasInvalidated(epochAtStart, signal)) {
-          throw createSessionClosedError();
-        }
-        const { done, value } = await reader.read();
-        if (done) {
-          break;
-        }
-        if (!value || value.byteLength === 0) {
-          continue;
-        }
-        received += value.byteLength;
-        if (received > MEDIUM_MAX_BYTES) {
-          throw new ProtectedAssetError('invalidContent', 'This photo could not be downloaded.');
-        }
-        await sink.write(value);
-        onProgress?.(received);
-      }
-      await sink.close();
-      // The final read can resolve at the same moment sign-out invalidates the
-      // session. Re-check after the last await so an old user's bytes are never
-      // handed to Photos after the session boundary.
-      if (transferWasInvalidated(epochAtStart, signal)) {
-        throw createSessionClosedError();
-      }
-    } catch (error) {
-      await reader.cancel().catch(() => undefined);
-      await sink.discard();
-      stagedUri = null;
-      throw error;
-    }
-
-    await native.createAsset(sink.uri);
-    return { status: 'saved' };
   } catch (caught) {
     return { status: 'failed', failure: toPhotoFailure(caught) };
-  } finally {
-    // The staged copy exists only to hand to the library; it is never kept.
-    if (stagedUri) {
-      await transport.files.discard(stagedUri);
-    }
-    releaseLease?.();
   }
 }
 
@@ -339,138 +432,172 @@ export async function downloadAndShareTripPhotoArchive(
     };
   }
 
-  if (!(await native.isSharingAvailable())) {
-    return { status: 'unavailable' };
+  try {
+    if (!(await native.isSharingAvailable())) {
+      return { status: 'unavailable' };
+    }
+  } catch (caught) {
+    return { status: 'failed', failure: toPhotoFailure(caught) };
   }
 
-  let releaseLease: (() => void) | null = null;
   try {
-    releaseLease = acquirePrivateTransferLease();
-  } catch {
-    return { status: 'cancelled' };
-  }
+    return await trackPrivateRequest(signal, async (trackedSignal) => {
+      let releaseLease: (() => void) | null = null;
+      try {
+        releaseLease = acquirePrivateTransferLease();
+      } catch {
+        return { status: 'cancelled' };
+      }
 
-  let stagedUri: string | null = null;
-  try {
-    if (!hasDiskRoomForArchive(transport.files.availableBytes(), 0)) {
-      return {
-        status: 'failed',
-        failure: { kind: 'request', message: PHOTO_ERROR_MESSAGES.lowStorage },
-      };
-    }
-
-    const epochAtStart = getPrivateMediaEpoch();
-    const response = await fetchProtectedResponse({
-      path: tripPhotoBulkDownloadPath(tripId),
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: buildBulkDownloadBody(photoIds),
-      signal,
-      transport,
-    });
-
-    const contentType = response.headers.get('content-type');
-    const disposition = response.headers.get('content-disposition');
-    if (!isZipResponse(contentType, disposition)) {
-      await response.body?.cancel().catch(() => undefined);
-      return {
-        status: 'failed',
-        failure: { kind: 'invalidContent', message: 'The download could not be prepared.' },
-      };
-    }
-
-    // A streaming response usually has no Content-Length, so an absent one is
-    // normal rather than evidence that the archive is small.
-    const declared = Number(response.headers.get('content-length'));
-    const totalBytes = Number.isFinite(declared) && declared > 0 ? declared : null;
-    if (totalBytes !== null && !hasDiskRoomForArchive(transport.files.availableBytes(), totalBytes)) {
-      await response.body?.cancel().catch(() => undefined);
-      return {
-        status: 'failed',
-        failure: { kind: 'request', message: PHOTO_ERROR_MESSAGES.lowStorage },
-      };
-    }
-
-    const body = response.body;
-    if (!body) {
-      return {
-        status: 'failed',
-        failure: { kind: 'invalidContent', message: 'The download could not be prepared.' },
-      };
-    }
-
-    const fileName = zipFileNameFrom(disposition);
-    // The file on disk gets an opaque name; the server's filename is only ever
-    // a label and a share-sheet hint.
-    const sink = await transport.files.createSink(createOpaqueFileName('.zip'));
-    stagedUri = sink.uri;
-
-    const reader = body.getReader();
-    let received = 0;
-    let nextDiskCheck = ARCHIVE_DISK_CHECK_INTERVAL_BYTES;
-    try {
-      for (;;) {
-        if (transferWasInvalidated(epochAtStart, signal)) {
-          throw createSessionClosedError();
+      let stagedUri: string | null = null;
+      try {
+        if (!hasDiskRoomForArchive(transport.files.availableBytes(), 0)) {
+          return {
+            status: 'failed',
+            failure: { kind: 'request', message: PHOTO_ERROR_MESSAGES.lowStorage },
+          };
         }
-        const { done, value } = await reader.read();
-        if (done) {
-          break;
-        }
-        if (!value || value.byteLength === 0) {
-          continue;
-        }
-        await sink.write(value);
-        received += value.byteLength;
-        onProgress?.(received, totalBytes);
 
-        if (received >= nextDiskCheck) {
-          nextDiskCheck = received + ARCHIVE_DISK_CHECK_INTERVAL_BYTES;
-          if (!hasDiskRoomForArchive(transport.files.availableBytes(), 0)) {
+        const epochAtStart = getPrivateMediaEpoch();
+        const throwIfInvalidated = (): void => {
+          if (transferWasInvalidated(epochAtStart, trackedSignal)) {
+            throw createSessionClosedError();
+          }
+        };
+        const response = await fetchProtectedResponse({
+          path: tripPhotoBulkDownloadPath(tripId),
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: buildBulkDownloadBody(photoIds),
+          signal: trackedSignal,
+          transport,
+        });
+        const body = response.body;
+        let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+        let sink: ProtectedFileSink | null = null;
+        let detachAbort = (): void => {};
+        let received = 0;
+        let nextDiskCheck = ARCHIVE_DISK_CHECK_INTERVAL_BYTES;
+        try {
+          throwIfInvalidated();
+
+          const contentType = response.headers.get('content-type');
+          const disposition = response.headers.get('content-disposition');
+          if (!isZipResponse(contentType, disposition)) {
+            throw new ProtectedAssetError(
+              'invalidContent',
+              'The download could not be prepared.',
+            );
+          }
+
+          // A streaming response usually has no Content-Length, so an absent
+          // one is normal rather than evidence that the archive is small.
+          const declared = Number(response.headers.get('content-length'));
+          const totalBytes = Number.isFinite(declared) && declared > 0 ? declared : null;
+          if (
+            totalBytes !== null &&
+            !hasDiskRoomForArchive(transport.files.availableBytes(), totalBytes)
+          ) {
             throw new ProtectedAssetError('request', PHOTO_ERROR_MESSAGES.lowStorage);
           }
+          if (!body) {
+            throw new ProtectedAssetError(
+              'invalidContent',
+              'The download could not be prepared.',
+            );
+          }
+
+          const fileName = zipFileNameFrom(disposition);
+          reader = body.getReader();
+          detachAbort = cancelReaderOnAbort(trackedSignal, reader);
+          throwIfInvalidated();
+
+          // The file on disk gets an opaque name; the server's filename is only
+          // ever a label and a share-sheet hint.
+          sink = await transport.files.createSink(createOpaqueFileName('.zip'));
+          stagedUri = sink.uri;
+          throwIfInvalidated();
+
+          for (;;) {
+            throwIfInvalidated();
+            const { done, value } = await readStreamChunk(trackedSignal, reader);
+            throwIfInvalidated();
+            if (done) {
+              break;
+            }
+            if (!value || value.byteLength === 0) {
+              continue;
+            }
+            await sink.write(value);
+            throwIfInvalidated();
+            received += value.byteLength;
+            onProgress?.(received, totalBytes);
+
+            if (received >= nextDiskCheck) {
+              nextDiskCheck = received + ARCHIVE_DISK_CHECK_INTERVAL_BYTES;
+              if (!hasDiskRoomForArchive(transport.files.availableBytes(), 0)) {
+                throw new ProtectedAssetError('request', PHOTO_ERROR_MESSAGES.lowStorage);
+              }
+            }
+          }
+          await sink.close();
+          throwIfInvalidated();
+
+          await native.share(sink.uri, {
+            UTI: 'public.zip-archive',
+            mimeType: 'application/zip',
+          });
+          throwIfInvalidated();
+          return { status: 'shared', fileName };
+        } catch (error) {
+          await cancelOwnedBody(body, reader);
+          await discardSinkQuietly(sink);
+          if (sink && stagedUri === sink.uri) {
+            stagedUri = null;
+          }
+          throw error;
+        } finally {
+          detachAbort();
+        }
+      } catch (caught) {
+        const failure = toPhotoFailure(caught);
+        if (failure.kind === 'cancelled') {
+          return { status: 'cancelled' };
+        }
+        if (failure.kind === 'notFound' && failure.errorCode === 'PHOTO_NOT_FOUND') {
+          // All-or-nothing: the server refuses the whole archive when any id is
+          // gone, and deliberately does not say which. The caller reconciles and
+          // asks for a fresh selection rather than retrying blind against a 30/hour
+          // budget.
+          return { status: 'staleSelection' };
+        }
+        return {
+          status: 'failed',
+          failure:
+            failure.kind === 'throttled'
+              ? { ...failure, message: PHOTO_ERROR_MESSAGES.bulkThrottled }
+              : failure,
+        };
+      } finally {
+        try {
+          // Deleted only after the share sheet has settled: on iOS the sheet reads the
+          // file while it is open.
+          if (stagedUri) {
+            await transport.files.discard(stagedUri);
+          }
+        } finally {
+          releaseLease?.();
         }
       }
-      await sink.close();
-      // Same commit barrier as the single-photo path: a sign-out that lands
-      // after the stream's final chunk must stop the share sheet from opening.
-      if (transferWasInvalidated(epochAtStart, signal)) {
-        throw createSessionClosedError();
-      }
-    } catch (error) {
-      await reader.cancel().catch(() => undefined);
-      await sink.discard();
-      stagedUri = null;
-      throw error;
-    }
-
-    await native.share(sink.uri, { UTI: 'public.zip-archive', mimeType: 'application/zip' });
-    return { status: 'shared', fileName };
+    });
   } catch (caught) {
     const failure = toPhotoFailure(caught);
     if (failure.kind === 'cancelled') {
       return { status: 'cancelled' };
     }
-    if (failure.kind === 'notFound' && failure.errorCode === 'PHOTO_NOT_FOUND') {
-      // All-or-nothing: the server refuses the whole archive when any id is
-      // gone, and deliberately does not say which. The caller reconciles and
-      // asks for a fresh selection rather than retrying blind against a 30/hour
-      // budget.
-      return { status: 'staleSelection' };
-    }
     return {
       status: 'failed',
-      failure:
-        failure.kind === 'throttled'
-          ? { ...failure, message: PHOTO_ERROR_MESSAGES.bulkThrottled }
-          : failure,
+      failure,
     };
-  } finally {
-    // Deleted only after the share sheet has settled: on iOS the sheet reads the
-    // file while it is open.
-    if (stagedUri) {
-      await transport.files.discard(stagedUri);
-    }
-    releaseLease?.();
   }
 }

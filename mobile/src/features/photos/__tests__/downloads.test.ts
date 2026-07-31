@@ -2,7 +2,9 @@ import { setAccessToken } from '@/shared/api/token-store';
 import {
   __resetPrivateMediaLifecycleForTests,
   beginPrivateMediaShutdown,
+  flushPrivateMediaPurge,
   startPrivateMediaSession,
+  waitForPrivateNetworkIdle,
 } from '@/shared/media/privateMediaLifecycle';
 import {
   downloadAndShareTripPhotoArchive,
@@ -16,8 +18,10 @@ import {
 import { PRIVATE_MEDIA_DISK_RESERVE_BYTES } from '../constants';
 import {
   bytes,
+  createDeferred,
   createFakeResponse,
   createFakeTransport,
+  flushMicrotasks,
   jsonErrorResponse,
 } from '@test/fakeProtectedTransport';
 
@@ -43,6 +47,52 @@ function downloadResponse(contentType = 'image/webp', disposition = 'attachment;
     headers: { 'content-type': contentType, 'content-disposition': disposition },
     chunks: [bytes(32), bytes(32)],
   }).response;
+}
+
+function responseWithDeferredFirstRead(
+  headers: Record<string, string>,
+): {
+  response: Response;
+  read: ReturnType<typeof createDeferred<{ done: boolean; value?: Uint8Array }>>;
+  started: Promise<void>;
+  cancel: jest.Mock<Promise<void>, []>;
+} {
+  const read = createDeferred<{ done: boolean; value?: Uint8Array }>();
+  const started = createDeferred<void>();
+  const cancel = jest.fn(async () => undefined);
+  let reads = 0;
+  const body = {
+    getReader() {
+      return {
+        async read(): Promise<{ done: boolean; value?: Uint8Array }> {
+          reads += 1;
+          started.resolve();
+          return reads === 1 ? read.promise : { done: true };
+        },
+        cancel,
+      };
+    },
+    async cancel(): Promise<void> {},
+  };
+  const normalized = Object.entries(headers).map(([name, value]) => [
+    name.toLowerCase(),
+    value,
+  ] as const);
+  return {
+    read,
+    started: started.promise,
+    cancel,
+    response: {
+      status: 200,
+      ok: true,
+      headers: {
+        get(name: string): string | null {
+          return normalized.find(([key]) => key === name.toLowerCase())?.[1] ?? null;
+        },
+      },
+      body,
+    } as unknown as Response,
+  };
 }
 
 beforeEach(async () => {
@@ -171,6 +221,21 @@ describe('saveTripPhotoToLibrary', () => {
     expect(outcome).toEqual({ status: 'permissionDenied', canAskAgain: false });
   });
 
+  it('maps a native permission rejection instead of rejecting the action promise', async () => {
+    const outcome = await saveTripPhotoToLibrary({
+      tripId: 'trip-1',
+      photoId: 'photo-1',
+      transport: createFakeTransport(() => downloadResponse()),
+      native: nativeActions({
+        requestAddOnlyPermission: jest.fn(async () => {
+          throw new Error('native bridge unavailable');
+        }),
+      }),
+    });
+
+    expect(outcome).toMatchObject({ status: 'failed', failure: { kind: 'server' } });
+  });
+
   it('surfaces a stale photo with its error code so the caller can branch (D18)', async () => {
     const transport = createFakeTransport(
       () => jsonErrorResponse(404, { detail: 'Photo not found.', error_code: 'PHOTO_NOT_FOUND' }).response,
@@ -252,6 +317,139 @@ describe('saveTripPhotoToLibrary', () => {
     expect(outcome).toMatchObject({ status: 'failed', failure: { kind: 'cancelled' } });
     expect(native.createAsset).not.toHaveBeenCalled();
     expect(transport.files.contents().size).toBe(0);
+  });
+
+  it('deletes a sink created after the shutdown purge while createSink was pending', async () => {
+    const response = createFakeResponse({
+      status: 200,
+      headers: {
+        'content-type': 'image/webp',
+        'content-disposition': 'attachment; filename="photo.webp"',
+      },
+      chunks: [bytes(64)],
+    });
+    const transport = createFakeTransport(() => response.response);
+    const createSinkStarted = createDeferred<void>();
+    const allowSinkCreation = createDeferred<void>();
+    const createSink = transport.files.createSink.bind(transport.files);
+    transport.files.createSink = async (fileName: string) => {
+      createSinkStarted.resolve();
+      await allowSinkCreation.promise;
+      return createSink(fileName);
+    };
+
+    const pending = saveTripPhotoToLibrary({
+      tripId: 'trip-1',
+      photoId: 'photo-1',
+      transport,
+      native: nativeActions(),
+    });
+    await createSinkStarted.promise;
+    beginPrivateMediaShutdown();
+    await flushPrivateMediaPurge();
+    await flushMicrotasks();
+    expect(response.cancelled()).toBe(true);
+
+    let idle = false;
+    const waiting = waitForPrivateNetworkIdle().then(() => {
+      idle = true;
+    });
+    await flushMicrotasks();
+    expect(idle).toBe(false);
+
+    allowSinkCreation.resolve();
+    await expect(pending).resolves.toMatchObject({
+      status: 'failed',
+      failure: { kind: 'cancelled' },
+    });
+    await waiting;
+    expect(idle).toBe(true);
+    expect(transport.files.contents().size).toBe(0);
+  });
+
+  it('cancels the response body when creating the photo sink rejects', async () => {
+    const response = createFakeResponse({
+      status: 200,
+      headers: {
+        'content-type': 'image/webp',
+        'content-disposition': 'attachment; filename="photo.webp"',
+      },
+      chunks: [bytes(64)],
+    });
+    const transport = createFakeTransport(() => response.response);
+    transport.files.createSink = jest.fn(async () => {
+      throw new Error('filesystem unavailable');
+    });
+    const native = nativeActions();
+
+    const outcome = await saveTripPhotoToLibrary({
+      tripId: 'trip-1',
+      photoId: 'photo-1',
+      transport,
+      native,
+    });
+
+    expect(outcome).toMatchObject({ status: 'failed' });
+    expect(response.cancelled()).toBe(true);
+    expect(transport.files.contents().size).toBe(0);
+    expect(native.createAsset).not.toHaveBeenCalled();
+  });
+
+  it('keeps sign-out waiting while the response body read is still pending', async () => {
+    const deferred = responseWithDeferredFirstRead({
+      'content-type': 'image/webp',
+      'content-disposition': 'attachment; filename="photo.webp"',
+    });
+    const pending = saveTripPhotoToLibrary({
+      tripId: 'trip-1',
+      photoId: 'photo-1',
+      transport: createFakeTransport(() => deferred.response),
+      native: nativeActions(),
+    });
+    await deferred.started;
+
+    let idle = false;
+    const waiting = waitForPrivateNetworkIdle().then(() => {
+      idle = true;
+    });
+    await flushMicrotasks();
+    expect(idle).toBe(false);
+
+    beginPrivateMediaShutdown();
+    await expect(pending).resolves.toMatchObject({
+      status: 'failed',
+      failure: { kind: 'cancelled' },
+    });
+    await waiting;
+    expect(idle).toBe(true);
+    expect(deferred.cancel).toHaveBeenCalled();
+    deferred.read.resolve({ done: true });
+  });
+
+  it('waits through native Photos handoff and rejects a post-handoff old epoch', async () => {
+    const handoff = createDeferred<void>();
+    const pending = saveTripPhotoToLibrary({
+      tripId: 'trip-1',
+      photoId: 'photo-1',
+      transport: createFakeTransport(() => downloadResponse()),
+      native: nativeActions({ createAsset: jest.fn(async () => handoff.promise) }),
+    });
+    await flushMicrotasks(10);
+
+    beginPrivateMediaShutdown();
+    let idle = false;
+    const waiting = waitForPrivateNetworkIdle().then(() => {
+      idle = true;
+    });
+    await flushMicrotasks();
+    expect(idle).toBe(false);
+
+    handoff.resolve();
+    await expect(pending).resolves.toMatchObject({
+      status: 'failed',
+      failure: { kind: 'cancelled' },
+    });
+    await waiting;
   });
 });
 
@@ -406,6 +604,65 @@ describe('downloadAndShareTripPhotoArchive', () => {
     expect(transport.files.contents().size).toBe(0);
   });
 
+  it('deletes a ZIP sink created after the shutdown purge while createSink was pending', async () => {
+    const response = zipResponse();
+    const transport = createFakeTransport(() => response.response);
+    const createSinkStarted = createDeferred<void>();
+    const allowSinkCreation = createDeferred<void>();
+    const createSink = transport.files.createSink.bind(transport.files);
+    transport.files.createSink = async (fileName: string) => {
+      createSinkStarted.resolve();
+      await allowSinkCreation.promise;
+      return createSink(fileName);
+    };
+
+    const pending = downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native: nativeActions(),
+    });
+    await createSinkStarted.promise;
+    beginPrivateMediaShutdown();
+    await flushPrivateMediaPurge();
+    await flushMicrotasks();
+    expect(response.cancelled()).toBe(true);
+
+    let idle = false;
+    const waiting = waitForPrivateNetworkIdle().then(() => {
+      idle = true;
+    });
+    await flushMicrotasks();
+    expect(idle).toBe(false);
+
+    allowSinkCreation.resolve();
+    await expect(pending).resolves.toEqual({ status: 'cancelled' });
+    await waiting;
+    expect(idle).toBe(true);
+    expect(transport.files.contents().size).toBe(0);
+  });
+
+  it('cancels the ZIP body when creating its sink rejects', async () => {
+    const response = zipResponse();
+    const transport = createFakeTransport(() => response.response);
+    transport.files.createSink = jest.fn(async () => {
+      throw new Error('filesystem unavailable');
+    });
+    const native = nativeActions();
+
+    const outcome = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native,
+    });
+
+    expect(outcome).toMatchObject({ status: 'failed' });
+    expect(response.cancelled()).toBe(true);
+    expect(transport.files.contents().size).toBe(0);
+    expect(native.share).not.toHaveBeenCalled();
+  });
+
   it('rejects a 200 that is not actually a zip', async () => {
     const transport = createFakeTransport(
       () =>
@@ -522,12 +779,72 @@ describe('downloadAndShareTripPhotoArchive', () => {
     expect(transport.fetches.calls).toHaveLength(0);
   });
 
+  it('maps sharing availability and share-sheet native rejections', async () => {
+    const unavailableFailure = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport: createFakeTransport(() => zipResponse().response),
+      native: nativeActions({
+        isSharingAvailable: jest.fn(async () => {
+          throw new Error('native bridge unavailable');
+        }),
+      }),
+    });
+    expect(unavailableFailure).toMatchObject({
+      status: 'failed',
+      failure: { kind: 'server' },
+    });
+
+    const transport = createFakeTransport(() => zipResponse().response);
+    const shareFailure = await downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport,
+      native: nativeActions({
+        share: jest.fn(async () => {
+          throw new Error('share sheet failed');
+        }),
+      }),
+    });
+    expect(shareFailure).toMatchObject({ status: 'failed', failure: { kind: 'server' } });
+    expect(transport.files.contents().size).toBe(0);
+  });
+
+  it('keeps sign-out waiting while a ZIP body read is pending', async () => {
+    const deferred = responseWithDeferredFirstRead({
+      'content-type': 'application/zip',
+      'content-disposition': 'attachment; filename="trip.zip"',
+    });
+    const pending = downloadAndShareTripPhotoArchive({
+      tripId: 'trip-1',
+      photoIds: ['a'],
+      transport: createFakeTransport(() => deferred.response),
+      native: nativeActions(),
+    });
+    await deferred.started;
+
+    let idle = false;
+    const waiting = waitForPrivateNetworkIdle().then(() => {
+      idle = true;
+    });
+    await flushMicrotasks();
+    expect(idle).toBe(false);
+
+    beginPrivateMediaShutdown();
+    await expect(pending).resolves.toEqual({ status: 'cancelled' });
+    await waiting;
+    expect(idle).toBe(true);
+    expect(deferred.cancel).toHaveBeenCalled();
+    deferred.read.resolve({ done: true });
+  });
+
   it('deletes the partial archive when the download is cancelled', async () => {
     const controller = new AbortController();
+    const response = zipResponse();
     const transport = createFakeTransport(() => {
       // Aborted after the response arrives but before the body is drained.
       controller.abort();
-      return zipResponse().response;
+      return response.response;
     });
 
     const outcome = await downloadAndShareTripPhotoArchive({
@@ -539,6 +856,7 @@ describe('downloadAndShareTripPhotoArchive', () => {
     });
 
     expect(outcome).toEqual({ status: 'cancelled' });
+    expect(response.cancelled()).toBe(true);
     expect(transport.files.contents().size).toBe(0);
   });
 

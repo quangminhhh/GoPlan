@@ -60,6 +60,9 @@ interface PhotoGridProps {
   selectionMode?: boolean;
   isSelected?: (photoId: string) => boolean;
   ListHeaderComponent?: React.ReactElement | null;
+  ListEmptyComponent?: React.ReactElement | null;
+  /** Measured overlay height; safe-area padding is already included by Screen. */
+  bottomInset?: number;
 }
 
 export function PhotoGrid({
@@ -78,6 +81,8 @@ export function PhotoGrid({
   selectionMode = false,
   isSelected,
   ListHeaderComponent,
+  ListEmptyComponent,
+  bottomInset = 0,
 }: PhotoGridProps) {
   const { width } = useWindowDimensions();
   const { columnCount, tileSize } = useMemo(() => computePhotoGridLayout(width), [width]);
@@ -102,6 +107,10 @@ export function PhotoGrid({
   );
 
   const keyExtractor = useCallback((item: TripPhoto) => item.id, []);
+  const contentStyle = useMemo(
+    () => [styles.content, bottomInset > 0 ? { paddingBottom: spacing.xl + bottomInset } : null],
+    [bottomInset],
+  );
 
   const footer = useMemo(() => {
     if (pageError) {
@@ -143,11 +152,12 @@ export function PhotoGrid({
       // rotation or split-view resize has to remount it.
       key={`photo-grid-${columnCount}`}
       columnWrapperStyle={columnCount > 1 ? styles.row : undefined}
-      contentContainerStyle={styles.content}
+      contentContainerStyle={contentStyle}
       onEndReached={onEndReached}
       onEndReachedThreshold={0.4}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
       ListHeaderComponent={ListHeaderComponent}
+      ListEmptyComponent={ListEmptyComponent}
       ListFooterComponent={footer}
       // `removeClippedSubviews` is intentionally left off until simulator QA
       // says it helps: on iOS it has a history of blanking cells.

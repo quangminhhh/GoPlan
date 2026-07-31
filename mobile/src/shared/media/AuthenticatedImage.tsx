@@ -12,7 +12,14 @@
 
 import { Image } from 'expo-image';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import {
+  ActivityIndicator,
+  type ColorValue,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import { useAppForegroundEffect } from '@/shared/hooks/useAppForegroundEffect';
 import { colors, radii, typography } from '@/shared/theme/tokens';
 import {
@@ -51,6 +58,8 @@ export interface AuthenticatedImageProps {
   /** Source pixel size, used to reserve layout and size the decode. */
   sourceWidth?: number;
   sourceHeight?: number;
+  /** Overrides the neutral tile surface for contexts such as the dark viewer. */
+  backgroundColor?: ColorValue;
   /** Owner branches on `errorCode` — trip-level versus photo-level (D18). */
   onNotFound?: (error: ProtectedAssetError) => void;
   transport?: ProtectedTransport;
@@ -66,6 +75,7 @@ export function AuthenticatedImage({
   accessibilityLabel,
   sourceWidth,
   sourceHeight,
+  backgroundColor,
   onNotFound,
   transport,
 }: AuthenticatedImageProps) {
@@ -178,6 +188,7 @@ export function AuthenticatedImage({
   }, [assetKey]);
 
   const frame = { width, height };
+  const background = backgroundColor ? { backgroundColor } : null;
 
   if (state.status === 'ready') {
     return (
@@ -187,7 +198,7 @@ export function AuthenticatedImage({
           ...(sourceWidth !== undefined ? { width: sourceWidth } : {}),
           ...(sourceHeight !== undefined ? { height: sourceHeight } : {}),
         }}
-        style={[styles.image, frame]}
+        style={[styles.image, frame, background]}
         contentFit={contentFit}
         // RAM only. Never 'disk' or 'memory-disk' for member-only content (D3).
         cachePolicy="memory"
@@ -204,7 +215,10 @@ export function AuthenticatedImage({
   if (state.status === 'error') {
     const retriable = state.error.kind === 'network' || state.error.kind === 'throttled';
     return (
-      <View style={[styles.placeholder, frame]} testID={`authenticated-image-error-${assetKey}`}>
+      <View
+        style={[styles.placeholder, frame, background]}
+        testID={`authenticated-image-error-${assetKey}`}
+      >
         {retriable ? (
           <Pressable
             accessibilityRole="button"
@@ -231,7 +245,10 @@ export function AuthenticatedImage({
   // Fixed size from the very first paint, so the grid never reflows as tiles
   // resolve.
   return (
-    <View style={[styles.placeholder, frame]} testID={`authenticated-image-placeholder-${assetKey}`}>
+    <View
+      style={[styles.placeholder, frame, background]}
+      testID={`authenticated-image-placeholder-${assetKey}`}
+    >
       {state.status === 'loading' ? <ActivityIndicator color={colors.textMuted} /> : null}
     </View>
   );

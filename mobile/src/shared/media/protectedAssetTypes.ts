@@ -125,7 +125,12 @@ export interface ProtectedTransport {
 }
 
 export interface ProtectedFileStore {
-  /** Creates a sink inside this store's own namespace. */
+  /**
+   * Creates a sink inside this store's own namespace.
+   *
+   * Rejection is atomic: because no URI has escaped to the caller yet, the
+   * implementation must remove any file it created before rejecting.
+   */
   createSink(fileName: string): Promise<ProtectedFileSink>;
   /** The cache directory can be reclaimed by the OS between two acquires. */
   exists(uri: string): Promise<boolean>;

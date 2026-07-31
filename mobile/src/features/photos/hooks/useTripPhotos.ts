@@ -9,7 +9,7 @@
  */
 
 import { useFocusEffect } from 'expo-router';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useAppForegroundEffect } from '@/shared/hooks/useAppForegroundEffect';
 import {
   invalidateProtectedAsset,
@@ -33,6 +33,8 @@ interface PhotoOverride {
   photo?: TripPhoto;
   removed: boolean;
 }
+
+type ReconcileEvidence = 'readable' | 'unreadable' | 'unknown';
 
 /**
  * The list contract is `-created_at, -id`. Locally merged uploads are sorted the
@@ -107,6 +109,7 @@ export interface UseTripPhotosResult {
 }
 
 export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
+  const [stateTripId, setStateTripId] = useState(tripId);
   const [photos, setPhotos] = useState<TripPhoto[]>([]);
   const [status, setStatus] = useState<PhotoListStatus>('loading');
   const [error, setError] = useState<PhotoFailure | null>(null);
@@ -127,8 +130,44 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
   const mountedRef = useRef(true);
   const hasLoadedOnceRef = useRef(false);
   /** One shared reconcile for every tile that reports an ambiguous 404. */
-  const reconcileInFlightRef = useRef<Promise<boolean> | null>(null);
+  const reconcileInFlightRef = useRef<Promise<ReconcileEvidence> | null>(null);
   const tripInvalidatedRef = useRef(false);
+  const refsTripIdRef = useRef(tripId);
+
+  if (stateTripId !== tripId) {
+    // React permits a guarded render-phase adjustment when state is derived
+    // from an identity prop. It restarts this component before committing, so
+    // the old trip is never painted and no reset-only effect causes a second
+    // visible render. The layout effect below moves imperative request state
+    // before passive focus effects or external promise callbacks can proceed.
+    setPhotos([]);
+    setStatus('loading');
+    setError(null);
+    setErrorSource(null);
+    setRefreshing(false);
+    setLoadingMore(false);
+    setHasNextPage(false);
+    setTripNotFound(false);
+    setStateTripId(tripId);
+  }
+
+  useLayoutEffect(() => {
+    if (refsTripIdRef.current === tripId) {
+      return;
+    }
+    refsTripIdRef.current = tripId;
+    firstPageRequestRef.current += 1;
+    listGenerationRef.current += 1;
+    firstPageInFlightRef.current = false;
+    loadMoreInFlightRef.current = false;
+    nextCursorRef.current = null;
+    hasUsablePageRef.current = false;
+    overridesRef.current.clear();
+    overrideVersionRef.current += 1;
+    hasLoadedOnceRef.current = false;
+    reconcileInFlightRef.current = null;
+    tripInvalidatedRef.current = false;
+  }, [tripId]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -144,11 +183,20 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
       return;
     }
     tripInvalidatedRef.current = true;
+    // Invalidate every response already in flight before changing visible
+    // state. A list success that started while membership was still valid must
+    // not resurrect the gallery after an explicit TRIP_NOT_FOUND.
+    firstPageRequestRef.current += 1;
+    listGenerationRef.current += 1;
+    firstPageInFlightRef.current = false;
+    loadMoreInFlightRef.current = false;
     if (tripId) {
       void invalidateProtectedAssets(tripPhotoAssetKeyPrefix(tripId));
     }
     setPhotos([]);
     setHasNextPage(false);
+    setRefreshing(false);
+    setLoadingMore(false);
     setTripNotFound(true);
     setStatus('error');
     setErrorSource('initial');
@@ -282,34 +330,67 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
    * Runs one silent reconcile no matter how many callers ask at once, and
    * reports whether the trip is still readable.
    */
-  const coalescedReconcile = useCallback((): Promise<boolean> => {
+  const coalescedReconcile = useCallback((): Promise<ReconcileEvidence> => {
     if (reconcileInFlightRef.current) {
       return reconcileInFlightRef.current;
     }
-    const pending = (async () => {
-      if (!tripId) {
-        return false;
-      }
+    if (!tripId || tripInvalidatedRef.current) {
+      return Promise.resolve('unreadable');
+    }
+
+    // This is a first-page read even though its caller only wants evidence.
+    // Give it the same sequencing authority as refresh/focus: supersede an
+    // older first page, invalidate any load-more append already in flight, and
+    // allow a newer first page to supersede this reconcile in turn.
+    const requestId = firstPageRequestRef.current + 1;
+    firstPageRequestRef.current = requestId;
+    firstPageInFlightRef.current = true;
+    listGenerationRef.current += 1;
+    loadMoreInFlightRef.current = false;
+    setLoadingMore(false);
+    const requestOverrideVersion = overrideVersionRef.current;
+
+    let pending!: Promise<ReconcileEvidence>;
+    pending = (async () => {
       try {
         const page = await listTripPhotos(tripId);
-        if (!mountedRef.current) {
-          return true;
+        if (
+          requestId !== firstPageRequestRef.current ||
+          !mountedRef.current
+        ) {
+          return 'unknown';
+        }
+        if (tripInvalidatedRef.current) {
+          return 'unreadable';
         }
         nextCursorRef.current = page.nextCursor;
         setHasNextPage(page.nextCursor !== null);
-        setPhotos(applyOverrides(page.items, overridesRef.current, overrideVersionRef.current, true));
+        setPhotos(
+          applyOverrides(page.items, overridesRef.current, requestOverrideVersion, true),
+        );
         hasUsablePageRef.current = true;
-        return true;
+        return 'readable';
       } catch (caught) {
+        if (
+          requestId !== firstPageRequestRef.current ||
+          !mountedRef.current
+        ) {
+          return 'unknown';
+        }
         const failure = toPhotoFailure(caught);
         if (failure.kind === 'notFound') {
-          return false;
+          return 'unreadable';
         }
-        // Any other failure leaves the question open; the caller treats that as
-        // "no evidence" and does not tombstone.
-        return true;
+        // Network/5xx is genuinely no evidence. It must not be collapsed into
+        // readable, because doing so tombstones a photo on an ambiguous 404.
+        return 'unknown';
       } finally {
-        reconcileInFlightRef.current = null;
+        if (requestId === firstPageRequestRef.current) {
+          firstPageInFlightRef.current = false;
+        }
+        if (reconcileInFlightRef.current === pending) {
+          reconcileInFlightRef.current = null;
+        }
       }
     })();
     reconcileInFlightRef.current = pending;
@@ -369,13 +450,13 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
         enterTripNotFound();
         return;
       }
-      void coalescedReconcile().then((tripReadable) => {
+      void coalescedReconcile().then((evidence) => {
         if (!mountedRef.current) {
           return;
         }
-        if (tripReadable) {
+        if (evidence === 'readable') {
           markPhotoStale(photoId);
-        } else {
+        } else if (evidence === 'unreadable') {
           enterTripNotFound();
         }
       });
@@ -413,15 +494,20 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
     }, [tripId, loadFirstPage]),
   );
 
+  const stateMatchesTrip = stateTripId === tripId;
+
   return {
-    photos,
-    status,
-    error,
-    errorSource,
-    refreshing,
-    loadingMore,
-    hasNextPage,
-    tripNotFound,
+    // Effects reset the backing state after a route transition. These derived
+    // guards also protect the render before that effect runs, so trip A can
+    // never be painted under trip B's route identity.
+    photos: stateMatchesTrip ? photos : [],
+    status: stateMatchesTrip ? status : 'loading',
+    error: stateMatchesTrip ? error : null,
+    errorSource: stateMatchesTrip ? errorSource : null,
+    refreshing: stateMatchesTrip ? refreshing : false,
+    loadingMore: stateMatchesTrip ? loadingMore : false,
+    hasNextPage: stateMatchesTrip ? hasNextPage : false,
+    tripNotFound: stateMatchesTrip ? tripNotFound : false,
     loadFirstPage,
     loadMore,
     reconcile,
