@@ -153,8 +153,12 @@ export function PhotoGrid({
       key={`photo-grid-${columnCount}`}
       columnWrapperStyle={columnCount > 1 ? styles.row : undefined}
       contentContainerStyle={contentStyle}
-      onEndReached={onEndReached}
+      // A stable pagination error is a user-decision boundary. Footer layout
+      // changes must not spend another throttled request behind the user's
+      // back; only the explicit Retry control may cross it.
+      onEndReached={pageError ? undefined : onEndReached}
       onEndReachedThreshold={0.4}
+      maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
       ListHeaderComponent={ListHeaderComponent}
       ListEmptyComponent={ListEmptyComponent}

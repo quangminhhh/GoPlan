@@ -5,6 +5,7 @@ import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 import { Screen } from '@/shared/ui/Screen';
 import { PhotoGrid } from '../components/PhotoGrid';
+import { PhotoFeedbackToast } from '../components/PhotoFeedbackToast';
 import { PhotoSelectionBar } from '../components/PhotoSelectionBar';
 import { PhotoUploadSheet } from '../components/PhotoUploadSheet';
 import { PhotoViewer } from '../components/PhotoViewer';
@@ -12,6 +13,7 @@ import { PHOTO_ERROR_MESSAGES, type PhotoFailure } from '../errors';
 import { usePhotoSelection } from '../hooks/usePhotoSelection';
 import { usePhotoUpload } from '../hooks/usePhotoUpload';
 import { usePhotoViewer } from '../hooks/usePhotoViewer';
+import { useTripPhotoScope } from '../hooks/useTripPhotoScope';
 import { useTripPhotos } from '../hooks/useTripPhotos';
 
 /**
@@ -21,6 +23,7 @@ import { useTripPhotos } from '../hooks/useTripPhotos';
 export function PhotosScreen() {
   const [selectionBarHeight, setSelectionBarHeight] = useState(0);
   const { tripId } = useLocalSearchParams<{ tripId: string }>();
+  const photoScope = useTripPhotoScope(tripId);
   const {
     photos,
     status,
@@ -29,14 +32,20 @@ export function PhotosScreen() {
     refreshing,
     loadingMore,
     hasNextPage,
+    tombstonedPhotoIds,
+    isPhotoTombstoned,
+    subscribePhotoTombstones,
     tripNotFound,
     loadFirstPage,
     loadMore,
+    retryLoadMore,
     reconcile,
     prependUploaded,
     removePhoto,
+    markPhotoStale,
+    resolveAssetNotFound,
     handleAssetNotFound,
-  } = useTripPhotos(tripId);
+  } = useTripPhotos(tripId, photoScope);
 
   const handleTripNotFound = useCallback(
     (failure?: PhotoFailure) => {
@@ -64,6 +73,7 @@ export function PhotosScreen() {
     close: closeUploadSession,
   } = usePhotoUpload({
     tripId,
+    scope: photoScope,
     onUploaded: prependUploaded,
     onReconcile: () => {
       void reconcile();
@@ -91,6 +101,10 @@ export function PhotosScreen() {
     void loadMore();
   }, [loadMore]);
 
+  const handleRetryPage = useCallback(() => {
+    void retryLoadMore();
+  }, [retryLoadMore]);
+
   const {
     currentIndex,
     currentPhoto,
@@ -104,12 +118,16 @@ export function PhotosScreen() {
     dismissAction: dismissViewerAction,
   } = usePhotoViewer({
     tripId,
+    scope: photoScope,
     photos,
     hasNextPage,
     loadMore: handleEndReached,
     reconcile,
     removePhoto,
+    isPhotoTombstoned,
     onAssetNotFound: handleAssetNotFound,
+    onTripUnavailable: handleTripNotFound,
+    resolveAmbiguousNotFound: resolveAssetNotFound,
   });
 
   const handleDelete = useCallback(() => {
@@ -123,21 +141,27 @@ export function PhotosScreen() {
   const {
     selectionMode,
     selectedCount,
-    download: selectionDownload,
+    saveSnapshot: selectionSaveSnapshot,
+    feedback: selectionFeedback,
     enterSelection,
     toggle: toggleSelection,
     isSelected,
     selectLoaded,
     clear: clearSelection,
     exit: exitSelection,
-    startDownload,
-    cancelDownload,
-    dismissMessage: dismissSelectionMessage,
+    startSave: startSelectionSave,
+    cancelSave: cancelSelectionSave,
+    dismissFeedback: dismissSelectionFeedback,
   } = usePhotoSelection({
     tripId,
     photos,
-    reconcile,
-    onTripNotFound: handleTripNotFound,
+    tombstonedPhotoIds,
+    isPhotoTombstoned,
+    subscribePhotoTombstones,
+    scope: photoScope,
+    onTombstone: markPhotoStale,
+    onTripUnavailable: handleTripNotFound,
+    resolveAmbiguousNotFound: resolveAssetNotFound,
   });
 
   // A long press enters selection mode rather than opening the photo, and a tap
@@ -153,9 +177,9 @@ export function PhotosScreen() {
     [selectionMode, toggleSelection, openViewer],
   );
 
-  const handleStartDownload = useCallback(() => {
-    void startDownload();
-  }, [startDownload]);
+  const handleStartSelectionSave = useCallback(() => {
+    void startSelectionSave();
+  }, [startSelectionSave]);
 
   const detachedFeedback = useMemo(() => {
     if (uploadPickFailure) {
@@ -178,14 +202,11 @@ export function PhotosScreen() {
     }
     if (
       !selectionMode &&
-      (selectionDownload.status === 'message' || selectionDownload.status === 'error')
+      selectionFeedback
     ) {
       return {
-        message:
-          selectionDownload.status === 'message'
-            ? selectionDownload.message
-            : selectionDownload.failure.message,
-        dismiss: dismissSelectionMessage,
+        message: selectionFeedback.message,
+        dismiss: dismissSelectionFeedback,
       };
     }
     return null;
@@ -196,8 +217,8 @@ export function PhotosScreen() {
     viewerAction,
     dismissViewerAction,
     selectionMode,
-    selectionDownload,
-    dismissSelectionMessage,
+    selectionFeedback,
+    dismissSelectionFeedback,
   ]);
 
   if (tripNotFound) {
@@ -280,7 +301,7 @@ export function PhotosScreen() {
             pageError={null}
             onRefresh={refresh}
             onEndReached={handleEndReached}
-            onRetryPage={handleEndReached}
+            onRetryPage={handleRetryPage}
             onPhotoPress={handleTilePress}
             onPhotoLongPress={enterSelection}
             onAssetNotFound={handleAssetNotFound}
@@ -303,15 +324,12 @@ export function PhotosScreen() {
         </View>
         {uploadSheet}
         {detachedFeedback ? (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Dismiss message"
-            onPress={detachedFeedback.dismiss}
-            style={styles.toast}
+          <PhotoFeedbackToast
+            message={detachedFeedback.message}
+            onDismiss={detachedFeedback.dismiss}
+            style={styles.toastPlacement}
             testID="photos-feedback-toast"
-          >
-            <Text style={styles.toastText}>{detachedFeedback.message}</Text>
-          </Pressable>
+          />
         ) : null}
       </Screen>
     );
@@ -335,7 +353,7 @@ export function PhotosScreen() {
           pageError={pageError}
           onRefresh={refresh}
           onEndReached={handleEndReached}
-          onRetryPage={handleEndReached}
+          onRetryPage={handleRetryPage}
           onPhotoPress={handleTilePress}
           onPhotoLongPress={enterSelection}
           onAssetNotFound={handleAssetNotFound}
@@ -346,13 +364,14 @@ export function PhotosScreen() {
         {selectionMode ? (
           <PhotoSelectionBar
             selectedCount={selectedCount}
-            hasNextPage={hasNextPage}
-            download={selectionDownload}
+            loadedCount={photos.length}
+            saveSnapshot={selectionSaveSnapshot}
+            feedback={selectionFeedback}
             onSelectLoaded={selectLoaded}
             onClear={clearSelection}
             onExit={exitSelection}
-            onDownload={handleStartDownload}
-            onCancelDownload={cancelDownload}
+            onSave={handleStartSelectionSave}
+            onCancelSave={cancelSelectionSave}
             onHeightChange={setSelectionBarHeight}
           />
         ) : null}
@@ -375,15 +394,12 @@ export function PhotosScreen() {
         />
       ) : null}
       {detachedFeedback ? (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Dismiss message"
-          onPress={detachedFeedback.dismiss}
-          style={styles.toast}
+        <PhotoFeedbackToast
+          message={detachedFeedback.message}
+          onDismiss={detachedFeedback.dismiss}
+          style={styles.toastPlacement}
           testID="photos-feedback-toast"
-        >
-          <Text style={styles.toastText}>{detachedFeedback.message}</Text>
-        </Pressable>
+        />
       ) : null}
     </Screen>
   );
@@ -419,14 +435,10 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
   },
   bannerText: { ...typography.caption, color: colors.warning },
-  toast: {
-    backgroundColor: colors.text,
-    borderRadius: radii.md,
+  toastPlacement: {
     bottom: spacing.lg,
     left: spacing.lg,
-    padding: spacing.md,
     position: 'absolute',
     right: spacing.lg,
   },
-  toastText: { ...typography.caption, color: colors.background, textAlign: 'center' },
 });

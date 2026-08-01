@@ -59,7 +59,13 @@ jest.mock('expo-file-system', () => {
 // the sets above, and the production module constructs its default stores while
 // it is imported.
 // eslint-disable-next-line import/first
-import { createNativeFileStore } from '../protectedTransport';
+import {
+  createNativeFileStore,
+  nativePhotoSaveFileStore,
+  nativeProtectedFileStore,
+  nativeUploadTempFileStore,
+  PHOTO_SAVE_TEMP_NAMESPACE,
+} from '../protectedTransport';
 
 describe('createNativeFileStore', () => {
   beforeEach(() => {
@@ -76,5 +82,11 @@ describe('createNativeFileStore', () => {
     expect(mockDeletedUris).toHaveBeenCalledWith(
       'file:///cache/atomic-sink-test/asset.webp',
     );
+  });
+
+  it('keeps the PhotoKit handoff namespace separate from cache and upload temp', () => {
+    expect(PHOTO_SAVE_TEMP_NAMESPACE).toBe('goplan-photo-save');
+    expect(nativePhotoSaveFileStore).not.toBe(nativeProtectedFileStore);
+    expect(nativePhotoSaveFileStore).not.toBe(nativeUploadTempFileStore);
   });
 });

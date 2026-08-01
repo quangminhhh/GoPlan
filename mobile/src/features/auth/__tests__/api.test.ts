@@ -1,10 +1,12 @@
  
 import { apiClient } from '@/shared/api/client';
 import {
+  authCloseHttp,
   changePasswordRequest,
   deleteAvatarRequest,
   fetchMe,
   loginRequest,
+  logoutRequest,
   profileSetupRequest,
   requestPasswordResetRequest,
   updateProfileNameRequest,
@@ -30,6 +32,18 @@ describe('auth api', () => {
   it('fetchMe unwraps the user envelope', async () => {
     jest.spyOn(apiClient, 'get').mockResolvedValue({ data: { user: { id: 'u1' } } });
     await expect(fetchMe()).resolves.toEqual({ id: 'u1' });
+  });
+
+  it('revokes through the low-level client with a matched access/refresh pair', async () => {
+    const post = jest.spyOn(authCloseHttp, 'post').mockResolvedValue({ data: null });
+
+    await logoutRequest({ access: 'closing-access', refresh: 'closing-refresh' });
+
+    expect(post).toHaveBeenCalledWith(
+      '/auth/logout',
+      { refresh: 'closing-refresh' },
+      { headers: { Authorization: 'Bearer closing-access' } },
+    );
   });
 
   it('profileSetupRequest unwraps the user envelope', async () => {

@@ -1,18 +1,17 @@
 /**
- * The production implementation of `NativePhotoActions`.
+ * The production implementation of `PhotoLibraryAdapter`.
  *
- * Separated from `downloads.ts` for the same reason `imageCodec.ts` is separate
+ * Separated from `photoSave.ts` for the same reason `imageCodec.ts` is separate
  * from `preprocessImage.ts`: this is the only module that loads
- * expo-media-library and expo-sharing, so the logic that uses them stays
+ * expo-media-library, so the logic that uses it stays
  * testable. It matters more here than usual — `MediaLibrary.Asset` extends a
  * native class, so merely importing the module outside a device runtime throws.
  */
 
 import * as MediaLibrary from 'expo-media-library';
-import * as Sharing from 'expo-sharing';
-import type { NativePhotoActions } from './downloads';
+import type { PhotoLibraryAdapter } from './photoSaveTypes';
 
-export const nativePhotoActions: NativePhotoActions = {
+export const nativePhotoActions: PhotoLibraryAdapter = {
   async requestAddOnlyPermission() {
     // `writeOnly: true` with photos-only granularity: saving needs to add an
     // asset, never to read the user's library.
@@ -25,14 +24,8 @@ export const nativePhotoActions: NativePhotoActions = {
   },
 
   async createAsset(fileUri: string) {
-    // SDK 57's non-legacy save. The root `saveToLibraryAsync` is documented as
-    // deprecated and as throwing at runtime, so it is never called.
+    // SDK 57's supported Asset API avoids the deprecated root-level helper,
+    // which throws at runtime on this version.
     await MediaLibrary.Asset.create(fileUri);
-  },
-
-  isSharingAvailable: () => Sharing.isAvailableAsync(),
-
-  async share(fileUri, options) {
-    await Sharing.shareAsync(fileUri, options);
   },
 };

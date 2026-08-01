@@ -143,11 +143,13 @@ export interface FakeFileStore extends ProtectedFileStore {
   setAvailableBytes(value: number | null): void;
   purgeCount(): number;
   discarded(): string[];
+  createdFileNames(): string[];
 }
 
 export function createFakeFileStore(namespace = 'fake-protected'): FakeFileStore {
   const files = new Map<string, FakeFileRecord>();
   const discarded: string[] = [];
+  const createdFileNames: string[] = [];
   let created = 0;
   let purges = 0;
   let available: number | null = 8 * 1024 * 1024 * 1024;
@@ -159,6 +161,7 @@ export function createFakeFileStore(namespace = 'fake-protected'): FakeFileStore
   return {
     async createSink(fileName: string): Promise<ProtectedFileSink> {
       created += 1;
+      createdFileNames.push(fileName);
       const uri = `file:///${namespace}/${created}-${fileName}`;
       const record: FakeFileRecord = { chunks: [], closed: false };
       files.set(uri, record);
@@ -212,6 +215,7 @@ export function createFakeFileStore(namespace = 'fake-protected'): FakeFileStore
     },
     purgeCount: () => purges,
     discarded: () => discarded,
+    createdFileNames: () => [...createdFileNames],
   };
 }
 

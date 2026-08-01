@@ -1,4 +1,2 @@
 allowBuilds:
   unrs-resolver: true
-minimumReleaseAgeExclude:
-  - expo-sharing@57.0.8

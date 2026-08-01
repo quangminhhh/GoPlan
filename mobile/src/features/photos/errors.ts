@@ -3,9 +3,9 @@
  * respect (D18).
  *
  * Photo work arrives through two paths: Axios for list/upload/delete, and
- * `fetchProtectedResponse` for asset bytes and the bulk ZIP. They throw
- * different error types, and every call site needs the same three facts — what
- * kind of failure, what the server called it, and what is safe to show.
+ * `fetchProtectedResponse` for protected asset bytes and Save to Photos. They
+ * throw different error types, and every call site needs the same three facts —
+ * what kind of failure, what the server called it, and what is safe to show.
  */
 
 import { normalizeApiError } from '@/shared/api/errors';
@@ -33,9 +33,9 @@ export const PHOTO_ERROR_MESSAGES = {
   uploadThrottled: 'Upload limit reached. Try again later.',
   assetThrottled: 'Too many photo requests. Please wait a moment and try again.',
   downloadThrottled: 'Download limit reached. Try again later.',
-  bulkThrottled: 'Download limit reached. Try again later.',
-  bulkStale: 'Some selected photos are no longer available.',
   lowStorage: 'Not enough storage space to prepare these photos.',
+  invalidDownload: 'This photo could not be downloaded.',
+  saveUnknown: 'This photo may already be saved. Check Photos before trying again.',
   selectionCap: 'You can select up to 100 photos.',
 } as const;
 
@@ -91,8 +91,8 @@ export function isCancelledFailure(failure: PhotoFailure): boolean {
 /**
  * What a 404 actually means at this call site.
  *
- * Asset, delete, single save and bulk download all resolve membership before
- * they resolve a photo, so any of them can answer either way. Collapsing both
+ * Asset, delete and Save to Photos all resolve membership before they resolve a
+ * photo, so any of them can answer either way. Collapsing both
  * into "photo is stale" tombstones tiles one by one while the real story is that
  * the user was removed from the trip.
  *

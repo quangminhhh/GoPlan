@@ -12,6 +12,7 @@ import { StyleSheet, View } from 'react-native';
 import { Gesture, GestureDetector, type GestureType } from 'react-native-gesture-handler';
 import Animated, {
   runOnJS,
+  type SharedValue,
   useAnimatedReaction,
   useAnimatedStyle,
   useSharedValue,
@@ -34,6 +35,9 @@ interface ZoomablePhotoProps {
   zoomed: boolean;
   /** Native recognizer coordinated with the child gestures. */
   pagerGesture: GestureType;
+  dismissGesture: GestureType;
+  /** UI-thread lock shared with the pager and dismiss owners. */
+  pinchInProgress: SharedValue<boolean>;
   /** Reported so the pager can stop competing for horizontal drags. */
   onZoomChange?: (zoomed: boolean) => void;
   children: React.ReactNode;
@@ -47,6 +51,8 @@ export function ZoomablePhoto({
   sourceHeight,
   zoomed,
   pagerGesture,
+  dismissGesture,
+  pinchInProgress,
   onZoomChange,
   children,
 }: ZoomablePhotoProps) {
@@ -64,7 +70,12 @@ export function ZoomablePhoto({
   // would leave the pager disabled.
   useEffect(() => {
     onZoomChange?.(false);
-  }, [onZoomChange]);
+    return () => {
+      if (onZoomChange) {
+        pinchInProgress.set(false);
+      }
+    };
+  }, [onZoomChange, pinchInProgress]);
 
   const reportZoom = (zoomed: boolean): void => {
     onZoomChange?.(zoomed);
@@ -100,7 +111,12 @@ export function ZoomablePhoto({
   );
 
   const pinch = Gesture.Pinch()
-    .simultaneousWithExternalGesture(pagerGesture)
+    .withTestId(`photo-pinch-${photoId}`)
+    .blocksExternalGesture(pagerGesture, dismissGesture)
+    .onBegin(() => {
+      'worklet';
+      pinchInProgress.set(true);
+    })
     .onUpdate((event) => {
       'worklet';
       scale.set(clampNumber(savedScale.get() * event.scale, MIN_ZOOM, MAX_ZOOM));
@@ -122,9 +138,25 @@ export function ZoomablePhoto({
       savedTranslateX.set(nextX);
       savedTranslateY.set(nextY);
       runOnJS(reportZoom)(scale.get() > MIN_ZOOM);
+    })
+    .onFinalize((_event, success) => {
+      'worklet';
+      if (!success) {
+        // CANCEL/FAIL do not run onEnd. Roll the transient transform back to
+        // the last committed gesture so the next double tap/pinch does not
+        // inherit a scale React still considers unzoomed.
+        const stableScale = savedScale.get();
+        scale.set(withTiming(stableScale));
+        translateX.set(withTiming(savedTranslateX.get()));
+        translateY.set(withTiming(savedTranslateY.get()));
+        runOnJS(reportZoom)(stableScale > MIN_ZOOM);
+      }
+      // Every terminal state releases the parent arbitration lock.
+      pinchInProgress.set(false);
     });
 
   const zoomPan = Gesture.Pan()
+    .withTestId(`photo-zoom-pan-${photoId}`)
     .enabled(zoomed)
     .simultaneousWithExternalGesture(pagerGesture)
     .onUpdate((event) => {
@@ -156,6 +188,7 @@ export function ZoomablePhoto({
     });
 
   const doubleTap = Gesture.Tap()
+    .withTestId(`photo-double-tap-${photoId}`)
     .numberOfTaps(2)
     .simultaneousWithExternalGesture(pagerGesture)
     .onEnd(() => {

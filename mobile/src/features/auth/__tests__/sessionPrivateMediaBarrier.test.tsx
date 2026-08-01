@@ -2,12 +2,9 @@
  * D20 regression: a refresh that is already in flight when the user signs out
  * must not resurrect the session.
  *
- * Both transports are covered, because both can refresh. `fetchProtectedResponse`
- * calls `refreshTokens()` directly; an Axios photo call refreshes inside the
- * response interceptor in `shared/api/client.ts`. Tracking only the first would
- * leave the second free to write a fresh access token into a store the user just
- * cleared. Neither `refresh.ts` nor the interceptor is modified — the barrier is
- * entirely at the caller.
+ * Both transports are covered, because both can refresh. The global auth
+ * coordinator owns credential activity and generation checks; the private-media
+ * lifecycle independently aborts the media operation and purges general temp.
  */
 
 jest.mock('expo-secure-store', () => {
@@ -26,6 +23,14 @@ jest.mock('../api', () => ({
   fetchMe: jest.fn(),
   logoutRequest: jest.fn(),
 }));
+jest.mock('@/shared/media/photoSaveTempStore', () => ({
+  photoSaveTempCoordinator: {
+    bootstrap: jest.fn(async () => undefined),
+    activateSession: jest.fn(),
+    suspend: jest.fn(),
+    resume: jest.fn(),
+  },
+}));
 
 // eslint-disable-next-line import/first
 import { act, renderHook, waitFor } from '@testing-library/react-native';
@@ -36,13 +41,20 @@ import { AxiosError } from 'axios';
 // eslint-disable-next-line import/first
 import { apiClient } from '@/shared/api/client';
 // eslint-disable-next-line import/first
+import { __resetAuthSessionLifecycleForTests } from '@/shared/api/authSessionLifecycle';
+// eslint-disable-next-line import/first
 import { refreshHttp } from '@/shared/api/refresh';
 // eslint-disable-next-line import/first
-import { getAccessToken, getRefreshToken, setAccessToken } from '@/shared/api/token-store';
+import { getAccessToken, getRefreshToken } from '@/shared/api/token-store';
 // eslint-disable-next-line import/first
 import { fetchProtectedResponse } from '@/shared/media/fetchProtectedAsset';
 // eslint-disable-next-line import/first
-import { trackPrivateOperation } from '@/shared/media/privateMediaLifecycle';
+import {
+  __resetPrivateMediaLifecycleForTests,
+  acquirePrivateTransferLease,
+  getPrivateTransferLeaseCount,
+  trackPrivateOperation,
+} from '@/shared/media/privateMediaLifecycle';
 // eslint-disable-next-line import/first
 import { bytes, createDeferred, createFakeTransport, flushMicrotasks, imageResponse, jsonErrorResponse } from '@test/fakeProtectedTransport';
 // eslint-disable-next-line import/first
@@ -103,11 +115,11 @@ afterEach(() => {
 });
 
 beforeEach(async () => {
+  __resetAuthSessionLifecycleForTests();
+  __resetPrivateMediaLifecycleForTests();
   jest.clearAllMocks();
-  setAccessToken(null);
-  // The real refresh module is used here on purpose: single-flight, the
-  // generation barrier and the SecureStore write queue are the mechanisms under
-  // test. Only the network underneath it is faked.
+  // The real refresh module is used here on purpose: ticket-scoped single-flight,
+  // the global generation barrier, and the SecureStore queue are under test.
   await getRefreshToken();
 });
 
@@ -123,7 +135,7 @@ describe('sign-out while a protected fetch is refreshing', () => {
       path: '/trips/trip-1/photos/photo-1/thumbnail',
       transport,
     }).catch((error: unknown) => error);
-    await flushMicrotasks();
+    await waitFor(() => expect(refreshHttpCallCount()).toBe(2));
 
     // Sign out while the 401 has been observed and the refresh is in flight.
     await act(async () => {
@@ -134,8 +146,8 @@ describe('sign-out while a protected fetch is refreshing', () => {
     });
     await pending;
 
-    // The gated refresh really ran and really wrote a new pair; sign-out waited
-    // for it and cleared afterwards, so nothing survives.
+    // The gated raw refresh really ran; close captured its response pair for
+    // revoke without publishing or replaying it, then cleared local state.
     expect(refreshHttpCallCount()).toBe(2);
     expect(events).toEqual(['refresh-settled', 'logout']);
     expect(result.current.status).toBe('signedOut');
@@ -143,6 +155,50 @@ describe('sign-out while a protected fetch is refreshing', () => {
     expect(await getRefreshToken()).toBeNull();
     // The aborted request never retried.
     expect(transport.fetches.calls).toHaveLength(1);
+  });
+});
+
+describe('sign-out while an upload request still owns its temp input', () => {
+  it('waits for the tracked request and lease before revoke without deadlocking', async () => {
+    const { result, events } = await signedInSessionWithGatedRefresh();
+    const requestGate = createDeferred<void>();
+    const releaseLease = acquirePrivateTransferLease();
+    let aborted = false;
+
+    const operation = trackPrivateOperation(async (signal) => {
+      signal.addEventListener('abort', () => {
+        aborted = true;
+      });
+      try {
+        // Axios/native may need a turn to settle after observing abort. The
+        // upload-temp URI remains owned until this promise releases its lease.
+        await requestGate.promise;
+      } finally {
+        releaseLease();
+      }
+    });
+
+    let signingOut!: Promise<void>;
+    await act(async () => {
+      signingOut = result.current.signOut();
+      await flushMicrotasks();
+    });
+
+    expect(aborted).toBe(true);
+    expect(result.current.status).toBe('signedOut');
+    expect(getPrivateTransferLeaseCount()).toBe(1);
+    expect(events).toEqual([]);
+
+    requestGate.resolve();
+    await operation;
+    await act(async () => {
+      await signingOut;
+    });
+
+    expect(getPrivateTransferLeaseCount()).toBe(0);
+    expect(events).toEqual(['logout']);
+    expect(getAccessToken()).toBeNull();
+    expect(await getRefreshToken()).toBeNull();
   });
 });
 
@@ -176,7 +232,7 @@ describe('sign-out while an Axios photo request is refreshing', () => {
         .request({ url: '/trips/trip-1/photos/photo-1', method: 'delete', signal })
         .catch((error: unknown) => error),
     ).catch((error: unknown) => error);
-    await flushMicrotasks();
+    await waitFor(() => expect(refreshHttpCallCount()).toBe(2));
 
     await act(async () => {
       const signingOut = result.current.signOut();
@@ -186,9 +242,8 @@ describe('sign-out while an Axios photo request is refreshing', () => {
     });
     await operation;
 
-    // The interceptor's own refresh ran inside the tracked operation and wrote a
-    // fresh pair; sign-out waited for it before revoking, so the clear wins.
-    // Without the barrier this ordering flips and the app comes back signed in.
+    // The interceptor's own raw refresh is globally tracked even after the
+    // media abort. Close waits it, revokes the handoff, and never replays.
     expect(axiosAttempts).toBe(1);
     expect(refreshHttpCallCount()).toBe(2);
     expect(events).toEqual(['refresh-settled', 'logout']);

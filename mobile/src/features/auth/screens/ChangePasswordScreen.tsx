@@ -7,7 +7,6 @@ import { Button } from '@/shared/ui/Button';
 import { Screen } from '@/shared/ui/Screen';
 import { TextField } from '@/shared/ui/TextField';
 import { mapChangePasswordError, type PasswordFieldErrors } from '../accountErrors';
-import { changePasswordRequest } from '../api';
 import { useSession } from '../session';
 
 /**
@@ -16,7 +15,7 @@ import { useSession } from '../session';
  * body: never a log line, never an error message, never a stored value.
  */
 export function ChangePasswordScreen() {
-  const { rotateSession } = useSession();
+  const { changePassword } = useSession();
   const router = useRouter();
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -40,13 +39,12 @@ export function ChangePasswordScreen() {
     submitLockRef.current = true;
     setSubmitting(true);
     try {
-      const auth = await changePasswordRequest({
+      // SessionContext registers the credential mutation before sending the
+      // request, then owns revision adoption and any close that crosses it.
+      const outcome = await changePassword({
         current_password: currentPassword,
         new_password: newPassword,
       });
-      // The server has already revoked every previous token, so the pair in this
-      // response must be adopted before anything else can fire a request.
-      const outcome = await rotateSession(auth);
       if (outcome === 'signedOut') {
         // The stack guard redirects to login; nothing further to do here.
         return;

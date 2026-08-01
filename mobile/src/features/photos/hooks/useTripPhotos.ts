@@ -22,11 +22,15 @@ import {
   toPhotoFailure,
   type PhotoFailure,
 } from '../errors';
+import { mergeTripPhotoFirstPage } from '../photoListReconcile';
 import type { TripPhoto } from '../types';
+import type { AmbiguousNotFoundResolution } from '../photoSaveTypes';
+import type { TripPhotoScopeController } from './useTripPhotoScope';
 
 export type PhotoListStatus = 'loading' | 'ready' | 'error';
 export type PhotoLoadMode = 'initial' | 'refresh' | 'silent';
 export type PhotoErrorSource = 'initial' | 'refresh' | 'loadMore' | 'background' | 'mutation' | null;
+export type PhotoTombstoneListener = (photoId: string) => void;
 
 interface PhotoOverride {
   version: number;
@@ -97,18 +101,36 @@ export interface UseTripPhotosResult {
   refreshing: boolean;
   loadingMore: boolean;
   hasNextPage: boolean;
+  /** Exact ids proven unavailable for the current trip generation. */
+  tombstonedPhotoIds: ReadonlySet<string>;
+  /** Synchronous read used by the final pre-PhotoKit commit gate. */
+  isPhotoTombstoned: (photoId: string) => boolean;
+  /**
+   * Publishes authoritative removal before React state/effects run, allowing an
+   * active download to abort and a native-boundary gate to fail in the same tick.
+   */
+  subscribePhotoTombstones: (listener: PhotoTombstoneListener) => () => void;
   /** Trip is gone or no longer readable. Neutral by design — see D18. */
   tripNotFound: boolean;
   loadFirstPage: (mode: PhotoLoadMode) => Promise<void>;
   loadMore: () => Promise<void>;
+  retryLoadMore: () => Promise<void>;
   reconcile: () => Promise<void>;
   prependUploaded: (photos: TripPhoto[]) => void;
   removePhoto: (photoId: string) => void;
   markPhotoStale: (photoId: string) => void;
+  resolveAssetNotFound: (
+    photoId: string,
+    failure: PhotoFailure,
+  ) => Promise<AmbiguousNotFoundResolution>;
   handleAssetNotFound: (photoId: string, failure: PhotoFailure) => void;
 }
 
-export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
+export function useTripPhotos(
+  tripId: string | undefined,
+  scope: TripPhotoScopeController,
+): UseTripPhotosResult {
+  const scopeTicket = scope.capture();
   const [stateTripId, setStateTripId] = useState(tripId);
   const [photos, setPhotos] = useState<TripPhoto[]>([]);
   const [status, setStatus] = useState<PhotoListStatus>('loading');
@@ -118,8 +140,15 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasNextPage, setHasNextPage] = useState(false);
   const [tripNotFound, setTripNotFound] = useState(false);
+  const [tombstonedPhotoIds, setTombstonedPhotoIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const tombstonedPhotoIdsRef = useRef<Set<string>>(new Set());
+  const tombstoneListenersRef = useRef(new Set<PhotoTombstoneListener>());
 
   const nextCursorRef = useRef<string | null>(null);
+  const failedCursorRef = useRef<string | null>(null);
+  const hasLoadedDeepPageRef = useRef(false);
   const firstPageRequestRef = useRef(0);
   const firstPageInFlightRef = useRef(false);
   const listGenerationRef = useRef(0);
@@ -148,6 +177,7 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
     setLoadingMore(false);
     setHasNextPage(false);
     setTripNotFound(false);
+    setTombstonedPhotoIds(new Set());
     setStateTripId(tripId);
   }
 
@@ -161,28 +191,56 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
     firstPageInFlightRef.current = false;
     loadMoreInFlightRef.current = false;
     nextCursorRef.current = null;
+    failedCursorRef.current = null;
+    hasLoadedDeepPageRef.current = false;
     hasUsablePageRef.current = false;
     overridesRef.current.clear();
     overrideVersionRef.current += 1;
     hasLoadedOnceRef.current = false;
     reconcileInFlightRef.current = null;
     tripInvalidatedRef.current = false;
+    tombstonedPhotoIdsRef.current = new Set();
   }, [tripId]);
 
   useEffect(() => {
     mountedRef.current = true;
+    const tombstoneListeners = tombstoneListenersRef.current;
     return () => {
       mountedRef.current = false;
+      tombstoneListeners.clear();
     };
   }, []);
 
+  const isPhotoTombstoned = useCallback(
+    (photoId: string): boolean =>
+      scope.isCurrent(scopeTicket) && tombstonedPhotoIdsRef.current.has(photoId),
+    [scope, scopeTicket],
+  );
+
+  const subscribePhotoTombstones = useCallback(
+    (listener: PhotoTombstoneListener): (() => void) => {
+      tombstoneListenersRef.current.add(listener);
+      return () => {
+        tombstoneListenersRef.current.delete(listener);
+      };
+    },
+    [],
+  );
+
   const enterTripNotFound = useCallback(() => {
+    if (!scope.isCurrent(scopeTicket)) {
+      return;
+    }
     if (tripInvalidatedRef.current) {
       // 60 tiles can report the same membership loss. Do the trip-level work
       // once instead of sixty times.
       return;
     }
     tripInvalidatedRef.current = true;
+    // A list/membership terminal is an application-wide trip boundary, not only
+    // a list presentation state. Close save/upload/viewer owners synchronously
+    // before any of them can cross another scheduling or native-commit gate.
+    scope.invalidateCurrentTrip();
     // Invalidate every response already in flight before changing visible
     // state. A list success that started while membership was still valid must
     // not resurrect the gallery after an explicit TRIP_NOT_FOUND.
@@ -190,6 +248,7 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
     listGenerationRef.current += 1;
     firstPageInFlightRef.current = false;
     loadMoreInFlightRef.current = false;
+    failedCursorRef.current = null;
     if (tripId) {
       void invalidateProtectedAssets(tripPhotoAssetKeyPrefix(tripId));
     }
@@ -200,11 +259,12 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
     setTripNotFound(true);
     setStatus('error');
     setErrorSource('initial');
-  }, [tripId]);
+  }, [scope, scopeTicket, tripId]);
 
   const loadFirstPage = useCallback(
     async (mode: PhotoLoadMode) => {
-      if (!tripId) {
+      const entryTicket = scopeTicket;
+      if (!tripId || !scope.isCurrent(entryTicket)) {
         return;
       }
       const requestId = firstPageRequestRef.current + 1;
@@ -212,10 +272,17 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
       firstPageInFlightRef.current = true;
       listGenerationRef.current += 1;
       const requestOverrideVersion = overrideVersionRef.current;
+      const failedCursorAtEntry = failedCursorRef.current;
+      const preservePageFailure = failedCursorAtEntry !== null && mode !== 'initial';
       loadMoreInFlightRef.current = false;
       setLoadingMore(false);
-      setError(null);
-      setErrorSource(null);
+      if (mode === 'initial') {
+        failedCursorRef.current = null;
+      }
+      if (!preservePageFailure) {
+        setError(null);
+        setErrorSource(null);
+      }
       if (mode === 'initial') {
         setStatus('loading');
       } else if (mode === 'refresh') {
@@ -224,18 +291,47 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
 
       try {
         const page = await listTripPhotos(tripId);
-        if (requestId !== firstPageRequestRef.current || !mountedRef.current) {
+        if (
+          requestId !== firstPageRequestRef.current ||
+          !mountedRef.current ||
+          !scope.isCurrent(entryTicket)
+        ) {
           return;
         }
-        nextCursorRef.current = page.nextCursor;
-        setHasNextPage(page.nextCursor !== null);
-        setPhotos(applyOverrides(page.items, overridesRef.current, requestOverrideVersion, true));
+        const fresh = applyOverrides(
+          page.items,
+          overridesRef.current,
+          requestOverrideVersion,
+          true,
+        );
+        if (hasLoadedDeepPageRef.current && mode !== 'initial') {
+          setHasNextPage(nextCursorRef.current !== null);
+          setPhotos((current) =>
+            mergeTripPhotoFirstPage(current, fresh, tombstonedPhotoIdsRef.current),
+          );
+        } else {
+          nextCursorRef.current = page.nextCursor;
+          setHasNextPage(page.nextCursor !== null);
+          setPhotos(fresh.filter((photo) => !tombstonedPhotoIdsRef.current.has(photo.id)));
+        }
         hasUsablePageRef.current = true;
         tripInvalidatedRef.current = false;
         setTripNotFound(false);
         setStatus('ready');
+        // An automatic focus/foreground reconcile may refresh page 1, but it
+        // cannot silently reopen a failed deep-page frontier. A user pull-to-
+        // refresh is the intentional full reconcile allowed to clear it.
+        if (preservePageFailure && mode === 'refresh') {
+          failedCursorRef.current = null;
+          setError(null);
+          setErrorSource(null);
+        }
       } catch (caught) {
-        if (requestId !== firstPageRequestRef.current || !mountedRef.current) {
+        if (
+          requestId !== firstPageRequestRef.current ||
+          !mountedRef.current ||
+          !scope.isCurrent(entryTicket)
+        ) {
           return;
         }
         const failure = toPhotoFailure(caught);
@@ -248,6 +344,13 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
           enterTripNotFound();
           return;
         }
+        if (preservePageFailure) {
+          // Keep the exact cursor and page error stable. In particular, a
+          // background failure must not reclassify this as `background`, which
+          // would reattach `onEndReached` and retry without a user action.
+          setStatus('ready');
+          return;
+        }
         setError(failure);
         if (mode === 'initial' || !hasUsablePageRef.current) {
           setErrorSource('initial');
@@ -256,7 +359,7 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
           setErrorSource(mode === 'refresh' ? 'refresh' : 'background');
         }
       } finally {
-        if (requestId === firstPageRequestRef.current) {
+        if (requestId === firstPageRequestRef.current && scope.isCurrent(entryTicket)) {
           firstPageInFlightRef.current = false;
           if (mountedRef.current) {
             setRefreshing(false);
@@ -264,64 +367,93 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
         }
       }
     },
-    [tripId, enterTripNotFound],
+    [tripId, enterTripNotFound, scope, scopeTicket],
   );
 
-  const loadMore = useCallback(async () => {
-    const cursor = nextCursorRef.current;
-    if (!tripId || firstPageInFlightRef.current || loadMoreInFlightRef.current || !cursor) {
-      return;
-    }
+  const runLoadMore = useCallback(
+    async (explicitRetry: boolean) => {
+      const entryTicket = scopeTicket;
+      const cursor = explicitRetry ? failedCursorRef.current : nextCursorRef.current;
+      if (
+        !tripId ||
+        !scope.isCurrent(entryTicket) ||
+        firstPageInFlightRef.current ||
+        loadMoreInFlightRef.current ||
+        !cursor ||
+        (!explicitRetry && failedCursorRef.current !== null)
+      ) {
+        return;
+      }
 
-    const generation = listGenerationRef.current;
-    const requestOverrideVersion = overrideVersionRef.current;
-    loadMoreInFlightRef.current = true;
-    setLoadingMore(true);
-    setError(null);
-    setErrorSource(null);
+      const generation = listGenerationRef.current;
+      const requestOverrideVersion = overrideVersionRef.current;
+      // Acquire the guard before hiding the error. Rapid Retry taps therefore
+      // coalesce even though the footer disappears immediately.
+      loadMoreInFlightRef.current = true;
+      setLoadingMore(true);
+      setError(null);
+      setErrorSource(null);
 
-    try {
-      const page = await listTripPhotos(tripId, cursor);
-      if (generation !== listGenerationRef.current || !mountedRef.current) {
-        return;
-      }
-      nextCursorRef.current = page.nextCursor;
-      setHasNextPage(page.nextCursor !== null);
-      setPhotos((current) => {
-        const seen = new Set(current.map((photo) => photo.id));
-        const appended = applyOverrides(
-          page.items,
-          overridesRef.current,
-          requestOverrideVersion,
-          false,
-        ).filter((photo) => !seen.has(photo.id));
-        return [...current, ...appended];
-      });
-    } catch (caught) {
-      if (generation !== listGenerationRef.current || !mountedRef.current) {
-        return;
-      }
-      const failure = toPhotoFailure(caught);
-      if (isCancelledFailure(failure)) {
-        return;
-      }
-      if (failure.kind === 'notFound') {
-        enterTripNotFound();
-        return;
-      }
-      // The cursor is deliberately left where it was: retry re-requests the same
-      // page, and the pages already loaded stay on screen.
-      setError(failure);
-      setErrorSource('loadMore');
-    } finally {
-      if (generation === listGenerationRef.current) {
-        loadMoreInFlightRef.current = false;
-        if (mountedRef.current) {
-          setLoadingMore(false);
+      try {
+        const page = await listTripPhotos(tripId, cursor);
+        if (
+          generation !== listGenerationRef.current ||
+          !mountedRef.current ||
+          !scope.isCurrent(entryTicket)
+        ) {
+          return;
+        }
+        failedCursorRef.current = null;
+        hasLoadedDeepPageRef.current = true;
+        nextCursorRef.current = page.nextCursor;
+        setHasNextPage(page.nextCursor !== null);
+        setPhotos((current) => {
+          const seen = new Set(current.map((photo) => photo.id));
+          const appended = applyOverrides(
+            page.items,
+            overridesRef.current,
+            requestOverrideVersion,
+            false,
+          ).filter(
+            (photo) => !seen.has(photo.id) && !tombstonedPhotoIdsRef.current.has(photo.id),
+          );
+          return [...current, ...appended];
+        });
+      } catch (caught) {
+        if (
+          generation !== listGenerationRef.current ||
+          !mountedRef.current ||
+          !scope.isCurrent(entryTicket)
+        ) {
+          return;
+        }
+        const failure = toPhotoFailure(caught);
+        if (isCancelledFailure(failure)) {
+          return;
+        }
+        if (failure.kind === 'notFound') {
+          enterTripNotFound();
+          return;
+        }
+        // Retain the exact cursor. Automatic onEndReached calls are blocked
+        // until the user explicitly retries this frontier.
+        failedCursorRef.current = cursor;
+        setError(failure);
+        setErrorSource('loadMore');
+      } finally {
+        if (generation === listGenerationRef.current && scope.isCurrent(entryTicket)) {
+          loadMoreInFlightRef.current = false;
+          if (mountedRef.current) {
+            setLoadingMore(false);
+          }
         }
       }
-    }
-  }, [tripId, enterTripNotFound]);
+    },
+    [tripId, enterTripNotFound, scope, scopeTicket],
+  );
+
+  const loadMore = useCallback(() => runLoadMore(false), [runLoadMore]);
+  const retryLoadMore = useCallback(() => runLoadMore(true), [runLoadMore]);
 
   /** Silent first-page reload used by focus, foreground and after a mutation. */
   const reconcile = useCallback(() => loadFirstPage('silent'), [loadFirstPage]);
@@ -331,10 +463,11 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
    * reports whether the trip is still readable.
    */
   const coalescedReconcile = useCallback((): Promise<ReconcileEvidence> => {
+    const entryTicket = scopeTicket;
     if (reconcileInFlightRef.current) {
       return reconcileInFlightRef.current;
     }
-    if (!tripId || tripInvalidatedRef.current) {
+    if (!tripId || tripInvalidatedRef.current || !scope.isCurrent(entryTicket)) {
       return Promise.resolve('unreadable');
     }
 
@@ -356,24 +489,37 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
         const page = await listTripPhotos(tripId);
         if (
           requestId !== firstPageRequestRef.current ||
-          !mountedRef.current
+          !mountedRef.current ||
+          !scope.isCurrent(entryTicket)
         ) {
           return 'unknown';
         }
         if (tripInvalidatedRef.current) {
           return 'unreadable';
         }
-        nextCursorRef.current = page.nextCursor;
-        setHasNextPage(page.nextCursor !== null);
-        setPhotos(
-          applyOverrides(page.items, overridesRef.current, requestOverrideVersion, true),
+        const fresh = applyOverrides(
+          page.items,
+          overridesRef.current,
+          requestOverrideVersion,
+          true,
         );
+        if (hasLoadedDeepPageRef.current) {
+          setHasNextPage(nextCursorRef.current !== null);
+          setPhotos((current) =>
+            mergeTripPhotoFirstPage(current, fresh, tombstonedPhotoIdsRef.current),
+          );
+        } else {
+          nextCursorRef.current = page.nextCursor;
+          setHasNextPage(page.nextCursor !== null);
+          setPhotos(fresh.filter((photo) => !tombstonedPhotoIdsRef.current.has(photo.id)));
+        }
         hasUsablePageRef.current = true;
         return 'readable';
       } catch (caught) {
         if (
           requestId !== firstPageRequestRef.current ||
-          !mountedRef.current
+          !mountedRef.current ||
+          !scope.isCurrent(entryTicket)
         ) {
           return 'unknown';
         }
@@ -385,7 +531,7 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
         // readable, because doing so tombstones a photo on an ambiguous 404.
         return 'unknown';
       } finally {
-        if (requestId === firstPageRequestRef.current) {
+        if (requestId === firstPageRequestRef.current && scope.isCurrent(entryTicket)) {
           firstPageInFlightRef.current = false;
         }
         if (reconcileInFlightRef.current === pending) {
@@ -395,12 +541,34 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
     })();
     reconcileInFlightRef.current = pending;
     return pending;
-  }, [tripId]);
+  }, [scope, scopeTicket, tripId]);
 
   const markPhotoStale = useCallback(
     (photoId: string) => {
+      if (!scope.isCurrent(scopeTicket)) {
+        return;
+      }
       overrideVersionRef.current += 1;
       overridesRef.current.set(photoId, { version: overrideVersionRef.current, removed: true });
+      const newlyTombstoned = !tombstonedPhotoIdsRef.current.has(photoId);
+      tombstonedPhotoIdsRef.current.add(photoId);
+      if (newlyTombstoned) {
+        for (const listener of Array.from(tombstoneListenersRef.current)) {
+          try {
+            listener(photoId);
+          } catch {
+            // One presentation owner cannot delay sibling native-boundary gates.
+          }
+        }
+      }
+      setTombstonedPhotoIds((current) => {
+        if (current.has(photoId)) {
+          return current;
+        }
+        const next = new Set(current);
+        next.add(photoId);
+        return next;
+      });
       setPhotos((current) => current.filter((photo) => photo.id !== photoId));
       if (tripId) {
         // Explicit invalidation, not `release()`: a photo that no longer exists
@@ -409,12 +577,15 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
         void invalidateProtectedAsset(tripPhotoAssetKey(tripId, photoId, 'medium'));
       }
     },
-    [tripId],
+    [scope, scopeTicket, tripId],
   );
 
   const removePhoto = markPhotoStale;
 
   const prependUploaded = useCallback((uploaded: TripPhoto[]) => {
+    if (!scope.isCurrent(scopeTicket)) {
+      return;
+    }
     if (uploaded.length === 0) {
       return;
     }
@@ -430,7 +601,7 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
         ...current.filter((photo) => !uploadedIds.has(photo.id)),
       ]);
     });
-  }, []);
+  }, [scope, scopeTicket]);
 
   /**
    * The D18 branch, shared by every tile, the viewer, delete and single save.
@@ -439,34 +610,56 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
    * buys evidence first: one coalesced list request decides whether this is a
    * stale photo or a trip the user can no longer read.
    */
+  const resolveAssetNotFound = useCallback(
+    async (
+      photoId: string,
+      failure: PhotoFailure,
+    ): Promise<AmbiguousNotFoundResolution> => {
+      const entryTicket = scopeTicket;
+      if (!scope.isCurrent(entryTicket)) {
+        return 'unknown';
+      }
+      const notFoundScope = classifyNotFound(failure);
+      if (notFoundScope === 'photo') {
+        markPhotoStale(photoId);
+        return 'photo';
+      }
+      if (notFoundScope === 'trip') {
+        enterTripNotFound();
+        return 'trip';
+      }
+
+      const evidence = await coalescedReconcile();
+      if (!mountedRef.current || !scope.isCurrent(entryTicket)) {
+        return 'unknown';
+      }
+      if (evidence === 'readable') {
+        markPhotoStale(photoId);
+        return 'photo';
+      }
+      if (evidence === 'unreadable') {
+        enterTripNotFound();
+        return 'trip';
+      }
+      return 'unknown';
+    },
+    [coalescedReconcile, enterTripNotFound, markPhotoStale, scope, scopeTicket],
+  );
+
   const handleAssetNotFound = useCallback(
     (photoId: string, failure: PhotoFailure) => {
-      const scope = classifyNotFound(failure);
-      if (scope === 'photo') {
-        markPhotoStale(photoId);
-        return;
-      }
-      if (scope === 'trip') {
-        enterTripNotFound();
-        return;
-      }
-      void coalescedReconcile().then((evidence) => {
-        if (!mountedRef.current) {
-          return;
-        }
-        if (evidence === 'readable') {
-          markPhotoStale(photoId);
-        } else if (evidence === 'unreadable') {
-          enterTripNotFound();
-        }
-      });
+      void resolveAssetNotFound(photoId, failure);
     },
-    [coalescedReconcile, enterTripNotFound, markPhotoStale],
+    [resolveAssetNotFound],
   );
 
   useFocusEffect(
     useCallback(() => {
-      if (!tripId || tripInvalidatedRef.current) {
+      if (
+        !tripId ||
+        tripInvalidatedRef.current ||
+        !scope.isCurrent(scopeTicket)
+      ) {
         return;
       }
       if (!hasLoadedOnceRef.current) {
@@ -479,19 +672,24 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
         return;
       }
       void loadFirstPage('silent');
-    }, [tripId, loadFirstPage]),
+    }, [tripId, loadFirstPage, scope, scopeTicket]),
   );
 
   useAppForegroundEffect(
     useCallback(() => {
-      if (!tripId || tripInvalidatedRef.current || !hasLoadedOnceRef.current) {
+      if (
+        !tripId ||
+        tripInvalidatedRef.current ||
+        !hasLoadedOnceRef.current ||
+        !scope.isCurrent(scopeTicket)
+      ) {
         return;
       }
       if (firstPageInFlightRef.current) {
         return;
       }
       void loadFirstPage('silent');
-    }, [tripId, loadFirstPage]),
+    }, [tripId, loadFirstPage, scope, scopeTicket]),
   );
 
   const stateMatchesTrip = stateTripId === tripId;
@@ -507,13 +705,18 @@ export function useTripPhotos(tripId: string | undefined): UseTripPhotosResult {
     refreshing: stateMatchesTrip ? refreshing : false,
     loadingMore: stateMatchesTrip ? loadingMore : false,
     hasNextPage: stateMatchesTrip ? hasNextPage : false,
+    tombstonedPhotoIds: stateMatchesTrip ? tombstonedPhotoIds : new Set<string>(),
+    isPhotoTombstoned,
+    subscribePhotoTombstones,
     tripNotFound: stateMatchesTrip ? tripNotFound : false,
     loadFirstPage,
     loadMore,
+    retryLoadMore,
     reconcile,
     prependUploaded,
     removePhoto,
     markPhotoStale,
+    resolveAssetNotFound,
     handleAssetNotFound,
   };
 }

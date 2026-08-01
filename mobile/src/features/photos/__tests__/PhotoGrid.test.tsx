@@ -130,17 +130,29 @@ describe('PhotoGrid', () => {
 
   it('offers a footer retry on a page failure without discarding loaded photos', async () => {
     const onRetryPage = jest.fn();
+    const onEndReached = jest.fn();
     await renderGrid([photo('p1')], {
       pageError: { kind: 'server', message: 'Could not load more photos.' },
       onRetryPage,
+      onEndReached,
     });
 
     expect(screen.getByTestId('photo-grid-page-error')).toBeTruthy();
     expect(screen.getByText('Could not load more photos.')).toBeTruthy();
     expect(screen.getByTestId('photo-tile-p1')).toBeTruthy();
+    expect(screen.getByTestId('photo-grid').props.onEndReached).toBeUndefined();
 
     await fireEvent.press(screen.getByLabelText('Retry loading more photos'));
     expect(onRetryPage).toHaveBeenCalledTimes(1);
+    expect(onEndReached).not.toHaveBeenCalled();
+  });
+
+  it('keeps visible content anchored when a refreshed first page prepends items', async () => {
+    await renderGrid([photo('p1'), photo('p2')]);
+
+    expect(screen.getByTestId('photo-grid').props.maintainVisibleContentPosition).toEqual({
+      minIndexForVisible: 0,
+    });
   });
 
   it('recomputes the tile size when the viewport width changes', async () => {

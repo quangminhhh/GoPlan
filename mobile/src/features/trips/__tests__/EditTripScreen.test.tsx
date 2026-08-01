@@ -298,7 +298,7 @@ describe('EditTripScreen', () => {
 
   it('replaces the cover with the newly uploaded url', async () => {
     mockUpdateTrip.mockResolvedValue(detail.trip);
-    mockPick.mockResolvedValue({ status: 'picked', image: pickedImage });
+    mockPick.mockResolvedValue({ status: 'picked', image: pickedImage, ownedSourceUri: null });
     mockPreprocess.mockResolvedValue(processedImage);
     mockUploadCover.mockResolvedValue(UPLOADED_COVER_URL);
 
@@ -316,7 +316,7 @@ describe('EditTripScreen', () => {
   });
 
   it('blocks submit until an in-flight cover upload settles', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: pickedImage });
+    mockPick.mockResolvedValue({ status: 'picked', image: pickedImage, ownedSourceUri: null });
     mockPreprocess.mockResolvedValue(processedImage);
     mockUploadCover.mockImplementation(() => new Promise(() => undefined));
 

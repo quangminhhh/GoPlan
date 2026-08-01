@@ -12,6 +12,11 @@
  */
 
 import { getApiBaseUrl } from '@/shared/api/base-url';
+import {
+  getAuthSnapshot,
+  isAuthTicketCurrent,
+  type AuthTicket,
+} from '@/shared/api/authSessionLifecycle';
 import { refreshTokens } from '@/shared/api/refresh';
 import { getAccessToken } from '@/shared/api/token-store';
 import {
@@ -254,8 +259,21 @@ interface ProtectedRequestContext {
 async function runProtectedRequest(context: ProtectedRequestContext): Promise<Response> {
   const { url, method, body, headers, signal, transport } = context;
 
+  const authAtStart = getAuthSnapshot();
+  const authTicket: AuthTicket | null =
+    authAtStart.phase === 'opening' || authAtStart.phase === 'active'
+      ? {
+          sessionGeneration: authAtStart.sessionGeneration,
+          credentialRevision: authAtStart.credentialRevision,
+        }
+      : null;
+
   const throwIfCancelled = (): void => {
-    if (signal.aborted || !isPrivateMediaSessionOpen()) {
+    if (
+      signal.aborted ||
+      !isPrivateMediaSessionOpen() ||
+      (authTicket !== null && !isAuthTicketCurrent(authTicket))
+    ) {
       throw createSessionClosedError();
     }
   };
@@ -291,11 +309,11 @@ async function runProtectedRequest(context: ProtectedRequestContext): Promise<Re
 
   throwIfCancelled();
 
-  let token = getAccessToken();
+  let token = authAtStart.access ?? getAccessToken();
   if (token === null) {
     // Nothing to send. One refresh either restores a usable session or proves
     // there is none; both beat firing a request that is guaranteed to 401.
-    token = await refreshTokens();
+    token = await refreshTokens(authTicket);
     throwIfCancelled();
     if (token === null) {
       throw new ProtectedAssetError('auth', AUTH_MESSAGE, { status: 401 });
@@ -311,7 +329,7 @@ async function runProtectedRequest(context: ProtectedRequestContext): Promise<Re
     // that writes a fresh token into a store the user just cleared (D20).
     throwIfCancelled();
 
-    const current = getAccessToken();
+    const current = getAuthSnapshot().access ?? getAccessToken();
     let retryToken: string | null;
 
     if (current === null) {
@@ -325,7 +343,7 @@ async function runProtectedRequest(context: ProtectedRequestContext): Promise<Re
       // exactly one refresh (D4).
       retryToken = current;
     } else {
-      retryToken = await refreshTokens();
+      retryToken = await refreshTokens(authTicket);
     }
 
     throwIfCancelled();

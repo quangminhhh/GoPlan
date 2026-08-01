@@ -23,6 +23,7 @@ import type {
  */
 export const PROTECTED_MEDIA_NAMESPACE = 'goplan-protected-media';
 export const UPLOAD_TEMP_NAMESPACE = 'goplan-photo-upload';
+export const PHOTO_SAVE_TEMP_NAMESPACE = 'goplan-photo-save';
 
 let fileNameCounter = 0;
 
@@ -183,6 +184,11 @@ export function createNativeFileStore(namespace: string): ProtectedFileStore {
 
 export const nativeProtectedFileStore = createNativeFileStore(PROTECTED_MEDIA_NAMESPACE);
 export const nativeUploadTempFileStore = createNativeFileStore(UPLOAD_TEMP_NAMESPACE);
+/**
+ * Dedicated to the exact file PhotoKit is currently consuming. It is
+ * intentionally absent from the general private-media purger registry.
+ */
+export const nativePhotoSaveFileStore = createNativeFileStore(PHOTO_SAVE_TEMP_NAMESPACE);
 
 /**
  * Relocates a file into one of the owned namespaces and returns its new URI.

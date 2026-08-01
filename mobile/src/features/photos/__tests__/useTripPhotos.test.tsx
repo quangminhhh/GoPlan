@@ -37,6 +37,8 @@ import { listTripPhotos } from '../api';
 // eslint-disable-next-line import/first
 import { useTripPhotos } from '../hooks/useTripPhotos';
 // eslint-disable-next-line import/first
+import { useTripPhotoScope } from '../hooks/useTripPhotoScope';
+// eslint-disable-next-line import/first
 import type { TripPhoto } from '../types';
 
 const mockListTripPhotos = listTripPhotos as jest.MockedFunction<typeof listTripPhotos>;
@@ -46,6 +48,16 @@ const mockInvalidateAsset = invalidateProtectedAsset as jest.MockedFunction<
 const mockInvalidateTrip = invalidateProtectedAssets as jest.MockedFunction<
   typeof invalidateProtectedAssets
 >;
+
+function useScopedTripPhotos(tripId: string) {
+  const scope = useTripPhotoScope(tripId);
+  return useTripPhotos(tripId, scope);
+}
+
+function useScopedTripPhotosWithOwner(tripId: string) {
+  const scope = useTripPhotoScope(tripId);
+  return { scope, photos: useTripPhotos(tripId, scope) };
+}
 
 function photo(id: string, createdAt = '2026-07-31T10:00:00Z'): TripPhoto {
   return {
@@ -105,7 +117,7 @@ async function triggerForeground() {
 
 async function renderReady(first = page([photo('p1'), photo('p2')])) {
   mockListTripPhotos.mockResolvedValueOnce(first);
-  const view = await renderHook(() => useTripPhotos('trip-1'));
+  const view = await renderHook(() => useScopedTripPhotos('trip-1'));
   await triggerFocus();
   await waitFor(() => expect(view.result.current.status).toBe('ready'));
   return view;
@@ -145,7 +157,38 @@ describe('loading and pagination', () => {
     expect(mockListTripPhotos).toHaveBeenLastCalledWith('trip-1', 'cursor-1');
   });
 
-  it('keeps loaded pages and the same cursor when a page fails, so retry asks again', async () => {
+  it('merges a refreshed first page into the loaded tail and keeps the deepest cursor', async () => {
+    const view = await renderReady(page([photo('p1')], 'cursor-1'));
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('p2')], 'cursor-2'));
+    await act(async () => {
+      await view.result.current.loadMore();
+    });
+
+    mockListTripPhotos.mockResolvedValueOnce(
+      page([photo('new'), photo('p1')], 'replacement-page-2'),
+    );
+    await act(async () => {
+      await view.result.current.loadFirstPage('silent');
+    });
+
+    expect(view.result.current.photos.map(({ id }) => id)).toEqual(['new', 'p1', 'p2']);
+    expect(view.result.current.hasNextPage).toBe(true);
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('p3')], null));
+    await act(async () => {
+      await view.result.current.loadMore();
+    });
+    expect(mockListTripPhotos).toHaveBeenLastCalledWith('trip-1', 'cursor-2');
+    expect(view.result.current.photos.map(({ id }) => id)).toEqual([
+      'new',
+      'p1',
+      'p2',
+      'p3',
+    ]);
+  });
+
+  it('keeps loaded pages and waits for explicit Retry after a page fails', async () => {
     const view = await renderReady(page([photo('p1')], 'cursor-1'));
 
     mockListTripPhotos.mockRejectedValueOnce(serverError());
@@ -157,13 +200,54 @@ describe('loading and pagination', () => {
     expect(view.result.current.errorSource).toBe('loadMore');
     expect(view.result.current.status).toBe('ready');
 
-    mockListTripPhotos.mockResolvedValueOnce(page([photo('p2')], null));
+    const requestsAfterFailure = mockListTripPhotos.mock.calls.length;
     await act(async () => {
       await view.result.current.loadMore();
+    });
+    expect(mockListTripPhotos).toHaveBeenCalledTimes(requestsAfterFailure);
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('p2')], null));
+    await act(async () => {
+      await view.result.current.retryLoadMore();
     });
 
     expect(mockListTripPhotos).toHaveBeenLastCalledWith('trip-1', 'cursor-1');
     expect(view.result.current.photos.map((item) => item.id)).toEqual(['p1', 'p2']);
+  });
+
+  it('keeps the failed frontier closed across automatic silent reconciles', async () => {
+    const view = await renderReady(page([photo('p1')], 'cursor-1'));
+
+    mockListTripPhotos.mockRejectedValueOnce(serverError());
+    await act(async () => {
+      await view.result.current.loadMore();
+    });
+    expect(view.result.current.errorSource).toBe('loadMore');
+
+    mockListTripPhotos.mockRejectedValueOnce(serverError());
+    await triggerForeground();
+    await waitFor(() => expect(mockListTripPhotos).toHaveBeenCalledTimes(3));
+    expect(view.result.current.errorSource).toBe('loadMore');
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('new'), photo('p1')], 'ignored'));
+    await triggerFocus();
+    await waitFor(() =>
+      expect(view.result.current.photos.map(({ id }) => id)).toEqual(['new', 'p1']),
+    );
+    expect(view.result.current.errorSource).toBe('loadMore');
+
+    const requestsBeforeAutomaticLoadMore = mockListTripPhotos.mock.calls.length;
+    await act(async () => {
+      await view.result.current.loadMore();
+    });
+    expect(mockListTripPhotos).toHaveBeenCalledTimes(requestsBeforeAutomaticLoadMore);
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('p2')], null));
+    await act(async () => {
+      await view.result.current.retryLoadMore();
+    });
+    expect(mockListTripPhotos).toHaveBeenLastCalledWith('trip-1', 'cursor-1');
+    expect(view.result.current.errorSource).toBeNull();
   });
 
   it('keeps photos and reports a refresh failure inline', async () => {
@@ -181,7 +265,7 @@ describe('loading and pagination', () => {
 
   it('shows a full error only when the first load fails with nothing on screen', async () => {
     mockListTripPhotos.mockRejectedValueOnce(serverError());
-    const view = await renderHook(() => useTripPhotos('trip-1'));
+    const view = await renderHook(() => useScopedTripPhotos('trip-1'));
     await triggerFocus();
 
     await waitFor(() => expect(view.result.current.status).toBe('error'));
@@ -192,7 +276,7 @@ describe('loading and pagination', () => {
   it('ignores a stale first-page response that lost the race', async () => {
     const slow = createDeferred<CursorPage<TripPhoto>>();
     mockListTripPhotos.mockReturnValueOnce(slow.promise);
-    const view = await renderHook(() => useTripPhotos('trip-1'));
+    const view = await renderHook(() => useScopedTripPhotos('trip-1'));
     await triggerFocus();
 
     mockListTripPhotos.mockResolvedValueOnce(page([photo('newest')]));
@@ -328,7 +412,7 @@ describe('trip identity boundaries', () => {
   it('hides the old trip immediately and ignores its pending response after rerender', async () => {
     mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-1-photo')]));
     const view = await renderHook(
-      ({ activeTripId }: { activeTripId: string }) => useTripPhotos(activeTripId),
+      ({ activeTripId }: { activeTripId: string }) => useScopedTripPhotos(activeTripId),
       { initialProps: { activeTripId: 'trip-1' } },
     );
     await triggerFocus();
@@ -372,7 +456,7 @@ describe('trip identity boundaries', () => {
   it('loads a new trip after the previous trip was marked unreadable', async () => {
     mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-1-photo')]));
     const view = await renderHook(
-      ({ activeTripId }: { activeTripId: string }) => useTripPhotos(activeTripId),
+      ({ activeTripId }: { activeTripId: string }) => useScopedTripPhotos(activeTripId),
       { initialProps: { activeTripId: 'trip-1' } },
     );
     await triggerFocus();
@@ -399,6 +483,273 @@ describe('trip identity boundaries', () => {
     );
     expect(view.result.current.tripNotFound).toBe(false);
     expect(mockListTripPhotos).toHaveBeenLastCalledWith('trip-2');
+  });
+
+  it('does not let a stale PHOTO_NOT_FOUND callback tombstone the same id in Trip B', async () => {
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('shared'), photo('trip-1-photo')]));
+    const view = await renderHook(
+      ({ activeTripId }: { activeTripId: string }) => useScopedTripPhotos(activeTripId),
+      { initialProps: { activeTripId: 'trip-1' } },
+    );
+    await triggerFocus();
+    await waitFor(() => expect(view.result.current.status).toBe('ready'));
+    const staleResolveAssetNotFound = view.result.current.resolveAssetNotFound;
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('shared'), photo('trip-2-photo')]));
+    await view.rerender({ activeTripId: 'trip-2' });
+    await triggerFocus();
+    await waitFor(() =>
+      expect(view.result.current.photos.map(({ id }) => id)).toEqual([
+        'shared',
+        'trip-2-photo',
+      ]),
+    );
+    const invalidationsBeforeStaleCallback = mockInvalidateAsset.mock.calls.length;
+
+    let resolution: Awaited<ReturnType<typeof staleResolveAssetNotFound>> | undefined;
+    await act(async () => {
+      resolution = await staleResolveAssetNotFound('shared', {
+        kind: 'notFound',
+        message: 'gone',
+        status: 404,
+        errorCode: 'PHOTO_NOT_FOUND',
+      });
+    });
+
+    expect(resolution).toBe('unknown');
+    expect(view.result.current.photos.map(({ id }) => id)).toEqual([
+      'shared',
+      'trip-2-photo',
+    ]);
+    expect(view.result.current.tombstonedPhotoIds.has('shared')).toBe(false);
+    expect(mockInvalidateAsset).toHaveBeenCalledTimes(invalidationsBeforeStaleCallback);
+  });
+
+  it('ignores a stale Trip A list TRIP_NOT_FOUND after Trip B is ready', async () => {
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-1-photo')]));
+    const view = await renderHook(
+      ({ activeTripId }: { activeTripId: string }) => useScopedTripPhotos(activeTripId),
+      { initialProps: { activeTripId: 'trip-1' } },
+    );
+    await triggerFocus();
+    await waitFor(() => expect(view.result.current.status).toBe('ready'));
+
+    const staleTripNotFound = createDeferred<CursorPage<TripPhoto>>();
+    mockListTripPhotos.mockReturnValueOnce(staleTripNotFound.promise);
+    let pendingTripA!: Promise<void>;
+    await act(async () => {
+      pendingTripA = view.result.current.loadFirstPage('silent');
+      await Promise.resolve();
+    });
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-2-photo')]));
+    await view.rerender({ activeTripId: 'trip-2' });
+    await triggerFocus();
+    await waitFor(() =>
+      expect(view.result.current.photos.map(({ id }) => id)).toEqual(['trip-2-photo']),
+    );
+    const tripInvalidationsBeforeStaleResponse = mockInvalidateTrip.mock.calls.length;
+
+    await act(async () => {
+      staleTripNotFound.reject(notFound('TRIP_NOT_FOUND'));
+      await pendingTripA;
+    });
+
+    expect(view.result.current.tripNotFound).toBe(false);
+    expect(view.result.current.status).toBe('ready');
+    expect(view.result.current.error).toBeNull();
+    expect(view.result.current.photos.map(({ id }) => id)).toEqual(['trip-2-photo']);
+    expect(mockInvalidateTrip).toHaveBeenCalledTimes(
+      tripInvalidationsBeforeStaleResponse,
+    );
+  });
+
+  it('does not let stale Trip A load-more error/finally mutate Trip B loading or cursor state', async () => {
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-1-photo')], 'trip-1-cursor'));
+    const view = await renderHook(
+      ({ activeTripId }: { activeTripId: string }) => useScopedTripPhotos(activeTripId),
+      { initialProps: { activeTripId: 'trip-1' } },
+    );
+    await triggerFocus();
+    await waitFor(() => expect(view.result.current.status).toBe('ready'));
+
+    const tripALoadMore = createDeferred<CursorPage<TripPhoto>>();
+    mockListTripPhotos.mockReturnValueOnce(tripALoadMore.promise);
+    let pendingTripALoadMore!: Promise<void>;
+    await act(async () => {
+      pendingTripALoadMore = view.result.current.loadMore();
+      await Promise.resolve();
+    });
+    expect(view.result.current.loadingMore).toBe(true);
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-2-photo')], 'trip-2-cursor'));
+    await view.rerender({ activeTripId: 'trip-2' });
+    await triggerFocus();
+    await waitFor(() =>
+      expect(view.result.current.photos.map(({ id }) => id)).toEqual(['trip-2-photo']),
+    );
+
+    const tripBLoadMore = createDeferred<CursorPage<TripPhoto>>();
+    mockListTripPhotos.mockReturnValueOnce(tripBLoadMore.promise);
+    let pendingTripBLoadMore!: Promise<void>;
+    await act(async () => {
+      pendingTripBLoadMore = view.result.current.loadMore();
+      await Promise.resolve();
+    });
+    expect(view.result.current.loadingMore).toBe(true);
+
+    await act(async () => {
+      tripALoadMore.reject(serverError());
+      await pendingTripALoadMore;
+    });
+
+    expect(view.result.current.loadingMore).toBe(true);
+    expect(view.result.current.error).toBeNull();
+    expect(view.result.current.errorSource).toBeNull();
+    expect(view.result.current.hasNextPage).toBe(true);
+    expect(view.result.current.photos.map(({ id }) => id)).toEqual(['trip-2-photo']);
+
+    await act(async () => {
+      tripBLoadMore.resolve(page([photo('trip-2-tail')], null));
+      await pendingTripBLoadMore;
+    });
+
+    expect(mockListTripPhotos).toHaveBeenLastCalledWith('trip-2', 'trip-2-cursor');
+    expect(view.result.current.loadingMore).toBe(false);
+    expect(view.result.current.hasNextPage).toBe(false);
+    expect(view.result.current.photos.map(({ id }) => id)).toEqual([
+      'trip-2-photo',
+      'trip-2-tail',
+    ]);
+  });
+
+  it('keeps Trip B reconcile ownership when a stale Trip A reconcile errors and settles', async () => {
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-1-photo')]));
+    const view = await renderHook(
+      ({ activeTripId }: { activeTripId: string }) => useScopedTripPhotos(activeTripId),
+      { initialProps: { activeTripId: 'trip-1' } },
+    );
+    await triggerFocus();
+    await waitFor(() => expect(view.result.current.status).toBe('ready'));
+
+    const tripAReconcile = createDeferred<CursorPage<TripPhoto>>();
+    mockListTripPhotos.mockReturnValueOnce(tripAReconcile.promise);
+    let pendingTripAReconcile!: ReturnType<typeof view.result.current.resolveAssetNotFound>;
+    await act(async () => {
+      pendingTripAReconcile = view.result.current.resolveAssetNotFound('trip-1-photo', {
+        kind: 'notFound',
+        message: 'gone',
+        status: 404,
+      });
+      await Promise.resolve();
+    });
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-2-a'), photo('trip-2-b')]));
+    await view.rerender({ activeTripId: 'trip-2' });
+    await triggerFocus();
+    await waitFor(() =>
+      expect(view.result.current.photos.map(({ id }) => id)).toEqual([
+        'trip-2-a',
+        'trip-2-b',
+      ]),
+    );
+
+    const tripBReconcile = createDeferred<CursorPage<TripPhoto>>();
+    mockListTripPhotos.mockReturnValueOnce(tripBReconcile.promise);
+    let pendingTripBFirst!: ReturnType<typeof view.result.current.resolveAssetNotFound>;
+    await act(async () => {
+      pendingTripBFirst = view.result.current.resolveAssetNotFound('trip-2-a', {
+        kind: 'notFound',
+        message: 'gone',
+        status: 404,
+      });
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      tripAReconcile.reject(serverError());
+      await pendingTripAReconcile;
+    });
+
+    expect(view.result.current.status).toBe('ready');
+    expect(view.result.current.error).toBeNull();
+    expect(view.result.current.errorSource).toBeNull();
+    expect(view.result.current.refreshing).toBe(false);
+    expect(view.result.current.loadingMore).toBe(false);
+
+    const requestsBeforeSecondTripBCallback = mockListTripPhotos.mock.calls.length;
+    let pendingTripBSecond!: ReturnType<typeof view.result.current.resolveAssetNotFound>;
+    await act(async () => {
+      pendingTripBSecond = view.result.current.resolveAssetNotFound('trip-2-b', {
+        kind: 'notFound',
+        message: 'gone',
+        status: 404,
+      });
+      await Promise.resolve();
+    });
+    expect(mockListTripPhotos).toHaveBeenCalledTimes(requestsBeforeSecondTripBCallback);
+
+    await act(async () => {
+      tripBReconcile.resolve(page([photo('trip-2-a'), photo('trip-2-b')]));
+      await Promise.all([pendingTripBFirst, pendingTripBSecond]);
+    });
+
+    expect(view.result.current.photos).toEqual([]);
+    expect(view.result.current.tombstonedPhotoIds).toEqual(
+      new Set(['trip-2-a', 'trip-2-b']),
+    );
+  });
+
+  it('makes an old public list callback a no-op at entry after Trip B renders', async () => {
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-1-photo')]));
+    const view = await renderHook(
+      ({ activeTripId }: { activeTripId: string }) => useScopedTripPhotos(activeTripId),
+      { initialProps: { activeTripId: 'trip-1' } },
+    );
+    await triggerFocus();
+    await waitFor(() => expect(view.result.current.status).toBe('ready'));
+    const staleLoadFirstPage = view.result.current.loadFirstPage;
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-2-photo')]));
+    await view.rerender({ activeTripId: 'trip-2' });
+    await triggerFocus();
+    await waitFor(() =>
+      expect(view.result.current.photos.map(({ id }) => id)).toEqual(['trip-2-photo']),
+    );
+    const requestsBeforeStaleEntry = mockListTripPhotos.mock.calls.length;
+
+    await act(async () => {
+      await staleLoadFirstPage('refresh');
+    });
+
+    expect(mockListTripPhotos).toHaveBeenCalledTimes(requestsBeforeStaleEntry);
+    expect(view.result.current.refreshing).toBe(false);
+    expect(view.result.current.error).toBeNull();
+    expect(view.result.current.photos.map(({ id }) => id)).toEqual(['trip-2-photo']);
+  });
+
+  it('does not prepend a stale Trip A upload after Trip B renders', async () => {
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-1-photo')]));
+    const view = await renderHook(
+      ({ activeTripId }: { activeTripId: string }) => useScopedTripPhotos(activeTripId),
+      { initialProps: { activeTripId: 'trip-1' } },
+    );
+    await triggerFocus();
+    await waitFor(() => expect(view.result.current.status).toBe('ready'));
+    const stalePrependUploaded = view.result.current.prependUploaded;
+
+    mockListTripPhotos.mockResolvedValueOnce(page([photo('trip-2-photo')]));
+    await view.rerender({ activeTripId: 'trip-2' });
+    await triggerFocus();
+    await waitFor(() =>
+      expect(view.result.current.photos.map(({ id }) => id)).toEqual(['trip-2-photo']),
+    );
+
+    await act(async () => {
+      stalePrependUploaded([photo('stale-trip-1-upload', '2026-07-31T12:00:00Z')]);
+    });
+
+    expect(view.result.current.photos.map(({ id }) => id)).toEqual(['trip-2-photo']);
   });
 });
 
@@ -516,14 +867,37 @@ describe('local override ledger', () => {
 });
 
 describe('D18 404 routing', () => {
-  it('treats a list 404 as trip-level and invalidates every asset of the trip', async () => {
+  it('treats a list 404 as a fail-closed trip boundary for every photo owner', async () => {
+    const cleanup = createDeferred<void>();
     mockListTripPhotos.mockRejectedValueOnce(notFound('TRIP_NOT_FOUND'));
-    const view = await renderHook(() => useTripPhotos('trip-1'));
+    const view = await renderHook(() => useScopedTripPhotosWithOwner('trip-1'));
+    const activeTicket = view.result.current.scope.capture();
+    const listener = jest.fn(() => cleanup.promise);
+    view.result.current.scope.subscribeInvalidation(listener);
     await triggerFocus();
 
-    await waitFor(() => expect(view.result.current.tripNotFound).toBe(true));
-    expect(view.result.current.photos).toEqual([]);
+    await waitFor(() => expect(view.result.current.photos.tripNotFound).toBe(true));
+    const terminalTicket = view.result.current.scope.capture();
+    expect(listener).toHaveBeenCalledWith(activeTicket, terminalTicket);
+    expect(view.result.current.scope.isCurrent(terminalTicket)).toBe(false);
+    expect(view.result.current.photos.photos).toEqual([]);
     expect(mockInvalidateTrip).toHaveBeenCalledWith('trip-photo:trip-1:');
+
+    // Even a newly captured same-trip callback is refused after terminal
+    // evidence; reopening requires a different route identity.
+    await act(async () => {
+      await view.result.current.photos.loadFirstPage('initial');
+    });
+    expect(mockListTripPhotos).toHaveBeenCalledTimes(1);
+
+    let cleanupSettled = false;
+    const waiting = view.result.current.scope.waitForCleanup().then(() => {
+      cleanupSettled = true;
+    });
+    await Promise.resolve();
+    expect(cleanupSettled).toBe(false);
+    cleanup.resolve();
+    await waiting;
   });
 
   it('tombstones only the reported photo on PHOTO_NOT_FOUND', async () => {
@@ -542,6 +916,28 @@ describe('D18 404 routing', () => {
     expect(view.result.current.tripNotFound).toBe(false);
     // No reconcile needed: the code already said which of the two this was.
     expect(mockListTripPhotos).toHaveBeenCalledTimes(1);
+  });
+
+  it('publishes a new tombstone synchronously before React state delivery', async () => {
+    const view = await renderReady(page([photo('p1'), photo('p2')]));
+    let gateObserved = false;
+    const listener = jest.fn((photoId: string) => {
+      gateObserved = view.result.current.isPhotoTombstoned(photoId);
+    });
+    const unsubscribe = view.result.current.subscribePhotoTombstones(listener);
+
+    await act(async () => {
+      view.result.current.markPhotoStale('p1');
+      expect(listener).toHaveBeenCalledWith('p1');
+      expect(gateObserved).toBe(true);
+    });
+
+    // The feed is an edge, not a second business outcome for the same id.
+    await act(async () => {
+      view.result.current.markPhotoStale('p1');
+    });
+    expect(listener).toHaveBeenCalledTimes(1);
+    unsubscribe();
   });
 
   it('goes trip-level on TRIP_NOT_FOUND without tombstoning tiles one by one', async () => {

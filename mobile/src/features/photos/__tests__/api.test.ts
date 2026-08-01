@@ -7,14 +7,12 @@ import {
   startPrivateMediaSession,
 } from '@/shared/media/privateMediaLifecycle';
 import {
-  buildBulkDownloadBody,
   deleteTripPhoto,
   listTripPhotos,
   PHOTO_UPLOAD_TIMEOUT_MS,
   tripPhotoAssetKey,
   tripPhotoAssetKeyPrefix,
   tripPhotoAssetPath,
-  tripPhotoBulkDownloadPath,
   tripPhotoDetailPath,
   uploadTripPhotoBatch,
 } from '../api';
@@ -96,7 +94,6 @@ describe('path builders', () => {
     expect(tripPhotoAssetPath('trip-1', 'photo-1', 'download')).toBe(
       '/trips/trip-1/photos/photo-1/download',
     );
-    expect(tripPhotoBulkDownloadPath('trip-1')).toBe('/trips/trip-1/photos/download');
   });
 
   it('keys assets so a whole trip can be invalidated by prefix', () => {
@@ -194,12 +191,6 @@ describe('uploadTripPhotoBatch', () => {
 
     expect(recorded[0].timeout).toBe(PHOTO_UPLOAD_TIMEOUT_MS);
     expect(PHOTO_UPLOAD_TIMEOUT_MS).toBe(120_000);
-  });
-});
-
-describe('bulk download body', () => {
-  it('sends photo_ids in selection order', () => {
-    expect(buildBulkDownloadBody(['c', 'a', 'b'])).toBe('{"photo_ids":["c","a","b"]}');
   });
 });
 

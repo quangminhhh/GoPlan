@@ -1,124 +1,244 @@
 import { create } from 'axios';
+import {
+  beginAuthCredentialRotation,
+  beginCredentialActivity,
+  captureAuthTicket,
+  getAuthSnapshot,
+  isAuthTicketCurrent,
+  publishAuthPair,
+  requestAuthSessionClose,
+  type AuthPair,
+  type AuthTicket,
+} from './authSessionLifecycle';
 import { getApiBaseUrl } from './base-url';
-import { clearTokens, getAccessToken, getRefreshToken, setAccessToken, setRefreshToken } from './token-store';
+import { getRefreshToken, setRefreshToken } from './token-store';
 
 interface RefreshResponse {
   access: string;
   refresh: string;
 }
 
-// Bare instance: must NOT share apiClient's interceptors, or a failing
-// refresh would recursively trigger another refresh.
-export const refreshHttp = create();
+interface RawRefreshResult {
+  access: string | null;
+  hardFailure: boolean;
+}
 
-let inFlight: Promise<string | null> | null = null;
+interface RefreshFlight {
+  ticket: AuthTicket;
+  promise: Promise<RawRefreshResult>;
+}
+
+interface RotationFlight {
+  ticket: AuthTicket;
+  promise: Promise<boolean>;
+}
+
+export const REFRESH_TIMEOUT_MS = 15_000;
+
+// Bare instance: it must never share apiClient's interceptors, otherwise a
+// failing refresh recursively attempts to refresh itself.
+export const refreshHttp = create({ timeout: REFRESH_TIMEOUT_MS });
+
+const refreshFlights = new Map<string, RefreshFlight>();
+let rotationInFlight: RotationFlight | null = null;
 let onRefreshFailed: (() => void) | null = null;
 
-/**
- * Bumped every time the token pair is replaced wholesale (password change).
- * A refresh that started before the bump belongs to a chain the server has
- * already revoked; its result — success or failure — must not touch the store.
- */
-let tokenGeneration = 0;
-let rotationInFlight: Promise<void> | null = null;
+function ticketKey(ticket: AuthTicket): string {
+  return `${ticket.sessionGeneration}:${ticket.credentialRevision}`;
+}
+
+function sameSession(left: AuthTicket, right: AuthTicket): boolean {
+  return left.sessionGeneration === right.sessionGeneration;
+}
 
 export function setOnRefreshFailed(handler: (() => void) | null): void {
   onRefreshFailed = handler;
 }
 
-export function refreshTokens(): Promise<string | null> {
-  if (!inFlight) {
-    inFlight = doRefresh().finally(() => {
-      inFlight = null;
-    });
+async function accessAfterRotation(source: AuthTicket): Promise<string | null> {
+  const rotation = rotationInFlight;
+  if (rotation && sameSession(rotation.ticket, source)) {
+    try {
+      await rotation.promise;
+    } catch {
+      return null;
+    }
   }
-  return inFlight;
+
+  const snapshot = getAuthSnapshot();
+  if (
+    (snapshot.phase === 'opening' || snapshot.phase === 'active') &&
+    snapshot.sessionGeneration === source.sessionGeneration &&
+    snapshot.credentialRevision >= source.credentialRevision
+  ) {
+    return snapshot.access;
+  }
+  return null;
 }
 
 /**
- * A refresh from an older generation calls this instead of reading the current
- * access token immediately. That token stays revoked until the barrier settles,
- * so returning it early would hand the interceptor a token the server rejects.
+ * Single-flight is scoped to the exact auth ticket. An old generation can
+ * never join a new session's flight and receive its access token.
  */
-async function accessAfterSupersedingRotation(): Promise<string | null> {
-  const pending = rotationInFlight;
-  if (!pending) {
-    return getAccessToken();
+export function refreshTokens(expectedTicket: AuthTicket | null = captureAuthTicket()): Promise<string | null> {
+  if (expectedTicket === null) {
+    return Promise.resolve(null);
   }
+
+  const rotation = rotationInFlight;
+  if (rotation && sameSession(rotation.ticket, expectedTicket)) {
+    return accessAfterRotation(expectedTicket);
+  }
+
+  if (!isAuthTicketCurrent(expectedTicket)) {
+    return accessAfterRotation(expectedTicket);
+  }
+
+  const key = ticketKey(expectedTicket);
+  let flight = refreshFlights.get(key);
+  if (!flight) {
+    const activity = beginCredentialActivity(expectedTicket);
+    if (activity === null) {
+      return Promise.resolve(null);
+    }
+
+    const promise = doRefresh(expectedTicket, activity.recordCandidate)
+      .then((result) => {
+        activity.finish();
+        if (result.hardFailure) {
+          // The activity has left the registry before close starts, so close can
+          // wait for all raw attempts without waiting on the promise that is
+          // currently requesting close (self-deadlock).
+          void requestAuthSessionClose('refreshFailure');
+          try {
+            onRefreshFailed?.();
+          } catch {
+            // A legacy observer is informational; the lifecycle owns closing.
+          }
+        }
+        return result;
+      }, (error: unknown) => {
+        activity.finish();
+        throw error;
+      })
+      .finally(() => {
+        const current = refreshFlights.get(key);
+        if (current?.promise === promise) {
+          refreshFlights.delete(key);
+        }
+      });
+
+    flight = { ticket: { ...expectedTicket }, promise };
+    refreshFlights.set(key, flight);
+  }
+
+  return flight.promise.then(async ({ access }) => {
+    if (isAuthTicketCurrent(expectedTicket)) {
+      return access;
+    }
+    return accessAfterRotation(expectedTicket);
+  });
+}
+
+async function doRefresh(
+  ticket: AuthTicket,
+  recordCandidate: (pair: AuthPair, ticket?: AuthTicket) => boolean,
+): Promise<RawRefreshResult> {
+  const refresh = await getRefreshToken();
+  if (!isAuthTicketCurrent(ticket)) {
+    return { access: await accessAfterRotation(ticket), hardFailure: false };
+  }
+  if (!refresh) {
+    return { access: null, hardFailure: false };
+  }
+
   try {
-    await pending;
+    // No sign-out signal is attached. A request sent before close is allowed to
+    // settle so its rotated pair can become the authoritative revoke handoff.
+    const { data } = await refreshHttp.post<RefreshResponse>(
+      `${getApiBaseUrl()}/auth/refresh`,
+      { refresh },
+    );
+    const pair = { access: data.access, refresh: data.refresh };
+
+    // This is deliberately before the first persistence await. Close crossing
+    // the native write can now see A2/R2 even though it must not publish A2.
+    if (!recordCandidate(pair, ticket)) {
+      return { access: await accessAfterRotation(ticket), hardFailure: false };
+    }
+    if (!isAuthTicketCurrent(ticket)) {
+      return { access: null, hardFailure: false };
+    }
+
+    // The queue call itself is synchronous. A close that begins after this line
+    // sees the raw attempt in its activity registry and deletes only after the
+    // pending native write has settled.
+    await setRefreshToken(pair.refresh);
+    if (!isAuthTicketCurrent(ticket)) {
+      return { access: null, hardFailure: false };
+    }
+    if (!publishAuthPair(ticket, pair)) {
+      return { access: null, hardFailure: false };
+    }
+    return { access: pair.access, hardFailure: false };
   } catch {
-    return null;
+    if (!isAuthTicketCurrent(ticket)) {
+      // Password rotation or close superseded this chain. Its expected failure
+      // is not evidence that the current credentials are invalid.
+      return { access: await accessAfterRotation(ticket), hardFailure: false };
+    }
+    return { access: null, hardFailure: true };
   }
-  return getAccessToken();
 }
 
 /**
- * Atomically adopt a server-issued token pair after an operation that revoked
- * every previous token (POST /auth/password/change).
- *
- * The refresh token is written to SecureStore first — it is the only step that
- * can fail. The opposite order would leave memory holding a valid access token
- * while disk still holds a revoked refresh token, so a kill at that point would
- * make the next restore fail with no durable record of the partial adoption.
+ * Adopts a password-change pair. Revision changes before persistence; refresh
+ * callers arriving during the native write await this barrier and make zero
+ * refresh HTTP calls.
  */
-export async function rotateTokens(tokens: { access: string; refresh: string }): Promise<void> {
-  tokenGeneration += 1;
+export async function rotateTokens(
+  tokens: AuthPair,
+  source: AuthTicket | null = captureAuthTicket(),
+): Promise<boolean> {
+  if (source === null) return false;
+
+  const rotatedTicket = beginAuthCredentialRotation(source, tokens);
+  if (rotatedTicket === null) return false;
+
+  // A password response that crossed close is already in the authoritative
+  // handoff. Closing forbids starting a new persistence write.
+  if (!isAuthTicketCurrent(rotatedTicket)) {
+    return false;
+  }
+
+  const activity = beginCredentialActivity(rotatedTicket);
+  if (activity === null) return false;
+
   const pending = (async () => {
     await setRefreshToken(tokens.refresh);
-    setAccessToken(tokens.access);
+    if (!isAuthTicketCurrent(rotatedTicket)) {
+      return false;
+    }
+    return publishAuthPair(rotatedTicket, tokens);
   })();
-  rotationInFlight = pending;
+  rotationInFlight = { ticket: rotatedTicket, promise: pending };
 
   try {
-    await pending;
+    return await pending;
   } catch (error) {
-    // The server has already revoked this access token. Never let a superseded
-    // refresh or request retry observe it while rotateSession signs out locally.
-    setAccessToken(null);
+    // The old family is already revoked server-side and the new refresh could
+    // not be persisted. Close owns local cleanup and best-effort handoff revoke.
     throw error;
   } finally {
-    if (rotationInFlight === pending) {
+    activity.finish();
+    if (rotationInFlight?.promise === pending) {
       rotationInFlight = null;
     }
   }
 }
 
-async function doRefresh(): Promise<string | null> {
-  const generationAtStart = tokenGeneration;
-  const refresh = await getRefreshToken();
-  if (tokenGeneration !== generationAtStart) {
-    // Do not send a token read from a generation superseded during SecureStore
-    // access: backend refresh rotation could blacklist the newly stored token.
-    return accessAfterSupersedingRotation();
-  }
-  if (!refresh) {
-    return null;
-  }
-  try {
-    const { data } = await refreshHttp.post<RefreshResponse>(`${getApiBaseUrl()}/auth/refresh`, { refresh });
-    if (tokenGeneration !== generationAtStart) {
-      return accessAfterSupersedingRotation();
-    }
-    setAccessToken(data.access);
-    // Backend rotates refresh tokens (ROTATE_REFRESH_TOKENS): persist the new one.
-    // Enqueued with no await since the generation check above, so a rotation
-    // starting from here on is guaranteed to write after this one and win.
-    await setRefreshToken(data.refresh);
-    if (tokenGeneration !== generationAtStart) {
-      // A rotation landed while that write was in flight. It has superseded both
-      // tokens, so this access token is revoked even though the write succeeded.
-      return accessAfterSupersedingRotation();
-    }
-    return data.access;
-  } catch {
-    if (tokenGeneration !== generationAtStart) {
-      // This refresh used a token the password change revoked. That failure is
-      // expected and must not sign the user out.
-      return accessAfterSupersedingRotation();
-    }
-    await clearTokens();
-    onRefreshFailed?.();
-    return null;
-  }
+export function __resetRefreshForTests(): void {
+  refreshFlights.clear();
+  rotationInFlight = null;
+  onRefreshFailed = null;
 }

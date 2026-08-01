@@ -1,19 +1,14 @@
-const mockDownloadAndShare = jest.fn();
-
-jest.mock('../downloads', () => ({
-  ...jest.requireActual('../downloads'),
-  downloadAndShareTripPhotoArchive: (...args: unknown[]) => mockDownloadAndShare(...args),
-}));
-
-// eslint-disable-next-line import/first
 import { act, renderHook } from '@testing-library/react-native';
-// eslint-disable-next-line import/first
+import { PHOTO_SAVE_SELECTION_MAX } from '../constants';
 import { createDeferred } from '@test/fakeProtectedTransport';
-// eslint-disable-next-line import/first
-import { PHOTO_BULK_DOWNLOAD_MAX_SELECTION } from '../constants';
-// eslint-disable-next-line import/first
+import { createPhotoSaveActionLock } from '../photoSave';
 import { usePhotoSelection } from '../hooks/usePhotoSelection';
-// eslint-disable-next-line import/first
+import type {
+  CreateSelectedPhotoSaveSessionOptions,
+  SelectedPhotoSaveSession,
+  SelectedSaveSnapshot,
+} from '../selectedPhotoSaveSession';
+import type { TripPhotoScope, TripPhotoScopeTicket } from '../hooks/useTripPhotoScope';
 import type { TripPhoto } from '../types';
 
 function photo(id: string): TripPhoto {
@@ -31,531 +26,382 @@ function photo(id: string): TripPhoto {
   };
 }
 
-function options(overrides: Record<string, unknown> = {}) {
+function createScope(tripId = 'trip-1'): TripPhotoScope & { invalidate(nextTripId: string): void } {
+  let ticket: TripPhotoScopeTicket = { tripId, generation: 0 };
+  const listeners = new Set<Parameters<TripPhotoScope['subscribeInvalidation']>[0]>();
   return {
-    tripId: 'trip-1',
-    photos: [photo('p1'), photo('p2'), photo('p3')],
-    reconcile: jest.fn(async () => undefined),
-    onTripNotFound: jest.fn(),
+    capture: () => ticket,
+    isCurrent: (candidate) =>
+      candidate.tripId === ticket.tripId && candidate.generation === ticket.generation,
+    subscribeInvalidation: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    waitForCleanup: async () => undefined,
+    invalidate: (nextTripId) => {
+      const previous = ticket;
+      ticket = { tripId: nextTripId, generation: ticket.generation + 1 };
+      for (const listener of listeners) void listener(previous, ticket);
+    },
+  };
+}
+
+function snapshot(overrides: Partial<SelectedSaveSnapshot> = {}): SelectedSaveSnapshot {
+  return {
+    phase: 'idle',
+    stage: null,
+    total: 0,
+    currentOrdinal: null,
+    counts: {
+      committed: 0,
+      terminalSkipped: 0,
+      retryableFailed: 0,
+      unknown: 0,
+      unattempted: 0,
+    },
+    ledger: [],
+    failure: null,
+    permissionDenied: null,
     ...overrides,
   };
 }
 
-beforeEach(() => {
-  jest.clearAllMocks();
-  mockDownloadAndShare.mockResolvedValue({ status: 'shared', fileName: 'trip-photos.zip' });
+function fakeSessionFactory(finalSnapshot: SelectedSaveSnapshot) {
+  const sessions: SelectedPhotoSaveSession[] = [];
+  const optionsSeen: CreateSelectedPhotoSaveSessionOptions[] = [];
+  const createSession = jest.fn((options: CreateSelectedPhotoSaveSessionOptions) => {
+    let current = snapshot({
+      total: options.photoIds.length,
+      counts: {
+        committed: 0,
+        terminalSkipped: 0,
+        retryableFailed: 0,
+        unknown: 0,
+        unattempted: options.photoIds.length,
+      },
+      ledger: options.photoIds.map((photoId) => ({ photoId, status: 'unattempted' as const })),
+    });
+    const session: SelectedPhotoSaveSession = {
+      getSnapshot: () => current,
+      start: jest.fn(async () => {
+        current = finalSnapshot;
+        options.onSnapshot?.(current);
+      }),
+      pause: jest.fn(),
+      stop: jest.fn(),
+      markUnavailable: jest.fn(),
+      close: jest.fn(async () => undefined),
+    };
+    sessions.push(session);
+    optionsSeen.push(options);
+    options.onSnapshot?.(current);
+    return session;
+  });
+  return { createSession, sessions, optionsSeen };
+}
+
+function options(overrides: Record<string, unknown> = {}) {
+  const scope = createScope();
+  const captured = {
+    auth: { sessionGeneration: 1, credentialRevision: 0 },
+    trip: scope.capture(),
+    store: { storeGeneration: 1, authGeneration: 1 },
+    runId: Symbol('selection-test-run'),
+  };
+  return {
+    tripId: 'trip-1',
+    photos: [photo('p1'), photo('p2'), photo('p3')],
+    tombstonedPhotoIds: new Set<string>(),
+    isPhotoTombstoned: jest.fn(() => false),
+    subscribePhotoTombstones: jest.fn(() => () => undefined),
+    scope,
+    onTombstone: jest.fn(),
+    onTripUnavailable: jest.fn(),
+    resolveAmbiguousNotFound: jest.fn(async () => 'unknown' as const),
+    captureTickets: jest.fn(() => captured),
+    ticketsAreCurrent: jest.fn(() => true),
+    ...overrides,
+  };
+}
+
+function createTombstoneFeed() {
+  const ids = new Set<string>();
+  const listeners = new Set<(photoId: string) => void>();
+  return {
+    isPhotoTombstoned: (photoId: string) => ids.has(photoId),
+    subscribePhotoTombstones: (listener: (photoId: string) => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    emit(photoId: string): void {
+      ids.add(photoId);
+      for (const listener of Array.from(listeners)) listener(photoId);
+    },
+  };
+}
+
+it('keeps ordered selection, enforces 100, and adds loaded ids without dropping deep ids', async () => {
+  const photos = Array.from({ length: 130 }, (_unused, index) => photo(`p${index}`));
+  const { result } = await renderHook(() => usePhotoSelection(options({ photos })));
+
+  await act(async () => {
+    result.current.enterSelection('deep-page-id');
+    result.current.selectLoaded();
+  });
+
+  expect(result.current.selectedIds[0]).toBe('deep-page-id');
+  expect(result.current.selectedCount).toBe(PHOTO_SAVE_SELECTION_MAX);
+  expect(result.current.selectedIds).toContain('p0');
+  expect(result.current.selectedIds).not.toContain('p100');
 });
 
-describe('selection model', () => {
-  it('enters selection on a long press and selects that photo', async () => {
-    const { result } = await renderHook(() => usePhotoSelection(options()));
+it('removes only authoritative tombstones and never intersects with the current page', async () => {
+  const scope = createScope();
+  const initial = options({ scope, photos: [photo('p1')] });
+  const view = await renderHook(
+    ({ tombstones }: { tombstones: ReadonlySet<string> }) =>
+      usePhotoSelection({ ...initial, tombstonedPhotoIds: tombstones }),
+    { initialProps: { tombstones: new Set<string>() } },
+  );
 
-    await act(async () => {
-      result.current.enterSelection('p2');
-    });
-
-    expect(result.current.selectionMode).toBe(true);
-    expect(result.current.selectedIds).toEqual(['p2']);
+  await act(async () => {
+    view.result.current.enterSelection('deep-page-id');
+    view.result.current.toggle('p1');
   });
+  expect(view.result.current.selectedIds).toEqual(['deep-page-id', 'p1']);
 
-  it('toggles on tap', async () => {
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-
-    await act(async () => {
-      result.current.toggle('p2');
-    });
-    expect(result.current.selectedCount).toBe(2);
-
-    await act(async () => {
-      result.current.toggle('p1');
-    });
-    expect(result.current.selectedIds).toEqual(['p2']);
-  });
-
-  it('refuses the photo past the hundred cap', async () => {
-    const photos = Array.from({ length: 120 }, (_unused, index) => photo(`p${index}`));
-    const { result } = await renderHook(() => usePhotoSelection(options({ photos })));
-
-    await act(async () => {
-      result.current.enterSelection('p0');
-      for (let index = 1; index < 120; index += 1) {
-        result.current.toggle(`p${index}`);
-      }
-    });
-
-    expect(result.current.selectedCount).toBe(PHOTO_BULK_DOWNLOAD_MAX_SELECTION);
-  });
-
-  it('selects only what is loaded, capped at a hundred', async () => {
-    const photos = Array.from({ length: 130 }, (_unused, index) => photo(`p${index}`));
-    const { result } = await renderHook(() => usePhotoSelection(options({ photos })));
-
-    await act(async () => {
-      result.current.enterSelection('p0');
-      result.current.selectLoaded();
-    });
-
-    expect(result.current.selectedCount).toBe(PHOTO_BULK_DOWNLOAD_MAX_SELECTION);
-  });
-
-  it('clears without leaving selection mode, and exits on cancel', async () => {
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-
-    await act(async () => {
-      result.current.clear();
-    });
-    expect(result.current.selectionMode).toBe(true);
-    expect(result.current.selectedCount).toBe(0);
-
-    await act(async () => {
-      result.current.exit();
-    });
-    expect(result.current.selectionMode).toBe(false);
-  });
+  await view.rerender({ tombstones: new Set(['p1']) });
+  expect(view.result.current.selectedIds).toEqual(['deep-page-id']);
 });
 
-describe('bulk download', () => {
-  it('sends the selected ids and counts the request against the hourly budget', async () => {
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-      result.current.toggle('p3');
-    });
-
-    await act(async () => {
-      await result.current.startDownload();
-    });
-
-    expect(mockDownloadAndShare).toHaveBeenCalledTimes(1);
-    expect(mockDownloadAndShare.mock.calls[0][0]).toMatchObject({
-      tripId: 'trip-1',
-      photoIds: ['p1', 'p3'],
-    });
-    expect(result.current.requestsUsed).toBe(1);
+it('delivers the synchronous tombstone feed to the active session before prop state changes', async () => {
+  const feed = createTombstoneFeed();
+  const paused = snapshot({
+    phase: 'paused',
+    total: 2,
+    counts: {
+      committed: 0,
+      terminalSkipped: 0,
+      retryableFailed: 0,
+      unknown: 0,
+      unattempted: 2,
+    },
+    ledger: [
+      { photoId: 'p1', status: 'unattempted' },
+      { photoId: 'p2', status: 'unattempted' },
+    ],
+  });
+  const fake = fakeSessionFactory(paused);
+  const configured = options({
+    ...feed,
+    createSession: fake.createSession,
+  });
+  const view = await renderHook(() => usePhotoSelection(configured));
+  await act(async () => {
+    view.result.current.enterSelection('p1');
+    view.result.current.toggle('p2');
+    await view.result.current.startSave();
   });
 
-  it('keeps the selection after the sheet closes and claims no success', async () => {
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-
-    await act(async () => {
-      await result.current.startDownload();
-    });
-
-    // `shareAsync` resolving proves the sheet closed, not that anything was
-    // shared, so nothing is announced and the selection survives.
-    expect(result.current.selectedIds).toEqual(['p1']);
-    expect(result.current.selectionMode).toBe(true);
-    expect(result.current.download).toEqual({ status: 'idle' });
+  await act(async () => {
+    feed.emit('p1');
+    expect(fake.sessions[0].markUnavailable).toHaveBeenCalledWith('p1');
   });
 
-  it('refuses a second download while one is running', async () => {
-    let release: (() => void) | null = null;
-    mockDownloadAndShare.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          release = () => resolve({ status: 'shared', fileName: 'a.zip' });
-        }),
-    );
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
+  expect(view.result.current.selectedIds).toEqual(['p2']);
+  expect(fake.optionsSeen[0].isPhotoUnavailable?.('p1')).toBe(true);
+});
 
-    await act(async () => {
-      void result.current.startDownload();
-      void result.current.startDownload();
-      release?.();
-    });
+it('freezes an ordered worklist and coalesces rapid Save taps', async () => {
+  const complete = snapshot({
+    phase: 'completed',
+    total: 2,
+    counts: {
+      committed: 2,
+      terminalSkipped: 0,
+      retryableFailed: 0,
+      unknown: 0,
+      unattempted: 0,
+    },
+    ledger: [
+      { photoId: 'p2', status: 'committed' },
+      { photoId: 'p1', status: 'committed' },
+    ],
+  });
+  const fake = fakeSessionFactory(complete);
+  const { result } = await renderHook(() =>
+    usePhotoSelection(options({ createSession: fake.createSession })),
+  );
 
-    expect(mockDownloadAndShare).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    result.current.enterSelection('p2');
+    result.current.toggle('p1');
+  });
+  await act(async () => {
+    await Promise.all([result.current.startSave(), result.current.startSave()]);
   });
 
-  it('does nothing with an empty selection', async () => {
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-      result.current.clear();
-    });
+  expect(fake.createSession).toHaveBeenCalledTimes(1);
+  expect(fake.optionsSeen[0].photoIds).toEqual(['p2', 'p1']);
+  expect(fake.sessions[0].start).toHaveBeenCalledTimes(1);
+  expect(result.current.selectionMode).toBe(false);
+  expect(result.current.selectedIds).toEqual([]);
+  expect(result.current.feedback?.message).toBe('Saved 2 photos to Photos.');
+});
 
-    await act(async () => {
-      await result.current.startDownload();
-    });
-
-    expect(mockDownloadAndShare).not.toHaveBeenCalled();
+it('reserves the global action and cannot adopt auth/store B across an old cleanup tail', async () => {
+  const cleanup = createDeferred<void>();
+  const scope = createScope();
+  scope.waitForCleanup = () => cleanup.promise;
+  const actionLock = createPhotoSaveActionLock();
+  const fake = fakeSessionFactory(snapshot());
+  let ticketsCurrent = true;
+  const configured = options({
+    scope,
+    actionLock,
+    createSession: fake.createSession,
+    ticketsAreCurrent: jest.fn(() => ticketsCurrent),
   });
+  const { result } = await renderHook(() => usePhotoSelection(configured));
+  await act(async () => result.current.enterSelection('p1'));
 
-  it('reports progress while the archive streams', async () => {
-    const finish = createDeferred<{ status: 'shared'; fileName: string }>();
-    mockDownloadAndShare.mockImplementation(
-      async (input: { onProgress?: (written: number, total: number | null) => void }) => {
-        input.onProgress?.(1024, 4096);
-        return finish.promise;
-      },
-    );
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-
-    let pending!: Promise<void>;
-    await act(async () => {
-      pending = result.current.startDownload();
-    });
-
-    // Observed while the archive is still streaming, not after it finished.
-    expect(result.current.download).toEqual({
-      status: 'downloading',
-      bytesWritten: 1024,
-      totalBytes: 4096,
-    });
-
-    await act(async () => {
-      finish.resolve({ status: 'shared', fileName: 'a.zip' });
-      await pending;
-    });
+  let pending!: Promise<void>;
+  await act(async () => {
+    pending = result.current.startSave();
+    await Promise.resolve();
   });
+  expect(fake.createSession).not.toHaveBeenCalled();
+  expect(actionLock.tryAcquire()).toBeNull();
 
-  it('keeps progress and Cancel visible when selection changes during a ZIP stream', async () => {
-    const finish = createDeferred<{ status: 'shared'; fileName: string }>();
-    mockDownloadAndShare.mockImplementation(
-      async (input: { onProgress?: (written: number, total: number | null) => void }) => {
-        input.onProgress?.(2048, 8192);
-        return finish.promise;
-      },
-    );
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-    let pending!: Promise<void>;
-    await act(async () => {
-      pending = result.current.startDownload();
-    });
-
-    await act(async () => {
-      result.current.toggle('p2');
-      result.current.selectLoaded();
-      result.current.clear();
-      result.current.enterSelection('p3');
-    });
-
-    // Every mutation path is frozen to the request snapshot, and none may reset
-    // the active progress state or hide Cancel.
-    expect(result.current.selectedIds).toEqual(['p1']);
-    expect(result.current.download).toEqual({
-      status: 'downloading',
-      bytesWritten: 2048,
-      totalBytes: 8192,
-    });
-
-    await act(async () => {
-      finish.resolve({ status: 'shared', fileName: 'a.zip' });
-      await pending;
-    });
-  });
-
-  it('coalesces a burst of chunk progress to a bounded React update rate', async () => {
-    const finish = createDeferred<{ status: 'shared'; fileName: string }>();
-    let emit: ((written: number, total: number | null) => void) | undefined;
-    mockDownloadAndShare.mockImplementation(
-      async (input: { onProgress?: (written: number, total: number | null) => void }) => {
-        emit = input.onProgress;
-        return finish.promise;
-      },
-    );
-    const now = jest.spyOn(Date, 'now').mockReturnValue(1_000);
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-    let pending!: Promise<void>;
-    await act(async () => {
-      pending = result.current.startDownload();
-      emit?.(1, 100);
-      emit?.(2, 100);
-      emit?.(3, 100);
-    });
-    expect(result.current.download).toMatchObject({ status: 'downloading', bytesWritten: 1 });
-
-    now.mockReturnValue(1_100);
-    await act(async () => {
-      emit?.(4, 100);
-    });
-    expect(result.current.download).toMatchObject({ status: 'downloading', bytesWritten: 4 });
-
-    await act(async () => {
-      finish.resolve({ status: 'shared', fileName: 'a.zip' });
-      await pending;
-    });
-    now.mockRestore();
-  });
-
-  it('does not re-render byte progress when the archive length is unknown', async () => {
-    const finish = createDeferred<{ status: 'shared'; fileName: string }>();
-    let emit: ((written: number, total: number | null) => void) | undefined;
-    mockDownloadAndShare.mockImplementation(
-      async (input: { onProgress?: (written: number, total: number | null) => void }) => {
-        emit = input.onProgress;
-        return finish.promise;
-      },
-    );
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-
-    let pending!: Promise<void>;
-    await act(async () => {
-      pending = result.current.startDownload();
-      for (let chunk = 1; chunk <= 100; chunk += 1) {
-        emit?.(chunk * 1024, null);
-      }
-    });
-
-    expect(result.current.download).toEqual({
-      status: 'downloading',
-      bytesWritten: 0,
-      totalBytes: null,
-    });
-
-    await act(async () => {
-      finish.resolve({ status: 'shared', fileName: 'a.zip' });
-      await pending;
-    });
-  });
-
-  it('aborts an in-flight archive when selection mode is exited', async () => {
-    const finish = createDeferred<{ status: 'cancelled' }>();
-    mockDownloadAndShare.mockImplementation(() => finish.promise);
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-
-    let pending!: Promise<void>;
-    await act(async () => {
-      pending = result.current.startDownload();
-    });
-    const signal = mockDownloadAndShare.mock.calls[0][0].signal as AbortSignal;
-
-    await act(async () => {
-      result.current.exit();
-    });
-
-    expect(signal.aborted).toBe(true);
-    expect(result.current.selectionMode).toBe(false);
-
-    await act(async () => {
-      finish.resolve({ status: 'cancelled' });
-      await pending;
-    });
-  });
-
-  it('aborts an in-flight archive when the screen unmounts', async () => {
-    const finish = createDeferred<{ status: 'cancelled' }>();
-    mockDownloadAndShare.mockImplementation(() => finish.promise);
-    const view = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      view.result.current.enterSelection('p1');
-    });
-    let pending!: Promise<void>;
-    await act(async () => {
-      pending = view.result.current.startDownload();
-    });
-    const signal = mockDownloadAndShare.mock.calls[0][0].signal as AbortSignal;
-
-    await act(async () => {
-      view.unmount();
-    });
-
-    expect(signal.aborted).toBe(true);
-    finish.resolve({ status: 'cancelled' });
+  ticketsCurrent = false;
+  await act(async () => {
+    cleanup.resolve();
     await pending;
   });
+  expect(fake.createSession).not.toHaveBeenCalled();
+  const release = actionLock.tryAcquire();
+  expect(release).not.toBeNull();
+  release?.();
 });
 
-describe('all-or-nothing bulk 404 (D17)', () => {
-  it('reconciles, clears the whole selection and asks the user to choose again', async () => {
-    mockDownloadAndShare.mockResolvedValue({ status: 'staleSelection' });
-    const opts = options();
-    const { result } = await renderHook(() => usePhotoSelection(opts));
-    await act(async () => {
-      result.current.enterSelection('p1');
-      result.current.toggle('p2');
-      result.current.toggle('p3');
-    });
+it('cancels a pending cleanup wait without creating a session or touching native state', async () => {
+  const cleanup = createDeferred<void>();
+  const scope = createScope();
+  scope.waitForCleanup = () => cleanup.promise;
+  const actionLock = createPhotoSaveActionLock();
+  const fake = fakeSessionFactory(snapshot());
+  const configured = options({
+    scope,
+    actionLock,
+    createSession: fake.createSession,
+  });
+  const { result } = await renderHook(() => usePhotoSelection(configured));
+  await act(async () => result.current.enterSelection('p1'));
 
-    await act(async () => {
-      await result.current.startDownload();
-    });
+  let pending!: Promise<void>;
+  await act(async () => {
+    pending = result.current.startSave();
+    await Promise.resolve();
+  });
+  expect(result.current.saveSnapshot?.stage).toBe('preparing');
 
-    // The server refuses the whole archive without saying which id was stale,
-    // so nothing here tries to work out which two of the three are still fine.
-    expect(opts.reconcile).toHaveBeenCalledTimes(1);
-    expect(result.current.selectedCount).toBe(0);
-    expect(result.current.selectionMode).toBe(false);
-    expect(result.current.download).toEqual({
-      status: 'message',
-      message: 'Some selected photos are no longer available.',
-    });
-    // One request, not a retry loop against a 30/hour budget.
-    expect(mockDownloadAndShare).toHaveBeenCalledTimes(1);
+  await act(async () => result.current.cancelSave());
+  expect(result.current.saveSnapshot).toBeNull();
+  expect(result.current.selectedIds).toEqual(['p1']);
+  expect(result.current.feedback?.message).toBe('Save stopped. 1 not saved.');
+  expect(fake.createSession).not.toHaveBeenCalled();
+  const releaseAfterCancel = actionLock.tryAcquire();
+  expect(releaseAfterCancel).not.toBeNull();
+  releaseAfterCancel?.();
+
+  await act(async () => {
+    cleanup.resolve();
+    await pending;
+  });
+  expect(fake.createSession).not.toHaveBeenCalled();
+});
+
+it('retains only retryable/unattempted ids after a partial result', async () => {
+  const partial = snapshot({
+    phase: 'completed',
+    total: 5,
+    counts: {
+      committed: 1,
+      terminalSkipped: 1,
+      retryableFailed: 1,
+      unknown: 1,
+      unattempted: 1,
+    },
+    ledger: [
+      { photoId: 'committed', status: 'committed' },
+      { photoId: 'gone', status: 'terminalSkipped', failure: { kind: 'notFound', message: 'Gone' } },
+      { photoId: 'retry', status: 'retryableFailed', failure: { kind: 'network', message: 'Offline' } },
+      { photoId: 'unknown', status: 'unknown', failure: { kind: 'server', message: 'Check Photos' } },
+      { photoId: 'rest', status: 'unattempted' },
+    ],
+    failure: { kind: 'network', message: 'Offline' },
+  });
+  const fake = fakeSessionFactory(partial);
+  const { result } = await renderHook(() =>
+    usePhotoSelection(options({ createSession: fake.createSession })),
+  );
+
+  await act(async () => {
+    result.current.enterSelection('committed');
+    for (const id of ['gone', 'retry', 'unknown', 'rest']) result.current.toggle(id);
+    await result.current.startSave();
   });
 
-  it('clears the selection even when the reconcile itself fails', async () => {
-    mockDownloadAndShare.mockResolvedValue({ status: 'staleSelection' });
-    const opts = options({
-      reconcile: jest.fn(async () => {
-        throw new Error('offline');
-      }),
-    });
-    const { result } = await renderHook(() => usePhotoSelection(opts));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
+  expect(result.current.selectionMode).toBe(true);
+  expect(result.current.selectedIds).toEqual(['retry', 'rest']);
+  expect(result.current.feedback?.message).toContain('Check Photos');
+});
 
-    await act(async () => {
-      await result.current.startDownload().catch(() => undefined);
-    });
-
-    expect(result.current.selectedCount).toBe(0);
-    expect(result.current.selectionMode).toBe(false);
-    expect(result.current.download).toEqual({
-      status: 'message',
-      message: 'Some selected photos are no longer available.',
-    });
+it('keeps an unknown warning detached and exposes no actionable unknown id', async () => {
+  const unknown = snapshot({
+    phase: 'completed',
+    total: 1,
+    counts: {
+      committed: 0,
+      terminalSkipped: 0,
+      retryableFailed: 0,
+      unknown: 1,
+      unattempted: 0,
+    },
+    ledger: [
+      { photoId: 'p1', status: 'unknown', failure: { kind: 'server', message: 'ambiguous' } },
+    ],
+  });
+  const fake = fakeSessionFactory(unknown);
+  const { result } = await renderHook(() =>
+    usePhotoSelection(options({ createSession: fake.createSession })),
+  );
+  await act(async () => {
+    result.current.enterSelection('p1');
+    await result.current.startSave();
   });
 
-  it('never leaks a photo id into the message', async () => {
-    mockDownloadAndShare.mockResolvedValue({ status: 'staleSelection' });
-    const reconciling = createDeferred<void>();
-    const opts = options({ reconcile: jest.fn(() => reconciling.promise) });
-    const { result } = await renderHook(() => usePhotoSelection(opts));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
+  expect(result.current.selectionMode).toBe(false);
+  expect(result.current.selectedIds).toEqual([]);
+  expect(result.current.feedback?.message).toContain('Check Photos');
+});
 
-    let pending!: Promise<void>;
-    await act(async () => {
-      pending = result.current.startDownload();
-    });
+it('closes stale Trip A work without publishing into Trip B', async () => {
+  const scope = createScope();
+  const paused = snapshot({ phase: 'paused' });
+  const fake = fakeSessionFactory(paused);
+  const view = await renderHook(
+    ({ tripId }: { tripId: string }) =>
+      usePhotoSelection(options({ tripId, scope, createSession: fake.createSession })),
+    { initialProps: { tripId: 'trip-1' } },
+  );
 
-    // Held mid-reconcile so the message is observable before the selection is
-    // cleared.
-    expect(result.current.download).toEqual({
-      status: 'message',
-      message: 'Some selected photos are no longer available.',
-    });
-    expect(JSON.stringify(result.current.download)).not.toContain('p1');
-
-    await act(async () => {
-      reconciling.resolve();
-      await pending;
-    });
+  await act(async () => {
+    view.result.current.enterSelection('p1');
   });
+  scope.invalidate('trip-2');
+  await view.rerender({ tripId: 'trip-2' });
 
-  it('routes a trip-level 404 away from the stale-selection path', async () => {
-    mockDownloadAndShare.mockResolvedValue({
-      status: 'failed',
-      failure: { kind: 'notFound', message: 'gone', status: 404, errorCode: 'TRIP_NOT_FOUND' },
-    });
-    const opts = options();
-    const { result } = await renderHook(() => usePhotoSelection(opts));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-
-    await act(async () => {
-      await result.current.startDownload();
-    });
-
-    expect(opts.onTripNotFound).toHaveBeenCalledWith(
-      expect.objectContaining({ errorCode: 'TRIP_NOT_FOUND' }),
-    );
-    expect(opts.reconcile).not.toHaveBeenCalled();
-    expect(result.current.selectionMode).toBe(false);
-  });
-
-  it('keeps the selection so the user can retry after a throttle or a failure', async () => {
-    mockDownloadAndShare.mockResolvedValue({
-      status: 'failed',
-      failure: { kind: 'throttled', message: 'Download limit reached. Try again later.', status: 429 },
-    });
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-      result.current.toggle('p2');
-    });
-
-    await act(async () => {
-      await result.current.startDownload();
-    });
-
-    expect(result.current.selectedCount).toBe(2);
-    expect(result.current.download).toMatchObject({
-      status: 'error',
-      failure: { message: 'Download limit reached. Try again later.' },
-    });
-  });
-
-  it('reports an unavailable share sheet without losing the selection', async () => {
-    mockDownloadAndShare.mockResolvedValue({ status: 'unavailable' });
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-
-    await act(async () => {
-      await result.current.startDownload();
-    });
-
-    expect(result.current.selectedCount).toBe(1);
-    expect(result.current.download).toMatchObject({ status: 'error' });
-  });
-
-  it('maps an unexpected native/download rejection and leaves the action retryable', async () => {
-    mockDownloadAndShare.mockRejectedValue(new Error('native failure'));
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-    await act(async () => {
-      await result.current.startDownload();
-    });
-
-    expect(result.current.download).toMatchObject({
-      status: 'error',
-      failure: { kind: 'server' },
-    });
-
-    mockDownloadAndShare.mockResolvedValue({ status: 'shared', fileName: 'retry.zip' });
-    await act(async () => {
-      await result.current.startDownload();
-    });
-    expect(mockDownloadAndShare).toHaveBeenCalledTimes(2);
-  });
-
-  it('treats a cancelled download as an ordinary outcome', async () => {
-    mockDownloadAndShare.mockResolvedValue({ status: 'cancelled' });
-    const { result } = await renderHook(() => usePhotoSelection(options()));
-    await act(async () => {
-      result.current.enterSelection('p1');
-    });
-
-    await act(async () => {
-      await result.current.startDownload();
-    });
-
-    expect(result.current.download).toEqual({ status: 'idle' });
-    expect(result.current.selectedCount).toBe(1);
-  });
+  expect(view.result.current.selectionMode).toBe(false);
+  expect(view.result.current.selectedIds).toEqual([]);
 });

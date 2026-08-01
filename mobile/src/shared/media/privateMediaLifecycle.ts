@@ -1,5 +1,5 @@
 /**
- * Session, abort, and purge barriers for every private-media flow (D20).
+ * Abort and general-temp purge barriers for private-media flows (D20).
  *
  * The problem this solves is narrow and specific. Protected assets, photo list,
  * upload and delete all authenticate, so all of them can trigger a token
@@ -9,11 +9,12 @@
  * signed out of, and a purge queued by the old session deletes files the new one
  * has already staged.
  *
- * The fix lives entirely at the caller: `src/shared/api/refresh.ts` and the Axios
- * interceptor keep their single-flight and generation semantics untouched. What
- * changes is that every private-media operation registers its *whole* promise
- * here — including any interceptor retry nested inside it — so sign-out can
- * close the gate, abort what is running, and wait for it before revoking.
+ * Global credential publication/retry safety lives in
+ * `shared/api/authSessionLifecycle.ts`; this registry is not an auth-session
+ * barrier by itself. Private-media operations still register their *whole*
+ * promise here so background/sign-out can abort network work and coordinate the
+ * general protected-cache/upload-temp purge independently from credential close
+ * and the dedicated PhotoKit commit fence.
  *
  * No native module is imported here: purgers register themselves, so this module
  * never needs to know what a file is.
@@ -30,6 +31,7 @@ const purgers = new Map<PrivateMediaPurgerName, () => Promise<void>>();
 const controllers = new Set<AbortController>();
 const activity = new Set<Promise<unknown>>();
 const generationListeners = new Set<() => void>();
+const transferLeaseIdleWaiters = new Set<() => void>();
 
 let sessionActive = false;
 let acquisitionOpen = false;
@@ -39,13 +41,14 @@ let activationVersion = 0;
 let generation = 0;
 let transferLeases = 0;
 let purgeDeferred = false;
-let purgeTail: Promise<void> = Promise.resolve();
+let protectedAssetPurgeTail: Promise<void> = Promise.resolve();
+let uploadTempPurgeTail: Promise<void> = Promise.resolve();
 /**
- * Moves synchronously whenever work is appended to `purgeTail`.
+ * Moves synchronously whenever work is appended to either namespace queue.
  *
  * Promise settlement alone is not a sufficient hand-off barrier: another
- * microtask can enqueue cleanup after `flushPrivateMediaPurge()` has observed a
- * settled tail but before an awaiting start/resume continuation runs. Openers
+ * microtask can enqueue cleanup after `flushPrivateMediaPurge()` has observed
+ * settled tails but before an awaiting start/resume continuation runs. Openers
  * compare this revision immediately before opening the gate, closing that gap.
  */
 let purgeRevision = 0;
@@ -215,10 +218,12 @@ export async function waitForPrivateNetworkIdle(): Promise<void> {
 }
 
 /**
- * Marks a multi-step flow that owns temporary files — preprocess/upload, single
- * save, ZIP download and share. Backgrounding defers the purge until the last
- * lease releases so the OS does not delete a file mid-transfer. Sign-out is not
- * deferrable and overrides every lease.
+ * Marks a preprocess/upload flow that owns a general temporary file.
+ * Backgrounding defers that namespace's purge until the last lease releases so
+ * the OS does not delete a file mid-transfer. Photos save uses its dedicated
+ * current-file commit fence; mobile no longer stages/shares a ZIP. Sign-out
+ * still aborts work synchronously, but the upload-temp purger waits for the
+ * active native/request lease to settle before deleting its exact inputs.
  *
  * @throws ProtectedAssetError `cancelled` when the gate is already closed.
  */
@@ -236,6 +241,11 @@ export function acquirePrivateTransferLease(): () => void {
     }
     released = true;
     transferLeases -= 1;
+    if (transferLeases === 0) {
+      const waiters = Array.from(transferLeaseIdleWaiters);
+      transferLeaseIdleWaiters.clear();
+      for (const resolve of waiters) resolve();
+    }
     if (transferLeases === 0 && purgeDeferred) {
       if (sessionActive && foregroundDesired) {
         // Foreground intent wins even when the async resume continuation has not
@@ -253,22 +263,57 @@ export function getPrivateTransferLeaseCount(): number {
   return transferLeases;
 }
 
-async function runAllPurgers(): Promise<void> {
-  for (const purge of Array.from(purgers.values())) {
-    try {
-      await purge();
-    } catch {
-      // Cleanup is best effort by contract: a file the OS refuses to delete must
-      // not leave the queue jammed for the session that comes next.
+async function waitForTransferLeasesToSettle(): Promise<void> {
+  if (transferLeases === 0) return;
+  await new Promise<void>((resolve) => {
+    transferLeaseIdleWaiters.add(resolve);
+    // Lease release and waiter registration are synchronous, but retain this
+    // re-check so future native lease adapters cannot introduce a lost wake-up.
+    if (transferLeases === 0 && transferLeaseIdleWaiters.delete(resolve)) {
+      resolve();
     }
+  });
+}
+
+async function runPurger(name: PrivateMediaPurgerName): Promise<void> {
+  const purge = purgers.get(name);
+  if (!purge) return;
+  try {
+    await purge();
+  } catch {
+    // Cleanup is best effort by contract: a file the OS refuses to delete must
+    // not leave the queue jammed for the session that comes next.
   }
 }
 
 function enqueuePurge(): Promise<void> {
   purgeRevision += 1;
-  const queued = purgeTail.then(runAllPurgers, runAllPurgers);
-  purgeTail = queued;
-  return queued;
+
+  // Protected cache files are not upload request bodies. Purge them on the
+  // boundary immediately, even while an upload-temp lease is still active.
+  protectedAssetPurgeTail = protectedAssetPurgeTail.then(
+    () => runPurger('protected-assets'),
+    () => runPurger('protected-assets'),
+  );
+
+  // Upload-temp files may still be read by native preprocessing or Axios. The
+  // namespace purge therefore owns a separate queue and cannot run until every
+  // lease that existed when the gate closed has settled. Because the gate is
+  // already closed, no new lease can appear behind this fence.
+  uploadTempPurgeTail = uploadTempPurgeTail.then(
+    async () => {
+      await waitForTransferLeasesToSettle();
+      await runPurger('upload-temp');
+    },
+    async () => {
+      await waitForTransferLeasesToSettle();
+      await runPurger('upload-temp');
+    },
+  );
+
+  return Promise.allSettled([protectedAssetPurgeTail, uploadTempPurgeTail]).then(
+    () => undefined,
+  );
 }
 
 /**
@@ -278,10 +323,15 @@ function enqueuePurge(): Promise<void> {
  * old purge deletes files the new session has already staged.
  */
 export async function flushPrivateMediaPurge(): Promise<void> {
-  let awaited: Promise<void> | null = null;
-  while (awaited !== purgeTail) {
-    awaited = purgeTail;
-    await awaited.catch(() => undefined);
+  let awaitedProtected: Promise<void> | null = null;
+  let awaitedUpload: Promise<void> | null = null;
+  while (
+    awaitedProtected !== protectedAssetPurgeTail ||
+    awaitedUpload !== uploadTempPurgeTail
+  ) {
+    awaitedProtected = protectedAssetPurgeTail;
+    awaitedUpload = uploadTempPurgeTail;
+    await Promise.allSettled([awaitedProtected, awaitedUpload]);
   }
 }
 
@@ -424,8 +474,11 @@ export function __resetPrivateMediaLifecycleForTests(): void {
   activationVersion = 0;
   generation = 0;
   transferLeases = 0;
+  for (const resolve of Array.from(transferLeaseIdleWaiters)) resolve();
+  transferLeaseIdleWaiters.clear();
   purgeDeferred = false;
-  purgeTail = Promise.resolve();
+  protectedAssetPurgeTail = Promise.resolve();
+  uploadTempPurgeTail = Promise.resolve();
   purgeRevision = 0;
   foregroundDesired = true;
 }

@@ -8,23 +8,17 @@
  */
 
 import * as MediaLibrary from 'expo-media-library';
-import * as Sharing from 'expo-sharing';
 import { nativePhotoActions } from '../nativePhotoActions';
-
-jest.mock('expo-sharing', () => ({
-  isAvailableAsync: jest.fn(async () => true),
-  shareAsync: jest.fn(async () => undefined),
-}));
 
 beforeEach(() => {
   jest.clearAllMocks();
 });
 
 it('saves through Asset.create and never through the deprecated saveToLibraryAsync', async () => {
-  await nativePhotoActions.createAsset('file:///cache/goplan-protected-media/abc.webp');
+  await nativePhotoActions.createAsset('file:///cache/goplan-photo-save/abc.webp');
 
   expect(MediaLibrary.Asset.create).toHaveBeenCalledWith(
-    'file:///cache/goplan-protected-media/abc.webp',
+    'file:///cache/goplan-photo-save/abc.webp',
   );
   expect(
     (MediaLibrary as unknown as { saveToLibraryAsync?: unknown }).saveToLibraryAsync,
@@ -42,13 +36,4 @@ it('requests write-only, photos-only permission rather than full library access'
 
   expect(MediaLibrary.requestPermissionsAsync).toHaveBeenCalledWith(true, ['photo']);
   expect(result).toEqual({ granted: true, canAskAgain: true, status: 'granted' });
-});
-
-it('passes the share options straight through', async () => {
-  await nativePhotoActions.share('file:///cache/trip-photos.zip', { UTI: 'public.zip-archive' });
-
-  expect(Sharing.shareAsync).toHaveBeenCalledWith('file:///cache/trip-photos.zip', {
-    UTI: 'public.zip-archive',
-  });
-  await expect(nativePhotoActions.isSharingAvailable()).resolves.toBe(true);
 });

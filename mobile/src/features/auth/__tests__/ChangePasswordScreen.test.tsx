@@ -8,25 +8,15 @@ jest.mock('expo-router', () => {
   return { useRouter: () => mockRouter, Stack: { Screen: MockStackScreen } };
 });
 
-const mockRotateSession = jest.fn();
-jest.mock('../session', () => ({ useSession: () => ({ rotateSession: mockRotateSession }) }));
-jest.mock('../api', () => ({ changePasswordRequest: jest.fn() }));
+const mockChangePassword = jest.fn();
+jest.mock('../session', () => ({ useSession: () => ({ changePassword: mockChangePassword }) }));
 
 // eslint-disable-next-line import/first
-import { fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 // eslint-disable-next-line import/first
 import { axiosError } from '@test/axiosError';
 // eslint-disable-next-line import/first
-import { changePasswordRequest } from '../api';
-// eslint-disable-next-line import/first
 import { ChangePasswordScreen } from '../screens/ChangePasswordScreen';
-
-const mockChange = changePasswordRequest as jest.MockedFunction<typeof changePasswordRequest>;
-
-const payload = {
-  user: { id: 'u1' },
-  tokens: { access: 'new-access', refresh: 'new-refresh', token_type: 'Bearer' },
-};
 
 async function fillForm(current: string, next: string, confirm: string) {
   await fireEvent.changeText(screen.getByLabelText('Current password'), current);
@@ -37,7 +27,7 @@ async function fillForm(current: string, next: string, confirm: string) {
 describe('ChangePasswordScreen', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockRotateSession.mockResolvedValue('rotated');
+    mockChangePassword.mockResolvedValue('rotated');
   });
 
   it('rejects a mismatched confirmation without contacting the server', async () => {
@@ -45,36 +35,35 @@ describe('ChangePasswordScreen', () => {
     await fillForm('old-secret', 'new-secret-1', 'new-secret-2');
     await fireEvent.press(screen.getByLabelText('Change password'));
 
-    expect(mockChange).not.toHaveBeenCalled();
+    expect(mockChangePassword).not.toHaveBeenCalled();
     expect(screen.getByText('New passwords do not match.')).toBeTruthy();
   });
 
-  it('adopts the rotated token pair and leaves the screen on success', async () => {
-    mockChange.mockResolvedValue(payload as never);
-
+  it('delegates the whole credential operation to SessionContext and leaves on success', async () => {
     await render(<ChangePasswordScreen />);
     await fillForm('old-secret', 'new-secret-1', 'new-secret-1');
     await fireEvent.press(screen.getByLabelText('Change password'));
 
-    await waitFor(() => expect(mockRotateSession).toHaveBeenCalledWith(payload));
-    expect(mockChange).toHaveBeenCalledWith({ current_password: 'old-secret', new_password: 'new-secret-1' });
+    await waitFor(() => expect(mockChangePassword).toHaveBeenCalledWith({
+      current_password: 'old-secret',
+      new_password: 'new-secret-1',
+    }));
     expect(mockRouter.back).toHaveBeenCalledTimes(1);
   });
 
   it('stays put when the rotation forces a sign-out, letting the stack guard redirect', async () => {
-    mockChange.mockResolvedValue(payload as never);
-    mockRotateSession.mockResolvedValue('signedOut');
+    mockChangePassword.mockResolvedValue('signedOut');
 
     await render(<ChangePasswordScreen />);
     await fillForm('old-secret', 'new-secret-1', 'new-secret-1');
     await fireEvent.press(screen.getByLabelText('Change password'));
 
-    await waitFor(() => expect(mockRotateSession).toHaveBeenCalled());
+    await waitFor(() => expect(mockChangePassword).toHaveBeenCalled());
     expect(mockRouter.back).not.toHaveBeenCalled();
   });
 
   it('places a wrong current password on its own input and rotates nothing', async () => {
-    mockChange.mockRejectedValue(
+    mockChangePassword.mockRejectedValue(
       axiosError(400, { detail: 'Current password is incorrect.', error_code: 'INVALID_CURRENT_PASSWORD' }),
     );
 
@@ -83,12 +72,11 @@ describe('ChangePasswordScreen', () => {
     await fireEvent.press(screen.getByLabelText('Change password'));
 
     await waitFor(() => expect(screen.getByText('Current password is incorrect.')).toBeTruthy());
-    expect(mockRotateSession).not.toHaveBeenCalled();
     expect(mockRouter.back).not.toHaveBeenCalled();
   });
 
   it('places a weak new password on the new password input', async () => {
-    mockChange.mockRejectedValue(
+    mockChangePassword.mockRejectedValue(
       axiosError(400, { detail: 'This password is too common.', error_code: 'WEAK_PASSWORD' }),
     );
 
@@ -100,7 +88,7 @@ describe('ChangePasswordScreen', () => {
   });
 
   it('handles the DRF field-keyed minimum-length rejection', async () => {
-    mockChange.mockRejectedValue(
+    mockChangePassword.mockRejectedValue(
       axiosError(400, { new_password: ['Ensure this field has at least 8 characters.'] }),
     );
 
@@ -114,7 +102,7 @@ describe('ChangePasswordScreen', () => {
   });
 
   it('surfaces the 5/hour throttle as its own state', async () => {
-    mockChange.mockRejectedValue(axiosError(429, {}));
+    mockChangePassword.mockRejectedValue(axiosError(429, {}));
 
     await render(<ChangePasswordScreen />);
     await fillForm('old-secret', 'new-secret-1', 'new-secret-1');
@@ -130,8 +118,8 @@ describe('ChangePasswordScreen', () => {
     // the promise the async onPress returns, so awaiting a request that never
     // resolves would hang the test instead of observing the in-flight state.
     let release: () => void = () => undefined;
-    mockChange.mockImplementation(
-      () => new Promise((resolve) => { release = () => resolve(payload as never); }),
+    mockChangePassword.mockImplementation(
+      () => new Promise((resolve) => { release = () => resolve('rotated'); }),
     );
 
     await render(<ChangePasswordScreen />);
@@ -140,7 +128,9 @@ describe('ChangePasswordScreen', () => {
 
     await waitFor(() => expect(mockStackScreen).toHaveBeenCalledWith(expect.objectContaining({ gestureEnabled: false })));
 
-    release();
-    await pressed;
+    await act(async () => {
+      release();
+      await pressed;
+    });
   });
 });

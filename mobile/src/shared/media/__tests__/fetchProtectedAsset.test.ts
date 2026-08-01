@@ -1,5 +1,13 @@
 import { refreshTokens } from '@/shared/api/refresh';
-import { getAccessToken, setAccessToken } from '@/shared/api/token-store';
+import {
+  __resetAuthSessionLifecycleForTests,
+  activateAuthSession,
+  beginAuthSessionOpening,
+  publishAuthPair,
+  requestAuthSessionClose,
+  type AuthTicket,
+} from '@/shared/api/authSessionLifecycle';
+import { getAccessToken } from '@/shared/api/token-store';
 import {
   assertSameOriginApiPath,
   fetchProtectedResponse,
@@ -29,6 +37,18 @@ jest.mock('@/shared/api/refresh', () => ({
 const mockRefreshTokens = refreshTokens as jest.MockedFunction<typeof refreshTokens>;
 
 const PATH = '/trips/trip-1/photos/photo-1/thumbnail';
+let authTicket: AuthTicket;
+
+function publishAccess(access: string): void {
+  expect(
+    publishAuthPair(authTicket, { access, refresh: `refresh-for-${access}` }),
+  ).toBe(true);
+}
+
+async function startOpeningWithoutAccess(): Promise<void> {
+  __resetAuthSessionLifecycleForTests();
+  authTicket = await beginAuthSessionOpening();
+}
 
 /** Runs a request that is expected to fail and returns the typed error. */
 async function expectProtectedFailure(pending: Promise<Response>): Promise<ProtectedAssetError> {
@@ -45,13 +65,16 @@ async function expectProtectedFailure(pending: Promise<Response>): Promise<Prote
 
 beforeEach(async () => {
   jest.clearAllMocks();
+  __resetAuthSessionLifecycleForTests();
   __resetPrivateMediaLifecycleForTests();
-  setAccessToken('token-old');
+  authTicket = await beginAuthSessionOpening();
+  publishAccess('token-old');
+  activateAuthSession(authTicket);
   await startPrivateMediaSession();
 });
 
 afterEach(() => {
-  setAccessToken(null);
+  __resetAuthSessionLifecycleForTests();
 });
 
 describe('assertSameOriginApiPath', () => {
@@ -84,7 +107,7 @@ describe('fetchProtectedResponse request shape', () => {
   it('reads the access token immediately before the request', async () => {
     const transport = createFakeTransport(() => imageResponse([bytes(4)]).response);
 
-    setAccessToken('token-rotated');
+    publishAccess('token-rotated');
     await fetchProtectedResponse({ path: PATH, transport });
 
     expect(transport.fetches.authorizations()).toEqual(['Bearer token-rotated']);
@@ -119,7 +142,7 @@ describe('fetchProtectedResponse request shape', () => {
   );
 
   it('never puts the token in the url', async () => {
-    setAccessToken('super-secret-token');
+    publishAccess('super-secret-token');
     const transport = createFakeTransport(() => imageResponse([bytes(4)]).response);
 
     await fetchProtectedResponse({ path: PATH, transport });
@@ -128,9 +151,9 @@ describe('fetchProtectedResponse request shape', () => {
   });
 
   it('refreshes once when there is no access token at all', async () => {
-    setAccessToken(null);
+    await startOpeningWithoutAccess();
     mockRefreshTokens.mockImplementation(async () => {
-      setAccessToken('token-restored');
+      publishAccess('token-restored');
       return 'token-restored';
     });
     const transport = createFakeTransport(() => imageResponse([bytes(4)]).response);
@@ -142,7 +165,7 @@ describe('fetchProtectedResponse request shape', () => {
   });
 
   it('fails with an auth error when no token can be restored', async () => {
-    setAccessToken(null);
+    await startOpeningWithoutAccess();
     mockRefreshTokens.mockResolvedValue(null);
     const transport = createFakeTransport(() => imageResponse([bytes(4)]).response);
 
@@ -156,7 +179,7 @@ describe('fetchProtectedResponse request shape', () => {
 describe('401 handling', () => {
   it('refreshes once and retries with the new token', async () => {
     mockRefreshTokens.mockImplementation(async () => {
-      setAccessToken('token-new');
+      publishAccess('token-new');
       return 'token-new';
     });
     const transport = createFakeTransport((_call, index) =>
@@ -175,7 +198,7 @@ describe('401 handling', () => {
       if (index === 0) {
         // The 401 resolves late: by the time it is observed, some other request
         // has already completed a refresh.
-        setAccessToken('token-new');
+        publishAccess('token-new');
         return jsonErrorResponse(401, { detail: 'nope' }).response;
       }
       return imageResponse([bytes(4)]).response;
@@ -187,17 +210,17 @@ describe('401 handling', () => {
     expect(transport.fetches.authorizations()).toEqual(['Bearer token-old', 'Bearer token-new']);
   });
 
-  it('does not refresh or send Bearer null after sign-out cleared the token', async () => {
+  it('cancels without refresh or Bearer null after auth close invalidates its ticket', async () => {
     const transport = createFakeTransport((_call, index) => {
       if (index === 0) {
-        setAccessToken(null);
+        void requestAuthSessionClose('user');
         return jsonErrorResponse(401, { detail: 'nope' }).response;
       }
       return imageResponse([bytes(4)]).response;
     });
 
     await expect(fetchProtectedResponse({ path: PATH, transport })).rejects.toMatchObject({
-      kind: 'auth',
+      kind: 'cancelled',
     });
     expect(mockRefreshTokens).not.toHaveBeenCalled();
     expect(transport.fetches.calls).toHaveLength(1);
@@ -205,7 +228,7 @@ describe('401 handling', () => {
 
   it('retries at most once', async () => {
     mockRefreshTokens.mockImplementation(async () => {
-      setAccessToken('token-new');
+      publishAccess('token-new');
       return 'token-new';
     });
     const transport = createFakeTransport(() => jsonErrorResponse(401, { detail: 'nope' }).response);
@@ -230,7 +253,7 @@ describe('401 handling', () => {
 
   it('cancels the 401 body before retrying so no native stream is left open', async () => {
     mockRefreshTokens.mockImplementation(async () => {
-      setAccessToken('token-new');
+      publishAccess('token-new');
       return 'token-new';
     });
     const unauthorized = createFakeResponse({
@@ -263,7 +286,7 @@ describe('60 concurrent tiles racing one expiry', () => {
         refreshInFlight = (async () => {
           refreshHttpCalls += 1;
           await refreshGate.promise;
-          setAccessToken('token-new');
+          publishAccess('token-new');
           return 'token-new';
         })().finally(() => {
           refreshInFlight = null;
@@ -312,7 +335,7 @@ describe('60 concurrent tiles racing one expiry', () => {
   });
 
   it('keeps the token out of thrown errors', async () => {
-    setAccessToken('token-that-must-not-leak');
+    publishAccess('token-that-must-not-leak');
     mockRefreshTokens.mockResolvedValue(null);
     const transport = createFakeTransport(() => jsonErrorResponse(401, { detail: 'expired' }).response);
 

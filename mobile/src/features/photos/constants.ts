@@ -30,8 +30,8 @@ export const PHOTO_GRID_GAP = spacing.xxs;
 export const PHOTO_GRID_TARGET_TILE_WIDTH = 110;
 export const PHOTO_GRID_MIN_COLUMNS = 3;
 
-/** Server cap on a bulk-download request, enforced before the request goes out. */
-export const PHOTO_BULK_DOWNLOAD_MAX_SELECTION = 100;
+/** UX/throttle guard for one sequential Save to Photos action. */
+export const PHOTO_SAVE_SELECTION_MAX = 100;
 
 /**
  * Upload batching must satisfy all three ceilings, not two.
@@ -62,6 +62,6 @@ export const TRIP_PHOTO_PREPROCESS_TARGET = {
 
 /**
  * Free-disk floor kept for the OS and the rest of the app while a temp file or a
- * ZIP is being written (D21).
+ * photo is being staged (D21).
  */
 export const PRIVATE_MEDIA_DISK_RESERVE_BYTES = 256 * 1024 * 1024;

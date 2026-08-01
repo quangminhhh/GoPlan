@@ -25,7 +25,6 @@
     "expo-media-library": "57.0.1",
     "expo-router": "~57.0.3",
     "expo-secure-store": "~57.0.0",
-    "expo-sharing": "~57.0.8",
     "expo-splash-screen": "~57.0.2",
     "expo-status-bar": "~57.0.0",
     "expo-symbols": "~57.0.0",
@@ -55,7 +54,10 @@
     "typescript": "~6.0.3"
   },
   "scripts": {
-    "start": "expo start",
+    "start": "NODE_OPTIONS=--dns-result-order=ipv4first expo start --dev-client --localhost --ios",
+    "start:clear": "NODE_OPTIONS=--dns-result-order=ipv4first expo start --dev-client --localhost --ios --clear",
+    "prebuild:ios": "expo prebuild --platform ios --clean",
+    "rebuild:sim": "expo run:ios --device \"iPhone 17 Pro Max\" --configuration Debug",
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",

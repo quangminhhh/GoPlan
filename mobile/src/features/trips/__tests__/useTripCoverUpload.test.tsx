@@ -3,6 +3,11 @@ jest.mock('@/shared/media/preprocessImage', () => ({ preprocessImage: jest.fn() 
 jest.mock('@/shared/media/imageCodec', () => ({
   nativeImageCodec: { encode: jest.fn(), discard: jest.fn(async () => undefined) },
 }));
+const mockDiscardPickerSource = jest.fn(async (_uri: string) => undefined);
+jest.mock('@/shared/media/pickerSourceStore', () => ({
+  claimAppOwnedPickerSourceUri: jest.fn((uri: string) => uri),
+  discardAppOwnedPickerSource: (uri: string) => mockDiscardPickerSource(uri),
+}));
 jest.mock('../api', () => ({ uploadTripCover: jest.fn() }));
 
 // eslint-disable-next-line import/first
@@ -13,6 +18,8 @@ import { axiosError } from '@test/axiosError';
 import { nativeImageCodec } from '@/shared/media/imageCodec';
 // eslint-disable-next-line import/first
 import { pickImage } from '@/shared/media/pickImage';
+// eslint-disable-next-line import/first
+import { claimAppOwnedPickerSourceUri } from '@/shared/media/pickerSourceStore';
 // eslint-disable-next-line import/first
 import { preprocessImage } from '@/shared/media/preprocessImage';
 // eslint-disable-next-line import/first
@@ -27,6 +34,8 @@ const mockPreprocess = preprocessImage as jest.MockedFunction<typeof preprocessI
 const mockUpload = uploadTripCover as jest.MockedFunction<typeof uploadTripCover>;
 
 const picked = { uri: 'file:///cover.heic', width: 4032, height: 3024, fileName: 'IMG_9.HEIC' };
+const ownedSourceUri = claimAppOwnedPickerSourceUri(picked.uri);
+if (!ownedSourceUri) throw new Error('Expected an owned picker test URI.');
 const processed = {
   uri: 'file:///cover.jpg',
   name: 'IMG_9.jpg',
@@ -38,7 +47,7 @@ const processed = {
 const UPLOADED_URL = '/media/trip-covers/8f0e.webp';
 
 function pickAndUploadSucceed(): void {
-  mockPick.mockResolvedValue({ status: 'picked', image: picked });
+  mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
   mockPreprocess.mockResolvedValue(processed);
   mockUpload.mockResolvedValue(UPLOADED_URL);
 }
@@ -49,6 +58,7 @@ describe('useTripCoverUpload', () => {
     // clearAllMocks keeps implementations, so restore the default rather than
     // letting one test's rejecting discard leak into the next.
     (nativeImageCodec.discard as jest.Mock).mockResolvedValue(undefined);
+    mockDiscardPickerSource.mockResolvedValue(undefined);
   });
 
   it('starts from the trip cover it was given', async () => {
@@ -92,7 +102,7 @@ describe('useTripCoverUpload', () => {
   });
 
   it('reports a preprocess failure in our own words without contacting the server', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockRejectedValue(new ImagePreprocessError('BUDGET_UNREACHABLE', 'internal'));
 
     const { result } = await renderHook(() => useTripCoverUpload('/media/trip-covers/a.webp'));
@@ -108,7 +118,7 @@ describe('useTripCoverUpload', () => {
     ['NO_FILE', 'No file was uploaded.'],
     ['UNSUPPORTED_IMAGE_FORMAT', 'Unsupported image format.'],
   ])('surfaces the server message for %s exactly as returned', async (errorCode, detail) => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockRejectedValue(axiosError(400, { detail, error_code: errorCode }));
 
@@ -121,7 +131,7 @@ describe('useTripCoverUpload', () => {
   });
 
   it('surfaces an exhausted media_upload budget as the throttle message', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockRejectedValue(axiosError(429, {}));
 
@@ -132,7 +142,7 @@ describe('useTripCoverUpload', () => {
   });
 
   it('clears the previous error when a retry succeeds', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockRejectedValueOnce(axiosError(429, {})).mockResolvedValueOnce(UPLOADED_URL);
 
@@ -171,25 +181,27 @@ describe('useTripCoverUpload', () => {
     expect(result.current.error).toBeNull();
   });
 
-  it('discards both temp files once the upload is done', async () => {
+  it('discards the capability-owned source and encoded temp once upload is done', async () => {
     pickAndUploadSucceed();
 
     const { result } = await renderHook(() => useTripCoverUpload());
     await act(async () => { await result.current.chooseCover(); });
 
-    expect(nativeImageCodec.discard).toHaveBeenCalledWith(picked.uri);
+    expect(mockDiscardPickerSource).toHaveBeenCalledWith(ownedSourceUri);
+    expect(nativeImageCodec.discard).not.toHaveBeenCalledWith(picked.uri);
     expect(nativeImageCodec.discard).toHaveBeenCalledWith(processed.uri);
   });
 
   it('discards the picked source on the failure path too', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockRejectedValue(axiosError(400, { detail: 'Unsupported image format.' }));
 
     const { result } = await renderHook(() => useTripCoverUpload());
     await act(async () => { await result.current.chooseCover(); });
 
-    expect(nativeImageCodec.discard).toHaveBeenCalledWith(picked.uri);
+    expect(mockDiscardPickerSource).toHaveBeenCalledWith(ownedSourceUri);
+    expect(nativeImageCodec.discard).not.toHaveBeenCalledWith(picked.uri);
     expect(nativeImageCodec.discard).toHaveBeenCalledWith(processed.uri);
     expect(result.current.error).not.toBeNull();
   });
@@ -206,7 +218,7 @@ describe('useTripCoverUpload', () => {
   });
 
   it('dismissError clears a previous failure', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockRejectedValue(new ImagePreprocessError('UNREADABLE', 'internal'));
 
     const { result } = await renderHook(() => useTripCoverUpload());

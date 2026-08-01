@@ -75,6 +75,22 @@ describe('token store', () => {
     await expect(getRefreshToken()).resolves.toBeNull();
   });
 
+  it('releases the write queue so a failed deletion can be retried', async () => {
+    setAccessToken('access-1');
+    await setRefreshToken('refresh-1');
+    (SecureStore.deleteItemAsync as jest.Mock).mockRejectedValueOnce(
+      new Error('keychain unavailable'),
+    );
+
+    await expect(clearTokens()).rejects.toThrow('keychain unavailable');
+    expect(getAccessToken()).toBeNull();
+    await expect(getRefreshToken()).resolves.toBe('refresh-1');
+
+    await clearTokens();
+    expect(SecureStore.deleteItemAsync).toHaveBeenCalledTimes(2);
+    await expect(getRefreshToken()).resolves.toBeNull();
+  });
+
   describe('overlapping writes', () => {
     it('commits in call order even when the earlier write is the slower one', async () => {
       const commitFirst = holdNextWrite();

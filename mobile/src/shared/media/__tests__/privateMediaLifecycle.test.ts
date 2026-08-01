@@ -22,17 +22,21 @@ const purgeLog: string[] = [];
 let protectedPurge: () => Promise<void> = async () => {
   purgeLog.push('protected-assets');
 };
+let uploadPurge: () => Promise<void> = async () => {
+  purgeLog.push('upload-temp');
+};
 
 registerPrivateMediaPurger('protected-assets', () => protectedPurge());
-registerPrivateMediaPurger('upload-temp', async () => {
-  purgeLog.push('upload-temp');
-});
+registerPrivateMediaPurger('upload-temp', () => uploadPurge());
 
 beforeEach(() => {
   __resetPrivateMediaLifecycleForTests();
   purgeLog.length = 0;
   protectedPurge = async () => {
     purgeLog.push('protected-assets');
+  };
+  uploadPurge = async () => {
+    purgeLog.push('upload-temp');
   };
 });
 
@@ -219,21 +223,57 @@ describe('transfer leases', () => {
     expect(purgeLog).toEqual(['protected-assets', 'upload-temp']);
   });
 
-  it('lets sign-out override an active lease', async () => {
+  it('purges protected cache immediately on sign-out but fences upload temp until its request settles', async () => {
     await startPrivateMediaSession();
     purgeLog.length = 0;
+    const request = createDeferred<void>();
+    const appOwnedUploadTemps = new Set(['file:///goplan-photo-upload/request-body.jpg']);
+    let uploadPurgeRanUnderLease = false;
+    uploadPurge = async () => {
+      uploadPurgeRanUnderLease = getPrivateTransferLeaseCount() > 0;
+      purgeLog.push('upload-temp');
+      appOwnedUploadTemps.clear();
+    };
+
     const release = acquirePrivateTransferLease();
+    const operation = trackPrivateOperation(async (signal) => {
+      expect(signal.aborted).toBe(false);
+      try {
+        // Model a native/Axios request that observes abort but cannot release its
+        // file synchronously. Its promise owns the request-body lease until the
+        // underlying transport settles.
+        await request.promise;
+      } finally {
+        expect(appOwnedUploadTemps.size).toBe(1);
+        release();
+      }
+    });
 
     beginPrivateMediaShutdown();
-    await flushPrivateMediaPurge();
+    await flushMicrotasks();
 
     expect(getPrivateMediaEpoch()).toBe(1);
+    expect(purgeLog).toEqual(['protected-assets']);
+    expect(appOwnedUploadTemps.size).toBe(1);
+    expect(getPrivateTransferLeaseCount()).toBe(1);
+
+    let purgeFinished = false;
+    const purging = flushPrivateMediaPurge().then(() => {
+      purgeFinished = true;
+    });
+    await flushMicrotasks();
+    expect(purgeFinished).toBe(false);
+
+    request.resolve();
+    await operation;
+    await purging;
+
+    expect(uploadPurgeRanUnderLease).toBe(false);
     expect(purgeLog).toEqual(['protected-assets', 'upload-temp']);
-
-    // Releasing afterwards must not run a second front half.
-    release();
-    await flushPrivateMediaPurge();
+    expect(appOwnedUploadTemps.size).toBe(0);
+    expect(getPrivateTransferLeaseCount()).toBe(0);
     expect(getPrivateMediaEpoch()).toBe(1);
+    await expect(waitForPrivateNetworkIdle()).resolves.toBeUndefined();
   });
 
   it('refuses a new lease once the gate is closed', async () => {

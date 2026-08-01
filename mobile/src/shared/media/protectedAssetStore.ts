@@ -26,6 +26,7 @@ import {
 import { fetchProtectedResponse } from './fetchProtectedAsset';
 import {
   ProtectedAssetError,
+  type AcquireProtectedAssetOptions,
   type ProtectedAssetVariant,
   type ProtectedCacheBucket,
   type ProtectedFileSink,
@@ -33,6 +34,8 @@ import {
   type ProtectedTransport,
 } from './protectedAssetTypes';
 import { createOpaqueFileName, nativeProtectedFileStore, nativeProtectedTransport } from './protectedTransport';
+
+export type { AcquireProtectedAssetOptions } from './protectedAssetTypes';
 
 /** Roughly twelve screens of a three-column grid. */
 export const THUMBNAIL_CACHE_MAX_ENTRIES = 240;
@@ -56,6 +59,7 @@ const EXTENSION_BY_CONTENT_TYPE: Record<string, string> = {
 
 interface CacheEntry {
   assetKey: string;
+  invalidationPrefix: string;
   uri: string;
   bytes: number;
   bucket: ProtectedCacheBucket;
@@ -68,6 +72,7 @@ interface CacheEntry {
 interface InFlightLoad {
   promise: Promise<CacheEntry>;
   controller: AbortController;
+  invalidationPrefix: string;
   waiters: number;
   settled: boolean;
 }
@@ -83,6 +88,12 @@ const inFlight = new Map<string, InFlightLoad>();
  * ABA window where an old `0` becomes current `0` again in a later session.
  */
 const assetVersions = new Map<string, number>();
+/**
+ * Trip-wide invalidation is a separate monotonic fence. It must move even when
+ * no matching key has reached either registry yet, otherwise a stage that was
+ * already between awaits could commit after a seemingly empty invalidation.
+ */
+const prefixVersions = new Map<string, number>();
 /**
  * Seeded with the production store so the very first `purgeAll()` of a process
  * finds files a previous process left behind, before anything has been staged.
@@ -104,19 +115,18 @@ function invalidateAssetVersion(assetKey: string): void {
   assetVersions.set(assetKey, assetVersion(assetKey) + 1);
 }
 
+function prefixVersion(prefix: string): number {
+  return prefixVersions.get(prefix) ?? 0;
+}
+
+function invalidatePrefixVersion(prefix: string): void {
+  prefixVersions.set(prefix, prefixVersion(prefix) + 1);
+}
+
 export interface AcquiredProtectedAsset {
   /** Local `file://` URI. Safe to hand to `expo-image`. */
   uri: string;
   release(): void;
-}
-
-export interface AcquireProtectedAssetOptions {
-  /** Logical identity, e.g. `trip-photo:<tripId>:<photoId>:thumbnail`. */
-  assetKey: string;
-  path: string;
-  variant: ProtectedAssetVariant;
-  signal?: AbortSignal;
-  transport?: ProtectedTransport;
 }
 
 function extensionForContentType(contentType: string): string {
@@ -177,12 +187,14 @@ async function evictBucket(bucket: ProtectedCacheBucket, justCommittedKey?: stri
 
 interface StageOptions {
   assetKey: string;
+  invalidationPrefix: string;
   path: string;
   variant: ProtectedAssetVariant;
   transport: ProtectedTransport;
   signal: AbortSignal;
   epochAtStart: number;
   assetVersionAtStart: number;
+  prefixVersionAtStart: number;
 }
 
 function readStreamChunk(
@@ -207,12 +219,14 @@ function readStreamChunk(
 async function stageAsset(options: StageOptions): Promise<CacheEntry> {
   const {
     assetKey,
+    invalidationPrefix,
     path,
     variant,
     transport,
     signal,
     epochAtStart,
     assetVersionAtStart,
+    prefixVersionAtStart,
   } = options;
 
   const response = await fetchProtectedResponse({ path, signal, transport });
@@ -226,6 +240,7 @@ async function stageAsset(options: StageOptions): Promise<CacheEntry> {
       signal.aborted ||
       getPrivateMediaEpoch() !== epochAtStart ||
       assetVersion(assetKey) !== assetVersionAtStart ||
+      prefixVersion(invalidationPrefix) !== prefixVersionAtStart ||
       !isPrivateMediaSessionOpen()
     ) {
       throw createSessionClosedError();
@@ -330,6 +345,7 @@ async function stageAsset(options: StageOptions): Promise<CacheEntry> {
 
   const entry: CacheEntry = {
     assetKey,
+    invalidationPrefix,
     uri: sink.uri,
     bytes: received,
     bucket: variant.bucket,
@@ -360,12 +376,17 @@ async function stageAsset(options: StageOptions): Promise<CacheEntry> {
 }
 
 function startLoad(
-  options: Omit<StageOptions, 'signal' | 'epochAtStart' | 'assetVersionAtStart'>,
+  options: Omit<
+    StageOptions,
+    'signal' | 'epochAtStart' | 'assetVersionAtStart' | 'prefixVersionAtStart'
+  >,
 ): InFlightLoad {
   const controller = new AbortController();
   const versionAtStart = assetVersion(options.assetKey);
+  const prefixAtStart = prefixVersion(options.invalidationPrefix);
   const load: InFlightLoad = {
     controller,
+    invalidationPrefix: options.invalidationPrefix,
     waiters: 0,
     settled: false,
     promise: undefined as unknown as Promise<CacheEntry>,
@@ -380,6 +401,7 @@ function startLoad(
         signal: linked.signal,
         epochAtStart,
         assetVersionAtStart: versionAtStart,
+        prefixVersionAtStart: prefixAtStart,
       });
     } finally {
       linked.dispose();
@@ -399,15 +421,18 @@ function startLoad(
 
 function assertAcquireStillCurrent(
   assetKey: string,
+  invalidationPrefix: string,
   requestEpoch: number,
   requestAssetVersion: number,
+  requestPrefixVersion: number,
   signal?: AbortSignal,
 ): void {
   if (
     signal?.aborted ||
     !isPrivateMediaSessionOpen() ||
     getPrivateMediaEpoch() !== requestEpoch ||
-    assetVersion(assetKey) !== requestAssetVersion
+    assetVersion(assetKey) !== requestAssetVersion ||
+    prefixVersion(invalidationPrefix) !== requestPrefixVersion
   ) {
     throw createSessionClosedError();
   }
@@ -446,7 +471,14 @@ function pin(entry: CacheEntry, alreadyReserved = false): AcquiredProtectedAsset
 export async function acquireProtectedAsset(
   options: AcquireProtectedAssetOptions,
 ): Promise<AcquiredProtectedAsset> {
-  const { assetKey, path, variant, signal, transport = nativeProtectedTransport } = options;
+  const {
+    assetKey,
+    invalidationPrefix,
+    path,
+    variant,
+    signal,
+    transport = nativeProtectedTransport,
+  } = options;
 
   // Check before the cache lookup. A shutdown closes the gate synchronously but
   // purges files asynchronously; without this guard, a cache hit in that small
@@ -457,12 +489,23 @@ export async function acquireProtectedAsset(
 
   const requestEpoch = getPrivateMediaEpoch();
   const requestAssetVersion = assetVersion(assetKey);
+  const requestPrefixVersion = prefixVersion(invalidationPrefix);
   for (;;) {
-    assertAcquireStillCurrent(assetKey, requestEpoch, requestAssetVersion, signal);
+    assertAcquireStillCurrent(
+      assetKey,
+      invalidationPrefix,
+      requestEpoch,
+      requestAssetVersion,
+      requestPrefixVersion,
+      signal,
+    );
 
     const cached = entries.get(assetKey);
     if (!cached) {
       break;
+    }
+    if (cached.invalidationPrefix !== invalidationPrefix) {
+      throw createSessionClosedError();
     }
 
     // The cache directory is reclaimable, so a registry hit is a hypothesis
@@ -481,7 +524,14 @@ export async function acquireProtectedAsset(
     try {
       // A false result is just as asynchronous as a true one. Check the session
       // and per-key boundaries before it can fall through into a fresh fetch.
-      assertAcquireStillCurrent(assetKey, requestEpoch, requestAssetVersion, signal);
+      assertAcquireStillCurrent(
+        assetKey,
+        invalidationPrefix,
+        requestEpoch,
+        requestAssetVersion,
+        requestPrefixVersion,
+        signal,
+      );
     } catch (error) {
       cached.refCount = Math.max(0, cached.refCount - 1);
       throw error;
@@ -505,10 +555,20 @@ export async function acquireProtectedAsset(
     // network load. A concurrent waiter may also have installed a replacement.
   }
 
-  assertAcquireStillCurrent(assetKey, requestEpoch, requestAssetVersion, signal);
+  assertAcquireStillCurrent(
+    assetKey,
+    invalidationPrefix,
+    requestEpoch,
+    requestAssetVersion,
+    requestPrefixVersion,
+    signal,
+  );
   let load = inFlight.get(assetKey);
+  if (load && load.invalidationPrefix !== invalidationPrefix) {
+    throw createSessionClosedError();
+  }
   if (!load) {
-    load = startLoad({ assetKey, path, variant, transport });
+    load = startLoad({ assetKey, invalidationPrefix, path, variant, transport });
     inFlight.set(assetKey, load);
   }
 
@@ -525,7 +585,14 @@ export async function acquireProtectedAsset(
 
   try {
     const entry = await Promise.race([load.promise, cancellation]);
-    assertAcquireStillCurrent(assetKey, requestEpoch, requestAssetVersion, signal);
+    assertAcquireStillCurrent(
+      assetKey,
+      invalidationPrefix,
+      requestEpoch,
+      requestAssetVersion,
+      requestPrefixVersion,
+      signal,
+    );
     if (entries.get(assetKey) !== entry) {
       throw createSessionClosedError();
     }
@@ -541,11 +608,6 @@ export async function acquireProtectedAsset(
   }
 }
 
-async function dropEntry(entry: CacheEntry): Promise<void> {
-  entries.delete(entry.assetKey);
-  await entry.store.discard(entry.uri);
-}
-
 /**
  * Forgets one asset completely: aborts a load in progress, drops the registry
  * entry and deletes the file.
@@ -557,47 +619,60 @@ async function dropEntry(entry: CacheEntry): Promise<void> {
 export async function invalidateProtectedAsset(assetKey: string): Promise<void> {
   invalidateAssetVersion(assetKey);
   const load = inFlight.get(assetKey);
-  if (load) {
+  if (load && inFlight.get(assetKey) === load) {
     inFlight.delete(assetKey);
-    load.controller.abort();
   }
   const entry = entries.get(assetKey);
+  if (entry && entries.get(assetKey) === entry) {
+    entries.delete(assetKey);
+  }
+
+  load?.controller.abort();
   if (entry) {
-    await dropEntry(entry);
+    await entry.store.discard(entry.uri);
   }
 }
 
 /**
- * Invalidates every asset whose key starts with `prefix` — the trip-level form
- * used when membership is lost (`TRIP_NOT_FOUND`).
+ * Invalidates every asset registered under the feature-supplied canonical
+ * `prefix` — the trip-level form used when membership is lost.
  */
 export async function invalidateProtectedAssets(prefix: string): Promise<void> {
-  const matchingKeys = new Set<string>();
-  for (const assetKey of inFlight.keys()) {
-    if (assetKey.startsWith(prefix)) {
-      matchingKeys.add(assetKey);
+  // This entire front half is synchronous. A later acquire therefore sees the
+  // new prefix generation and neither registry can expose an old object while
+  // its filesystem cleanup is awaiting native I/O.
+  invalidatePrefixVersion(prefix);
+
+  const detachedLoads = Array.from(inFlight.entries()).filter(
+    ([, load]) => load.invalidationPrefix === prefix,
+  );
+  const detachedEntries = Array.from(entries.entries()).filter(
+    ([, entry]) => entry.invalidationPrefix === prefix,
+  );
+
+  const detachedKeys = new Set<string>();
+  for (const [assetKey, load] of detachedLoads) {
+    if (inFlight.get(assetKey) === load) {
+      inFlight.delete(assetKey);
+      detachedKeys.add(assetKey);
     }
   }
-  for (const assetKey of entries.keys()) {
-    if (assetKey.startsWith(prefix)) {
-      matchingKeys.add(assetKey);
+  for (const [assetKey, entry] of detachedEntries) {
+    if (entries.get(assetKey) === entry) {
+      entries.delete(assetKey);
+      detachedKeys.add(assetKey);
     }
   }
-  for (const assetKey of matchingKeys) {
+  for (const assetKey of detachedKeys) {
     invalidateAssetVersion(assetKey);
   }
+  for (const [, load] of detachedLoads) {
+    load.controller.abort();
+  }
 
-  for (const [assetKey, load] of Array.from(inFlight.entries())) {
-    if (matchingKeys.has(assetKey)) {
-      inFlight.delete(assetKey);
-      load.controller.abort();
-    }
-  }
-  for (const entry of Array.from(entries.values())) {
-    if (matchingKeys.has(entry.assetKey)) {
-      await dropEntry(entry);
-    }
-  }
+  await Promise.allSettled(
+    detachedEntries.map(([, entry]) => entry.store.discard(entry.uri)),
+  );
 }
 
 /**
@@ -619,6 +694,7 @@ export function __resetProtectedAssetStoreForTests(): void {
   entries.clear();
   inFlight.clear();
   assetVersions.clear();
+  prefixVersions.clear();
   knownStores.clear();
   knownStores.add(nativeProtectedFileStore);
   clock = 0;
@@ -627,13 +703,22 @@ export function __resetProtectedAssetStoreForTests(): void {
 /** Test-only view of the registry. */
 export function __getProtectedAssetEntriesForTests(): {
   assetKey: string;
+  invalidationPrefix: string;
   uri: string;
   bytes: number;
   bucket: ProtectedCacheBucket;
   refCount: number;
 }[] {
-  return Array.from(entries.values()).map(({ assetKey, uri, bytes, bucket, refCount }) => ({
+  return Array.from(entries.values()).map(({
     assetKey,
+    invalidationPrefix,
+    uri,
+    bytes,
+    bucket,
+    refCount,
+  }) => ({
+    assetKey,
+    invalidationPrefix,
     uri,
     bytes,
     bucket,

@@ -2,7 +2,7 @@
  * Trip photo API.
  *
  * JSON and multipart go through the shared Axios client so they keep the 401
- * interceptor; asset bytes and the bulk ZIP go through `fetchProtectedResponse`,
+ * interceptor; asset bytes go through `fetchProtectedResponse`,
  * which is the only path that can tell a 401 from a 404 (D1).
  *
  * Every call here is registered as private-network activity for its whole
@@ -35,10 +35,6 @@ export function tripPhotoAssetPath(
   variant: TripPhotoAssetVariantName,
 ): string {
   return `${tripPhotoDetailPath(tripId, photoId)}/${variant}`;
-}
-
-export function tripPhotoBulkDownloadPath(tripId: string): string {
-  return `${tripPhotosPath(tripId)}/download`;
 }
 
 /** Logical cache identity. Also the prefix used to invalidate a whole trip. */
@@ -122,9 +118,4 @@ export function uploadTripPhotoBatch(
     });
     return data.photos;
   });
-}
-
-/** Body for the bulk ZIP endpoint. Order is the user's selection order. */
-export function buildBulkDownloadBody(photoIds: string[]): string {
-  return JSON.stringify({ photo_ids: photoIds });
 }

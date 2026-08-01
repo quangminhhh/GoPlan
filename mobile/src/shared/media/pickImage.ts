@@ -1,5 +1,6 @@
 import * as ImagePicker from 'expo-image-picker';
-import type { PickedImage, PickImageOutcome, PickImagesOutcome } from './types';
+import { claimAppOwnedPickerSourceUri } from './pickerSourceStore';
+import type { PickImageOutcome, PickImagesOutcome } from './types';
 
 export interface PickImageOptions {
   /**
@@ -33,6 +34,7 @@ export async function pickImage({ square = false }: PickImageOptions = {}): Prom
 
   return {
     status: 'picked',
+    ownedSourceUri: claimAppOwnedPickerSourceUri(asset.uri),
     image: {
       uri: asset.uri,
       width: asset.width,
@@ -64,8 +66,8 @@ export function hasUsableDimensions(asset: { width: number; height: number }): b
  * cover flows depend on the single-select behaviour, and iOS cannot combine
  * multi-select with the system editor anyway.
  *
- * Assets whose reported dimensions are unusable come back in `unreadable` so the
- * caller can reject exactly those files and still upload the rest.
+ * Every asset comes back as one ordered entry, including unreadable assets, so
+ * cleanup authority cannot be lost when dimensions are unusable.
  */
 export async function pickImages(): Promise<PickImagesOutcome> {
   const result = await ImagePicker.launchImageLibraryAsync({
@@ -93,25 +95,32 @@ export async function pickImages(): Promise<PickImagesOutcome> {
     return { status: 'cancelled' };
   }
 
-  const images: PickedImage[] = [];
-  const unreadable: { index: number; fileName: string | null }[] = [];
-
-  result.assets.forEach((asset, index) => {
+  const entries = result.assets.map((asset, index) => {
+    const ownedSourceUri = claimAppOwnedPickerSourceUri(asset.uri);
     if (!hasUsableDimensions(asset)) {
-      unreadable.push({ index, fileName: asset.fileName ?? null });
-      return;
+      return {
+        index,
+        status: 'unreadable' as const,
+        fileName: asset.fileName ?? null,
+        ownedSourceUri,
+      };
     }
-    images.push({
-      uri: asset.uri,
-      width: asset.width,
-      height: asset.height,
-      fileName: asset.fileName ?? null,
-    });
+    return {
+      index,
+      status: 'readable' as const,
+      image: {
+        uri: asset.uri,
+        width: asset.width,
+        height: asset.height,
+        fileName: asset.fileName ?? null,
+      },
+      ownedSourceUri,
+    };
   });
 
-  if (images.length === 0 && unreadable.length === 0) {
+  if (entries.length === 0) {
     return { status: 'cancelled' };
   }
 
-  return { status: 'picked', images, unreadable };
+  return { status: 'picked', entries };
 }

@@ -49,6 +49,7 @@ type LoadState =
 
 export interface AuthenticatedImageProps {
   assetKey: string;
+  invalidationPrefix: string;
   path: string;
   variant: ProtectedAssetVariant;
   width: number;
@@ -67,6 +68,7 @@ export interface AuthenticatedImageProps {
 
 export function AuthenticatedImage({
   assetKey,
+  invalidationPrefix,
   path,
   variant,
   width,
@@ -114,7 +116,14 @@ export function AuthenticatedImage({
     const controller = new AbortController();
     let acquired: { release(): void } | null = null;
 
-    acquireProtectedAsset({ assetKey, path, variant, signal: controller.signal, transport })
+    acquireProtectedAsset({
+      assetKey,
+      invalidationPrefix,
+      path,
+      variant,
+      signal: controller.signal,
+      transport,
+    })
       .then((asset) => {
         if (!active) {
           asset.release();
@@ -146,7 +155,7 @@ export function AuthenticatedImage({
       controller.abort();
       acquired?.release();
     };
-  }, [assetKey, path, variant, transport, attempt]);
+  }, [assetKey, invalidationPrefix, path, variant, transport, attempt]);
 
   // A purge clears the local URI immediately; the reacquire only happens once
   // the gate is open again, which for a background purge means after foreground.

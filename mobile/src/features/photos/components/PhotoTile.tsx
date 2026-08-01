@@ -4,7 +4,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { AuthenticatedImage } from '@/shared/media/AuthenticatedImage';
 import type { ProtectedAssetError } from '@/shared/media/protectedAssetTypes';
 import { colors, radii, spacing } from '@/shared/theme/tokens';
-import { tripPhotoAssetKey, tripPhotoAssetPath } from '../api';
+import { tripPhotoAssetKey, tripPhotoAssetKeyPrefix, tripPhotoAssetPath } from '../api';
 import { TRIP_PHOTO_VARIANTS } from '../constants';
 import { toPhotoFailure, type PhotoFailure } from '../errors';
 
@@ -66,6 +66,7 @@ function PhotoTileComponent({
     >
       <AuthenticatedImage
         assetKey={tripPhotoAssetKey(tripId, photoId, 'thumbnail')}
+        invalidationPrefix={tripPhotoAssetKeyPrefix(tripId)}
         path={tripPhotoAssetPath(tripId, photoId, 'thumbnail')}
         variant={TRIP_PHOTO_VARIANTS.thumbnail}
         width={size}

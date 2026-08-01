@@ -1,7 +1,13 @@
 import { AxiosError } from 'axios';
 import type { PickedImage, PreprocessedImage } from '@/shared/media/types';
 import { ImagePreprocessError } from '@/shared/media/types';
-import { createUploadSession, type UploadSessionDeps, type UploadSnapshot } from '../uploadSession';
+import { claimAppOwnedPickerSourceUri } from '@/shared/media/pickerSourceStore';
+import {
+  createUploadSession,
+  type UploadSessionController,
+  type UploadSessionDeps,
+  type UploadSnapshot,
+} from '../uploadSession';
 import { PHOTO_UPLOAD_BATCH_LIMITS } from '../constants';
 import type { TripPhoto } from '../types';
 import type { PreparedUpload } from '../uploadTypes';
@@ -69,6 +75,7 @@ interface Harness {
   tripNotFound: number;
   leases: number;
   peakLeases: number;
+  sourceDiscards: string[];
 }
 
 function createHarness(
@@ -89,6 +96,7 @@ function createHarness(
     tripNotFound: 0,
     leases: 0,
     peakLeases: 0,
+    sourceDiscards: [],
   };
   let attempt = 0;
   let tempCounter = 0;
@@ -112,6 +120,9 @@ function createHarness(
     },
     async discardEncoderOutput(uri) {
       harness.encoderOutputs!.delete(uri);
+    },
+    async discardSource(uri) {
+      harness.sourceDiscards!.push(uri);
     },
     async uploadBatch(files, onProgress) {
       attempt += 1;
@@ -153,10 +164,23 @@ function createHarness(
   return harness as Harness;
 }
 
-function selection(count: number, width = 2560, height = 1920) {
+function ownedSource(uri: string) {
+  const owned = claimAppOwnedPickerSourceUri(uri, {
+    imagePickerDirectoryUri: () => 'file:///src',
+    discard: async () => undefined,
+  });
+  if (!owned) throw new Error(`Expected an app-owned test source: ${uri}`);
+  return owned;
+}
+
+function selection(count: number, width = 2560, height = 1920, owned = false) {
   return {
-    images: Array.from({ length: count }, (_unused, index) => pickedImage(index, width, height)),
-    unreadable: [],
+    entries: Array.from({ length: count }, (_unused, index) => ({
+      index,
+      status: 'readable' as const,
+      image: pickedImage(index, width, height),
+      ownedSourceUri: owned ? ownedSource(pickedImage(index).uri) : null,
+    })),
   };
 }
 
@@ -217,7 +241,7 @@ describe('bounded pipeline', () => {
       return original(image, target);
     };
 
-    const session = createUploadSession(selection(3), harness.deps);
+    const session = createUploadSession(selection(3, 2560, 1920, true), harness.deps);
     await session.start();
 
     expect(events).toEqual(['encode', 'encode', 'encode', 'upload:3']);
@@ -257,18 +281,30 @@ describe('per-file rejection', () => {
       return original(image, target);
     };
 
-    const session = createUploadSession(selection(3), harness.deps);
+    const session = createUploadSession(selection(3, 2560, 1920, true), harness.deps);
     await session.start();
 
     expect(harness.last().rejectedCount).toBe(1);
     expect(harness.last().uploadedCount).toBe(2);
     expect(harness.uploads[0]).toHaveLength(2);
+    expect(harness.sourceDiscards).toHaveLength(3);
   });
 
   it('rejects an asset the picker could not describe, keeping its place in the numbering', async () => {
     const harness = createHarness();
     const session = createUploadSession(
-      { images: [pickedImage(0), pickedImage(2)], unreadable: [{ index: 1, fileName: 'IMG_1.HEIC' }] },
+      {
+        entries: [
+          { index: 0, status: 'readable', image: pickedImage(0), ownedSourceUri: null },
+          {
+            index: 1,
+            status: 'unreadable',
+            fileName: 'IMG_1.HEIC',
+            ownedSourceUri: null,
+          },
+          { index: 2, status: 'readable', image: pickedImage(2), ownedSourceUri: null },
+        ],
+      },
       harness.deps,
     );
 
@@ -292,13 +328,14 @@ describe('per-file rejection', () => {
       return original(input);
     };
 
-    const session = createUploadSession(selection(3), harness.deps);
+    const session = createUploadSession(selection(3, 2560, 1920, true), harness.deps);
     await session.start();
 
     expect(harness.last().rejectedCount).toBe(1);
     expect(harness.last().uploadedCount).toBe(2);
     // The encoder output for the failed adopt is not left behind.
     expect(harness.encoderOutputs.size).toBe(0);
+    expect(harness.sourceDiscards).toHaveLength(3);
   });
 });
 
@@ -314,7 +351,7 @@ describe('server outcomes', () => {
       },
     });
     // 10 MiB each means five per batch on the byte ceiling.
-    const session = createUploadSession(selection(12), harness.deps);
+    const session = createUploadSession(selection(12, 2560, 1920, true), harness.deps);
 
     await session.start();
 
@@ -325,6 +362,9 @@ describe('server outcomes', () => {
     // The throttled batch never landed, so it is pending — not failed.
     expect(harness.last().failedCount).toBe(0);
     expect(harness.last().unknownCount).toBe(0);
+    // Only the first committed batch is terminal. The throttled batch and
+    // unprocessed tail retain their picker sources for explicit Resume.
+    expect(harness.sourceDiscards).toHaveLength(5);
 
     await session.start();
 
@@ -338,6 +378,7 @@ describe('server outcomes', () => {
       Array.from({ length: 12 }, (_unused, index) => `pick-${index}`).sort(),
     );
     expect(harness.tempFiles.size).toBe(0);
+    expect(harness.sourceDiscards).toHaveLength(12);
   });
 
   it('marks a batch unknown after a 5xx and never offers to retry it', async () => {
@@ -350,7 +391,7 @@ describe('server outcomes', () => {
         return files.map((file) => serverPhoto(file.id));
       },
     });
-    const session = createUploadSession(selection(12), harness.deps);
+    const session = createUploadSession(selection(12, 2560, 1920, true), harness.deps);
 
     await session.start();
 
@@ -469,7 +510,7 @@ describe('background pause and resume', () => {
 
   it('lets the current request settle, then pauses without holding prepared files', async () => {
     const harness = createHarness({ encodedBytes: 10 * MIB });
-    const session = createUploadSession(selection(12), harness.deps);
+    const session = createUploadSession(selection(12, 2560, 1920, true), harness.deps);
 
     const original = harness.deps.uploadBatch;
     harness.deps.uploadBatch = async (files, onProgress) => {
@@ -487,11 +528,12 @@ describe('background pause and resume', () => {
     // in the cache directory for as long as the app stays backgrounded.
     expect(harness.tempFiles.size).toBe(0);
     expect(harness.last().pendingCount).toBe(7);
+    expect(harness.sourceDiscards).toHaveLength(5);
   });
 
   it('reprocesses the stranded file on resume rather than skipping it', async () => {
     const harness = createHarness({ encodedBytes: 10 * MIB });
-    const session = createUploadSession(selection(12), harness.deps);
+    const session = createUploadSession(selection(12, 2560, 1920, true), harness.deps);
 
     const original = harness.deps.uploadBatch;
     let paused = false;
@@ -511,6 +553,7 @@ describe('background pause and resume', () => {
 
     expect(harness.last().uploadedCount).toBe(12);
     expect(harness.tempFiles.size).toBe(0);
+    expect(harness.sourceDiscards).toHaveLength(12);
   });
 
   it('stops after the current batch when the user asks, and stays stopped', async () => {
@@ -529,6 +572,242 @@ describe('background pause and resume', () => {
     expect(harness.last().phase).toBe('stopped');
     expect(harness.last().uploadedCount).toBe(5);
     expect(harness.uploads).toHaveLength(1);
+  });
+});
+
+describe('intent boundaries and precedence', () => {
+  it.each(['pause', 'stop'] as const)(
+    '%s during deferred preprocess starts no upload request',
+    async (requested) => {
+      const harness = createHarness();
+      const preprocessStarted = createDeferred<void>();
+      const preprocess = createDeferred<PreprocessedImage>();
+      const output = encoded(pickedImage(0), MIB);
+      harness.deps.preprocess = async () => {
+        preprocessStarted.resolve();
+        const result = await preprocess.promise;
+        harness.encoderOutputs.add(result.uri);
+        return result;
+      };
+      const session = createUploadSession(selection(1, 2560, 1920, true), harness.deps);
+
+      const running = session.start();
+      await preprocessStarted.promise;
+      if (requested === 'pause') session.requestPause();
+      else session.requestStop();
+      preprocess.resolve(output);
+      await running;
+
+      expect(harness.uploads).toHaveLength(0);
+      expect(harness.encoderOutputs.size).toBe(0);
+      expect(harness.last().phase).toBe(requested === 'pause' ? 'paused' : 'stopped');
+      expect(harness.sourceDiscards).toHaveLength(requested === 'pause' ? 0 : 1);
+    },
+  );
+
+  it('pause after preprocess settles prevents adopt and remains resumable', async () => {
+    const harness = createHarness();
+    let session!: UploadSessionController;
+    const basePreprocess = harness.deps.preprocess;
+    harness.deps.preprocess = async (image, target) => {
+      const result = await basePreprocess(image, target);
+      session.requestPause();
+      return result;
+    };
+    const adopt = jest.spyOn(harness.deps, 'adopt');
+    session = createUploadSession(selection(1, 2560, 1920, true), harness.deps);
+
+    await session.start();
+
+    expect(session.snapshot().phase).toBe('paused');
+    expect(adopt).not.toHaveBeenCalled();
+    expect(harness.uploads).toHaveLength(0);
+    expect(harness.sourceDiscards).toHaveLength(0);
+  });
+
+  it('stop during deferred adopt discards the late temp and starts no request', async () => {
+    const harness = createHarness();
+    const adoptStarted = createDeferred<void>();
+    const adopt = createDeferred<void>();
+    harness.deps.adopt = async ({ uri, bytes }) => {
+      adoptStarted.resolve();
+      await adopt.promise;
+      harness.encoderOutputs.delete(uri);
+      const lateUri = 'file:///temp/stop-late-adopt.jpg';
+      harness.tempFiles.add(lateUri);
+      return { uri: lateUri, bytes };
+    };
+    const session = createUploadSession(selection(1, 2560, 1920, true), harness.deps);
+
+    const running = session.start();
+    await adoptStarted.promise;
+    session.requestStop();
+    adopt.resolve();
+    await running;
+
+    expect(session.snapshot().phase).toBe('stopped');
+    expect(harness.uploads).toHaveLength(0);
+    expect(harness.tempFiles.size).toBe(0);
+    expect(harness.sourceDiscards).toHaveLength(1);
+  });
+
+  it('Stop wins a concurrent 429, retains throttle detail and cannot restart', async () => {
+    const harness = createHarness();
+    let session!: UploadSessionController;
+    harness.deps.uploadBatch = async (files) => {
+      harness.uploads.push(files);
+      session.requestStop();
+      throw axiosFailure(429, { detail: 'Throttled.' });
+    };
+    session = createUploadSession(selection(3, 2560, 1920, true), harness.deps);
+
+    await session.start();
+    await session.start();
+
+    expect(session.snapshot()).toMatchObject({
+      phase: 'stopped',
+      pendingCount: 3,
+      unknownCount: 0,
+      error: { kind: 'throttled', message: 'Upload limit reached. Try again later.' },
+      activeBatch: null,
+    });
+    expect(harness.uploads).toHaveLength(1);
+    expect(harness.tempFiles.size).toBe(0);
+    expect(harness.sourceDiscards).toHaveLength(3);
+  });
+
+  it('Stop wins an uncertain network outcome without scheduling another batch', async () => {
+    const harness = createHarness();
+    let session!: UploadSessionController;
+    harness.deps.uploadBatch = async (files) => {
+      harness.uploads.push(files);
+      session.requestStop();
+      throw networkFailure();
+    };
+    session = createUploadSession(selection(3, 2560, 1920, true), harness.deps);
+
+    await session.start();
+    await session.start();
+
+    expect(session.snapshot()).toMatchObject({
+      phase: 'stopped',
+      unknownCount: 3,
+      activeBatch: null,
+    });
+    expect(harness.reconciles).toBe(1);
+    expect(harness.uploads).toHaveLength(1);
+    expect(harness.sourceDiscards).toHaveLength(3);
+  });
+
+  it('Stop is never downgraded by a later background Pause', async () => {
+    const harness = createHarness();
+    let session!: UploadSessionController;
+    const baseUpload = harness.deps.uploadBatch;
+    harness.deps.uploadBatch = async (files, onProgress, signal) => {
+      const result = await baseUpload(files, onProgress, signal);
+      session.requestStop();
+      session.requestPause();
+      return result;
+    };
+    session = createUploadSession(selection(2), harness.deps);
+
+    await session.start();
+
+    expect(session.snapshot().phase).toBe('stopped');
+    expect(harness.uploads).toHaveLength(1);
+  });
+});
+
+describe('picker source ownership and active batch progress', () => {
+  it('awaits cleanup already started for an unreadable source before cancel resolves', async () => {
+    const harness = createHarness();
+    const cleanup = createDeferred<void>();
+    harness.deps.discardSource = async (uri) => {
+      harness.sourceDiscards.push(uri);
+      await cleanup.promise;
+    };
+    const uri = ownedSource('file:///src/unreadable.heic');
+    const session = createUploadSession(
+      {
+        entries: [
+          {
+            index: 0,
+            status: 'unreadable',
+            fileName: 'unreadable.heic',
+            ownedSourceUri: uri,
+          },
+        ],
+      },
+      harness.deps,
+    );
+
+    let settled = false;
+    const cancelling = session.cancel().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(harness.sourceDiscards).toEqual([uri]);
+
+    cleanup.resolve();
+    await cancelling;
+    expect(settled).toBe(true);
+  });
+
+  it('absorbs source cleanup rejection without changing upload success', async () => {
+    const harness = createHarness();
+    harness.deps.discardSource = async (uri) => {
+      harness.sourceDiscards.push(uri);
+      throw new Error('file busy');
+    };
+    const session = createUploadSession(selection(2, 2560, 1920, true), harness.deps);
+
+    await session.start();
+
+    expect(session.snapshot()).toMatchObject({ phase: 'complete', uploadedCount: 2 });
+    expect(harness.sourceDiscards).toHaveLength(2);
+  });
+
+  it('reports only native multipart totals and ignores invalid or stale progress', async () => {
+    const harness = createHarness();
+    const uploadStarted = createDeferred<void>();
+    const upload = createDeferred<TripPhoto[]>();
+    let progress: ((loaded: number, total: number | null) => void) | null = null;
+    const emitProgress = (loaded: number, total: number | null): void => {
+      if (!progress) throw new Error('Upload progress callback was not captured.');
+      progress(loaded, total);
+    };
+    harness.deps.uploadBatch = async (files, onProgress) => {
+      harness.uploads.push(files);
+      progress = onProgress;
+      uploadStarted.resolve();
+      return upload.promise;
+    };
+    const session = createUploadSession(selection(2), harness.deps);
+    const running = session.start();
+    await uploadStarted.promise;
+
+    expect(session.snapshot().activeBatch).toEqual({
+      number: 1,
+      itemCount: 2,
+      loadedBytes: 0,
+      totalBytes: null,
+    });
+    emitProgress(10, null);
+    expect(session.snapshot().activeBatch).toMatchObject({ loadedBytes: 10, totalBytes: null });
+    const beforeInvalid = harness.snapshots.length;
+    emitProgress(Number.NaN, 100);
+    emitProgress(-1, 100);
+    expect(harness.snapshots).toHaveLength(beforeInvalid);
+    emitProgress(60, 100);
+    expect(session.snapshot().activeBatch).toMatchObject({ loadedBytes: 60, totalBytes: 100 });
+
+    upload.resolve(harness.uploads[0].map((file) => serverPhoto(file.id)));
+    await running;
+    const afterSettle = harness.snapshots.length;
+    emitProgress(90, 100);
+    expect(harness.snapshots).toHaveLength(afterSettle);
+    expect(session.snapshot().activeBatch).toBeNull();
   });
 });
 
@@ -675,11 +954,14 @@ describe('private-session cancellation', () => {
     await Promise.all([running, cancelling]);
 
     expect(harness.tempFiles.size).toBe(0);
-    expect(harness.uploaded).toHaveLength(0);
+    // A resolved 201 is authoritative even if close was requested while the
+    // native client was settling. The hook's stale owner guard suppresses this
+    // callback from Trip/Session B, while the internal ledger keeps the truth.
+    expect(harness.uploaded).toHaveLength(2);
     expect(harness.last()).toMatchObject({
       phase: 'cancelled',
-      uploadedCount: 0,
-      unknownCount: 2,
+      uploadedCount: 2,
+      unknownCount: 0,
     });
   });
 
@@ -722,13 +1004,18 @@ describe('low disk', () => {
     expect(harness.tempFiles.size).toBe(0);
   });
 
-  it('proceeds when the platform cannot report free space', async () => {
+  it('fails closed when the platform cannot prove the disk reserve', async () => {
     const harness = createHarness({ availableBytes: () => null });
     const session = createUploadSession(selection(3), harness.deps);
 
     await session.start();
 
-    expect(harness.last().uploadedCount).toBe(3);
+    expect(harness.last()).toMatchObject({
+      phase: 'partial',
+      uploadedCount: 0,
+      error: { message: 'Not enough storage space to prepare these photos.' },
+    });
+    expect(harness.uploads).toHaveLength(0);
   });
 });
 

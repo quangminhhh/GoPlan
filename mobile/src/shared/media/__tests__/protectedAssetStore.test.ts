@@ -2,7 +2,7 @@ import { setAccessToken } from '@/shared/api/token-store';
 import {
   __getProtectedAssetEntriesForTests,
   __resetProtectedAssetStoreForTests,
-  acquireProtectedAsset,
+  acquireProtectedAsset as acquireProtectedAssetWithPrefix,
   invalidateProtectedAsset,
   invalidateProtectedAssets,
   MEDIUM_CACHE_MAX_BYTES,
@@ -16,7 +16,10 @@ import {
   suspendPrivateMediaSession,
   waitForPrivateNetworkIdle,
 } from '../privateMediaLifecycle';
-import type { ProtectedAssetVariant } from '../protectedAssetTypes';
+import type {
+  AcquireProtectedAssetOptions,
+  ProtectedAssetVariant,
+} from '../protectedAssetTypes';
 import {
   bytes,
   createDeferred,
@@ -43,6 +46,19 @@ function thumbnailPath(photoId: string): string {
 
 function thumbnailKey(photoId: string): string {
   return `trip-photo:trip-1:${photoId}:thumbnail`;
+}
+
+type TestAcquireOptions = Omit<AcquireProtectedAssetOptions, 'invalidationPrefix'> & {
+  invalidationPrefix?: string;
+};
+
+function acquireProtectedAsset(options: TestAcquireOptions) {
+  const { invalidationPrefix, ...rest } = options;
+  const keyPrefix = /^trip-photo:[^:]+:/.exec(options.assetKey)?.[0] ?? 'test-protected:';
+  return acquireProtectedAssetWithPrefix({
+    ...rest,
+    invalidationPrefix: invalidationPrefix ?? keyPrefix,
+  });
 }
 
 beforeEach(async () => {
@@ -624,6 +640,148 @@ describe('explicit invalidation', () => {
     expect(transport.files.contents().size).toBe(1);
   });
 
+  it('detaches the whole prefix before awaiting old-file cleanup', async () => {
+    const transport = createFakeTransport(() => imageResponse([bytes(16)]).response);
+    const options = {
+      assetKey: thumbnailKey('photo-1'),
+      path: thumbnailPath('photo-1'),
+      variant: THUMBNAIL,
+      transport,
+    };
+    const old = await acquireProtectedAsset(options);
+    old.release();
+
+    const discardStarted = createDeferred<void>();
+    const allowDiscard = createDeferred<void>();
+    const discard = transport.files.discard.bind(transport.files);
+    transport.files.discard = async (uri: string) => {
+      if (uri === old.uri) {
+        discardStarted.resolve();
+        await allowDiscard.promise;
+      }
+      await discard(uri);
+    };
+
+    const invalidating = invalidateProtectedAssets('trip-photo:trip-1:');
+    await discardStarted.promise;
+    const replacement = await acquireProtectedAsset(options);
+
+    expect(replacement.uri).not.toBe(old.uri);
+    expect(transport.fetches.calls).toHaveLength(2);
+    expect(__getProtectedAssetEntriesForTests()).toEqual([
+      expect.objectContaining({ assetKey: options.assetKey, uri: replacement.uri }),
+    ]);
+
+    allowDiscard.resolve();
+    await invalidating;
+    expect(__getProtectedAssetEntriesForTests()).toEqual([
+      expect.objectContaining({ assetKey: options.assetKey, uri: replacement.uri }),
+    ]);
+    await expect(transport.files.exists(replacement.uri)).resolves.toBe(true);
+    replacement.release();
+  });
+
+  it('rejects a pending cache existence check that crosses a prefix bump', async () => {
+    const transport = createFakeTransport(() => imageResponse([bytes(16)]).response);
+    const options = {
+      assetKey: thumbnailKey('photo-1'),
+      path: thumbnailPath('photo-1'),
+      variant: THUMBNAIL,
+      transport,
+    };
+    const old = await acquireProtectedAsset(options);
+    old.release();
+
+    const existsStarted = createDeferred<void>();
+    const existsResult = createDeferred<boolean>();
+    transport.files.exists = async () => {
+      existsStarted.resolve();
+      return existsResult.promise;
+    };
+    const pendingHit = acquireProtectedAsset(options);
+    await existsStarted.promise;
+
+    await invalidateProtectedAssets('trip-photo:trip-1:');
+    existsResult.resolve(true);
+
+    await expect(pendingHit).rejects.toMatchObject({ kind: 'cancelled' });
+    expect(transport.fetches.calls).toHaveLength(1);
+  });
+
+  it('does not commit an in-flight stage that crosses a prefix bump', async () => {
+    const responseGate = createDeferred<void>();
+    const transport = createFakeTransport(async () => {
+      await responseGate.promise;
+      return imageResponse([bytes(16)]).response;
+    });
+    const pending = acquireProtectedAsset({
+      assetKey: thumbnailKey('photo-1'),
+      path: thumbnailPath('photo-1'),
+      variant: THUMBNAIL,
+      transport,
+    });
+    await flushMicrotasks();
+
+    await invalidateProtectedAssets('trip-photo:trip-1:');
+    responseGate.resolve();
+
+    await expect(pending).rejects.toMatchObject({ kind: 'cancelled' });
+    expect(__getProtectedAssetEntriesForTests()).toHaveLength(0);
+    expect(transport.files.contents().size).toBe(0);
+  });
+
+  it('does not resurrect a detached pinned entry when its old handle releases', async () => {
+    const transport = createFakeTransport(() => imageResponse([bytes(16)]).response);
+    const options = {
+      assetKey: thumbnailKey('photo-1'),
+      path: thumbnailPath('photo-1'),
+      variant: THUMBNAIL,
+      transport,
+    };
+    const pinnedOld = await acquireProtectedAsset(options);
+    await invalidateProtectedAssets('trip-photo:trip-1:');
+    const replacement = await acquireProtectedAsset(options);
+
+    pinnedOld.release();
+    await flushMicrotasks();
+
+    expect(__getProtectedAssetEntriesForTests()).toEqual([
+      expect.objectContaining({ assetKey: options.assetKey, uri: replacement.uri, refCount: 1 }),
+    ]);
+    replacement.release();
+  });
+
+  it('handles consecutive prefix invalidations without touching another trip', async () => {
+    const transport = createFakeTransport(() => imageResponse([bytes(16)]).response);
+    const tripOne = await acquireProtectedAsset({
+      assetKey: thumbnailKey('photo-1'),
+      path: thumbnailPath('photo-1'),
+      variant: THUMBNAIL,
+      transport,
+    });
+    tripOne.release();
+    const tripTwo = await acquireProtectedAsset({
+      assetKey: 'trip-photo:trip-2:photo-2:thumbnail',
+      path: '/trips/trip-2/photos/photo-2/thumbnail',
+      variant: THUMBNAIL,
+      transport,
+    });
+
+    await Promise.all([
+      invalidateProtectedAssets('trip-photo:trip-1:'),
+      invalidateProtectedAssets('trip-photo:trip-1:'),
+    ]);
+
+    expect(__getProtectedAssetEntriesForTests()).toEqual([
+      expect.objectContaining({
+        assetKey: 'trip-photo:trip-2:photo-2:thumbnail',
+        uri: tripTwo.uri,
+      }),
+    ]);
+    await expect(transport.files.exists(tripTwo.uri)).resolves.toBe(true);
+    tripTwo.release();
+  });
+
   it('aborts a load in progress for the invalidated key', async () => {
     const gate = createDeferred<void>();
     const transport = createFakeTransport(async () => {
@@ -648,6 +806,34 @@ describe('explicit invalidation', () => {
 });
 
 describe('session boundaries', () => {
+  it('purges a pre-upgrade opaque ZIP orphan before the next session opens', async () => {
+    const transport = createFakeTransport(() => imageResponse([bytes(16)]).response);
+    const registered = await acquireProtectedAsset({
+      assetKey: thumbnailKey('photo-1'),
+      path: thumbnailPath('photo-1'),
+      variant: THUMBNAIL,
+      transport,
+    });
+    registered.release();
+
+    beginPrivateMediaShutdown();
+    await flushPrivateMediaPurge();
+
+    // Simulate an opaque archive left by a pre-D22 process after its last
+    // successful cleanup. Startup owns the whole namespace, not a file-type
+    // allowlist, so the removed ZIP implementation needs no upgrade parser.
+    const orphan = await transport.files.createSink('m7y2f-4-n8v3q1.zip');
+    await orphan.write(bytes(24));
+    await orphan.close();
+    const purgesBeforeStartup = transport.files.purgeCount();
+    expect(transport.files.contents().has(orphan.uri)).toBe(true);
+
+    await startPrivateMediaSession();
+
+    expect(transport.files.contents().size).toBe(0);
+    expect(transport.files.purgeCount()).toBe(purgesBeforeStartup + 1);
+  });
+
   it('discards a completion that belongs to a session that has ended', async () => {
     const gate = createDeferred<void>();
     const transport = createFakeTransport(async () => {

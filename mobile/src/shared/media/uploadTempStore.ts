@@ -97,7 +97,8 @@ export function uploadTempAvailableBytes(store?: ProtectedFileStore): number | n
 /**
  * Deletes the whole namespace, including anything a killed process left behind.
  * Registered with the lifecycle so sign-in, sign-out and background all reach it
- * through the same serialized queue as the protected-asset staging directory.
+ * through its independently serialized, transfer-lease-fenced queue. Protected
+ * cache cleanup is separate and never waits for an upload request body.
  */
 export async function purgeUploadTempFiles(): Promise<void> {
   adoptedUris.clear();

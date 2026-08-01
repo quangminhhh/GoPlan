@@ -21,9 +21,9 @@ function PinchProbe() {
 
   const scale = useSharedValue(1);
   const pinch = Gesture.Pinch().onUpdate((event) => {
-    scale.value = event.scale;
+    scale.set(event.scale);
   });
-  const style = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
+  const style = useAnimatedStyle(() => ({ transform: [{ scale: scale.get() }] }));
 
   return (
     <GestureHandlerRootView>

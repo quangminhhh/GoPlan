@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { nativeImageCodec } from '@/shared/media/imageCodec';
 import { pickImage } from '@/shared/media/pickImage';
+import { discardAppOwnedPickerSource } from '@/shared/media/pickerSourceStore';
 import { preprocessImage } from '@/shared/media/preprocessImage';
 import { uploadTripCover } from '../api';
 import { describeCoverError, TRIP_COVER_TARGET } from '../coverMedia';
@@ -50,21 +51,24 @@ export function useTripCoverUpload(initialUrl = ''): TripCoverUpload {
         return;
       }
       setStatus('uploading');
-      // Every temp file this flow creates: the picker's full-resolution copy and
-      // the encoded upload. Both sit in the cache directory and nothing reads
-      // them once the request is done.
-      const temporaries = [outcome.image.uri];
+      // Encoder output and picker source use separate cleanup authority. The
+      // picked read URI may point at a Photos original and is never deleted by
+      // virtue of being readable.
+      const encoderOutputs: string[] = [];
       let uploadedUrl: string;
       try {
         const file = await preprocessImage(outcome.image, TRIP_COVER_TARGET, nativeImageCodec);
-        temporaries.push(file.uri);
+        encoderOutputs.push(file.uri);
         uploadedUrl = await uploadTripCover(file);
       } finally {
         // Cleanup runs on the failure path too, and must never replace the
         // outcome the user is actually waiting on with a delete error.
-        await Promise.all(
-          temporaries.map((uri) => nativeImageCodec.discard(uri).catch(() => undefined)),
-        );
+        await Promise.all([
+          ...encoderOutputs.map((uri) => nativeImageCodec.discard(uri).catch(() => undefined)),
+          outcome.ownedSourceUri
+            ? discardAppOwnedPickerSource(outcome.ownedSourceUri)
+            : Promise.resolve(),
+        ]);
       }
       // The only legal source of a cover_image_url is this response.
       setCoverUrl(uploadedUrl);

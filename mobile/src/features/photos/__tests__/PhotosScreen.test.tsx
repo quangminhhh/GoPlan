@@ -2,6 +2,12 @@ const mockUseTripPhotos = jest.fn();
 const mockUsePhotoUpload = jest.fn();
 const mockUsePhotoViewer = jest.fn();
 const mockUsePhotoSelection = jest.fn();
+const mockPhotoScope = {
+  capture: () => ({ tripId: 'trip-1', generation: 0 }),
+  isCurrent: () => true,
+  subscribeInvalidation: () => () => undefined,
+  waitForCleanup: async () => undefined,
+};
 
 jest.mock('expo-router', () => ({
   useLocalSearchParams: () => ({ tripId: 'trip-1' }),
@@ -22,6 +28,10 @@ jest.mock('../hooks/usePhotoViewer', () => ({
 
 jest.mock('../hooks/usePhotoSelection', () => ({
   usePhotoSelection: (...args: unknown[]) => mockUsePhotoSelection(...args),
+}));
+
+jest.mock('../hooks/useTripPhotoScope', () => ({
+  useTripPhotoScope: () => mockPhotoScope,
 }));
 
 jest.mock('@/shared/media/AuthenticatedImage', () => {
@@ -70,13 +80,16 @@ function hookState(overrides: Record<string, unknown> = {}) {
     refreshing: false,
     loadingMore: false,
     hasNextPage: false,
+    tombstonedPhotoIds: new Set<string>(),
     tripNotFound: false,
     loadFirstPage: jest.fn(async () => undefined),
     loadMore: jest.fn(async () => undefined),
+    retryLoadMore: jest.fn(async () => undefined),
     reconcile: jest.fn(async () => undefined),
     prependUploaded: jest.fn(),
     removePhoto: jest.fn(),
     markPhotoStale: jest.fn(),
+    resolveAssetNotFound: jest.fn(async () => 'unknown'),
     handleAssetNotFound: jest.fn(),
     ...overrides,
   };
@@ -119,17 +132,17 @@ function selectionState(overrides: Record<string, unknown> = {}) {
     selectionMode: false,
     selectedIds: [],
     selectedCount: 0,
-    download: { status: 'idle' },
-    requestsUsed: 0,
+    saveSnapshot: null,
+    feedback: null,
     enterSelection: jest.fn(),
     toggle: jest.fn(),
     isSelected: jest.fn(() => false),
     selectLoaded: jest.fn(),
     clear: jest.fn(),
     exit: jest.fn(),
-    startDownload: jest.fn(async () => undefined),
-    cancelDownload: jest.fn(),
-    dismissMessage: jest.fn(),
+    startSave: jest.fn(async () => undefined),
+    cancelSave: jest.fn(),
+    dismissFeedback: jest.fn(),
     ...overrides,
   };
 }
@@ -145,7 +158,11 @@ it('passes the route trip id to the hook', async () => {
   mockUseTripPhotos.mockReturnValue(hookState());
   await render(<PhotosScreen />);
 
-  expect(mockUseTripPhotos).toHaveBeenCalledWith('trip-1');
+  expect(mockUseTripPhotos).toHaveBeenCalledWith('trip-1', mockPhotoScope);
+  expect(mockUsePhotoUpload.mock.calls[0][0]).toMatchObject({
+    tripId: 'trip-1',
+    scope: mockPhotoScope,
+  });
 });
 
 it('shows the loading screen on a first load with nothing to show', async () => {
@@ -239,24 +256,24 @@ it('renders viewer and stale-selection feedback after their modal UI closes', as
 
   expect(screen.getByTestId('photos-feedback-toast')).toBeTruthy();
   expect(screen.getByText('Photo deleted.')).toBeTruthy();
-  await fireEvent.press(screen.getByTestId('photos-feedback-toast'));
+  await fireEvent.press(screen.getByLabelText('Dismiss message'));
   expect(dismissViewer).toHaveBeenCalledTimes(1);
 
   const dismissSelection = jest.fn();
   mockUsePhotoViewer.mockReturnValue(viewerState());
   mockUsePhotoSelection.mockReturnValue(
     selectionState({
-      download: {
-        status: 'message',
+      feedback: {
+        kind: 'message',
         message: 'Some selected photos are no longer available.',
       },
-      dismissMessage: dismissSelection,
+      dismissFeedback: dismissSelection,
     }),
   );
   await first.rerender(<PhotosScreen />);
 
   expect(screen.getByText('Some selected photos are no longer available.')).toBeTruthy();
-  await fireEvent.press(screen.getByTestId('photos-feedback-toast'));
+  await fireEvent.press(screen.getByLabelText('Dismiss message'));
   expect(dismissSelection).toHaveBeenCalledTimes(1);
 });
 
@@ -275,7 +292,7 @@ it('shows and dismisses a picker failure without opening an upload sheet', async
   expect(screen.getByText('Something went wrong. Please try again.')).toBeTruthy();
   expect(screen.queryByTestId('photo-upload-sheet')).toBeNull();
 
-  await fireEvent.press(screen.getByTestId('photos-feedback-toast'));
+  await fireEvent.press(screen.getByLabelText('Dismiss message'));
   expect(dismissPickFailure).toHaveBeenCalledTimes(1);
 });
 
@@ -320,9 +337,7 @@ it('shows the upload sheet once a selection exists', async () => {
         unknownCount: 0,
         failedCount: 0,
         batchesUploaded: 0,
-        currentBatchSize: 0,
-        batchBytesSent: 0,
-        batchBytesTotal: null,
+        activeBatch: null,
         error: null,
       },
     }),

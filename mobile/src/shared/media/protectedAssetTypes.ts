@@ -124,6 +124,20 @@ export interface ProtectedTransport {
   files: ProtectedFileStore;
 }
 
+export interface AcquireProtectedAssetOptions {
+  /** Logical identity, e.g. `trip-photo:<tripId>:<photoId>:thumbnail`. */
+  assetKey: string;
+  /**
+   * Canonical owner scope supplied by the feature. The cache never parses an
+   * opaque asset key to guess which trip-level invalidation fence owns it.
+   */
+  invalidationPrefix: string;
+  path: string;
+  variant: ProtectedAssetVariant;
+  signal?: AbortSignal;
+  transport?: ProtectedTransport;
+}
+
 export interface ProtectedFileStore {
   /**
    * Creates a sink inside this store's own namespace.
@@ -149,9 +163,10 @@ export interface ProtectedFileStore {
  * Chunk-at-a-time rather than `response.body.pipeTo(sink.writable)` because two
  * requirements cannot be expressed through `pipeTo`: a per-variant byte ceiling
  * that has to cancel the stream and discard the partial file the moment it is
- * crossed (§1.3), and the periodic free-disk check a long ZIP needs (D21). The
- * native mechanism underneath is still `File.writableStream()` — this only moves
- * the loop into JavaScript, where the abort signal is observable between chunks.
+ * crossed (§1.3), and the periodic free-disk check a streamed photo save needs
+ * (D21). The native mechanism underneath is still `File.writableStream()` — this
+ * only moves the loop into JavaScript, where the abort signal is observable
+ * between chunks.
  */
 export interface ProtectedFileSink {
   readonly uri: string;

@@ -3,6 +3,14 @@ jest.mock('expo-image-picker', () => ({
   launchImageLibraryAsync: jest.fn(),
 }));
 
+const mockClaimPickerSource = jest.fn((uri: string) =>
+  uri.startsWith('file:///cache/ImagePicker/') ? uri : null,
+);
+
+jest.mock('../pickerSourceStore', () => ({
+  claimAppOwnedPickerSourceUri: (uri: string) => mockClaimPickerSource(uri),
+}));
+
 // eslint-disable-next-line import/first
 import * as ImagePicker from 'expo-image-picker';
 // eslint-disable-next-line import/first
@@ -39,7 +47,21 @@ describe('pickImage', () => {
 
     await expect(pickImage()).resolves.toEqual({
       status: 'picked',
+      ownedSourceUri: null,
       image: { uri: 'file:///a.heic', width: 4032, height: 3024, fileName: 'IMG_1.HEIC' },
+    });
+  });
+
+  it('keeps delete authority separate from the image read URI', async () => {
+    const uri = 'file:///cache/ImagePicker/owned.heic';
+    mockLaunch.mockResolvedValue({
+      canceled: false,
+      assets: [{ uri, width: 100, height: 100, fileName: null }],
+    });
+
+    await expect(pickImage()).resolves.toMatchObject({
+      image: { uri },
+      ownedSourceUri: uri,
     });
   });
 
@@ -123,8 +145,11 @@ describe('pickImages', () => {
 
     expect(outcome.status).toBe('picked');
     if (outcome.status !== 'picked') return;
-    expect(outcome.images.map((image) => image.uri)).toEqual(['file:///c.heic', 'file:///a.heic']);
-    expect(outcome.unreadable).toEqual([]);
+    expect(
+      outcome.entries.map((entry) =>
+        entry.status === 'readable' ? entry.image.uri : entry.fileName,
+      ),
+    ).toEqual(['file:///c.heic', 'file:///a.heic']);
   });
 
   it('rejects only the assets with unusable dimensions, keeping the rest', async () => {
@@ -143,8 +168,58 @@ describe('pickImages', () => {
 
     expect(outcome.status).toBe('picked');
     if (outcome.status !== 'picked') return;
-    expect(outcome.images).toHaveLength(2);
-    expect(outcome.unreadable).toEqual([{ index: 1, fileName: 'broken.HEIC' }]);
+    expect(outcome.entries).toEqual([
+      {
+        index: 0,
+        status: 'readable',
+        image: {
+          uri: 'file:///ok.heic',
+          width: 4032,
+          height: 3024,
+          fileName: 'ok.HEIC',
+        },
+        ownedSourceUri: null,
+      },
+      {
+        index: 1,
+        status: 'unreadable',
+        fileName: 'broken.HEIC',
+        ownedSourceUri: null,
+      },
+      {
+        index: 2,
+        status: 'readable',
+        image: {
+          uri: 'file:///ok2.heic',
+          width: 100,
+          height: 100,
+          fileName: null,
+        },
+        ownedSourceUri: null,
+      },
+    ]);
+  });
+
+  it('preserves cleanup authority for an unreadable picker asset', async () => {
+    const uri = 'file:///cache/ImagePicker/unreadable.heic';
+    mockLaunch.mockResolvedValue({
+      canceled: false,
+      assets: [{ uri, width: 0, height: 0, fileName: 'cloud.heic' }],
+    });
+
+    const outcome = await pickImages();
+
+    expect(outcome).toEqual({
+      status: 'picked',
+      entries: [
+        {
+          index: 0,
+          status: 'unreadable',
+          fileName: 'cloud.heic',
+          ownedSourceUri: uri,
+        },
+      ],
+    });
   });
 
   it('reports cancellation as an ordinary outcome', async () => {

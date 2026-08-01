@@ -43,6 +43,7 @@ const THUMBNAIL: ProtectedAssetVariant = {
 };
 
 const ASSET_KEY = 'trip-photo:trip-1:photo-1:thumbnail';
+const INVALIDATION_PREFIX = 'trip-photo:trip-1:';
 const PATH = '/trips/trip-1/photos/photo-1/thumbnail';
 
 async function renderImage(
@@ -52,6 +53,7 @@ async function renderImage(
   return render(
     <AuthenticatedImage
       assetKey={ASSET_KEY}
+      invalidationPrefix={INVALIDATION_PREFIX}
       path={PATH}
       variant={THUMBNAIL}
       width={110}
