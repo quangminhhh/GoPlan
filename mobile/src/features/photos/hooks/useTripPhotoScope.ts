@@ -1,8 +1,13 @@
-import { useLayoutEffect, useState } from 'react';
+import { useLayoutEffect, useMemo, useState } from 'react';
 
 export interface TripPhotoScopeTicket {
   readonly tripId: string;
   readonly generation: number;
+}
+
+interface MutableTripPhotoScopeTicket {
+  tripId: string;
+  generation: number;
 }
 
 export type TripPhotoScopeInvalidationListener = (
@@ -45,8 +50,7 @@ function sameTicket(left: TripPhotoScopeTicket, right: TripPhotoScopeTicket): bo
 }
 
 class TripPhotoScopeOwner implements TripPhotoScopeController {
-  private ticket: TripPhotoScopeTicket;
-  private committedTicket: TripPhotoScopeTicket;
+  private ticket: MutableTripPhotoScopeTicket;
   private terminalInvalidated = false;
   private readonly listeners = new Set<TripPhotoScopeInvalidationListener>();
   private cleanupTail: Promise<void> = Promise.resolve();
@@ -54,7 +58,6 @@ class TripPhotoScopeOwner implements TripPhotoScopeController {
 
   constructor(tripId: string) {
     this.ticket = { tripId, generation: 0 };
-    this.committedTicket = this.ticket;
   }
 
   capture(): TripPhotoScopeTicket {
@@ -80,16 +83,35 @@ class TripPhotoScopeOwner implements TripPhotoScopeController {
     }
   }
 
-  /** Called during render so old closures fail before any new effect can run. */
-  observeTrip(tripId: string): void {
+  /** Pure preview used by a render-bound facade before its trip commits. */
+  previewTrip(tripId: string): MutableTripPhotoScopeTicket {
     if (this.ticket.tripId === tripId) {
-      return;
+      return this.ticket;
     }
-    this.ticket = {
+    return {
       tripId,
       generation: this.ticket.generation + 1,
     };
+  }
+
+  /** Publishes only from the layout phase, so abandoned renders are inert. */
+  commitTrip(
+    tripId: string,
+    preview: MutableTripPhotoScopeTicket,
+  ): void {
+    if (this.ticket.tripId === tripId) {
+      return;
+    }
+
+    const previous = this.ticket;
+    // An authoritative invalidation can land after render but before this
+    // layout effect. Update the render's preview in place before consumers'
+    // later layout effects run; tickets they captured from this facade then
+    // observe the actual monotonic generation committed by the owner.
+    preview.generation = previous.generation + 1;
+    this.ticket = preview;
     this.terminalInvalidated = false;
+    this.publishInvalidation(previous, preview);
   }
 
   invalidateCurrentTrip(): void {
@@ -106,21 +128,8 @@ class TripPhotoScopeOwner implements TripPhotoScopeController {
     // probes the scope therefore already sees a closed trip and cannot schedule
     // another request while sibling listeners are still being called.
     this.ticket = terminal;
-    this.committedTicket = terminal;
     this.terminalInvalidated = true;
     this.publishInvalidation(previous, terminal);
-  }
-
-  /** Called from the hook's layout effect, so abandoned renders never publish. */
-  publishCommittedInvalidation(): void {
-    const current = this.ticket;
-    if (sameTicket(this.committedTicket, current)) {
-      return;
-    }
-
-    const previous = this.committedTicket;
-    this.committedTicket = current;
-    this.publishInvalidation(previous, current);
   }
 
   private publishInvalidation(
@@ -150,20 +159,66 @@ class TripPhotoScopeOwner implements TripPhotoScopeController {
 }
 
 /**
- * One stable owner shared by every photo hook mounted for a trip screen.
+ * A render may describe a future trip without changing the committed owner.
+ * Its preview becomes current in the hook's layout effect, before later layout
+ * effects from photo consumers can start work for the newly committed screen.
+ */
+class RenderBoundTripPhotoScope implements TripPhotoScopeController {
+  constructor(
+    private readonly owner: TripPhotoScopeOwner,
+    private readonly tripId: string,
+    private readonly preview: MutableTripPhotoScopeTicket,
+  ) {}
+
+  commit(): void {
+    this.owner.commitTrip(this.tripId, this.preview);
+  }
+
+  capture(): TripPhotoScopeTicket {
+    const committed = this.owner.capture();
+    // A future render sees its preview until commit. A controller retained from
+    // an older committed render continues exposing the owner's latest ticket,
+    // preserving the public read contract without letting it mutate that trip.
+    return committed.generation < this.preview.generation ? this.preview : committed;
+  }
+
+  isCurrent(ticket: TripPhotoScopeTicket): boolean {
+    return this.owner.isCurrent(ticket);
+  }
+
+  subscribeInvalidation(listener: TripPhotoScopeInvalidationListener): () => void {
+    return this.owner.subscribeInvalidation(listener);
+  }
+
+  waitForCleanup(): Promise<void> {
+    return this.owner.waitForCleanup();
+  }
+
+  invalidateCurrentTrip(): void {
+    if (sameTicket(this.owner.capture(), this.preview)) {
+      this.owner.invalidateCurrentTrip();
+    }
+  }
+}
+
+/**
+ * One stable committed owner shared by every photo hook mounted for a screen.
  *
- * The ticket changes during render as soon as a different `tripId` is observed,
- * so callbacks retained by Trip A fail `isCurrent()` even before effects for
- * Trip B run. Subscribers are notified only for the committed transition, in a
- * layout effect, before the user can interact with the new screen.
+ * Render receives a pure trip-bound preview. The stable owner changes only in a
+ * layout effect, so React 19 can abandon or replay a render without invalidating
+ * the currently committed trip. The scope layout effect is registered before
+ * consumer effects and publishes the transition before new work can start.
  */
 export function useTripPhotoScope(tripId: string): TripPhotoScopeController {
   const [owner] = useState(() => new TripPhotoScopeOwner(tripId));
-  owner.observeTrip(tripId);
+  const scope = useMemo(
+    () => new RenderBoundTripPhotoScope(owner, tripId, owner.previewTrip(tripId)),
+    [owner, tripId],
+  );
 
   useLayoutEffect(() => {
-    owner.publishCommittedInvalidation();
-  }, [owner, tripId]);
+    scope.commit();
+  }, [scope]);
 
-  return owner;
+  return scope;
 }

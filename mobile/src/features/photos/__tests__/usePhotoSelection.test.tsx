@@ -321,6 +321,72 @@ it('cancels a pending cleanup wait without creating a session or touching native
   expect(fake.createSession).not.toHaveBeenCalled();
 });
 
+it('records a tombstone during cleanup wait and continues saving the remaining selection', async () => {
+  const cleanup = createDeferred<void>();
+  const scope = createScope();
+  scope.waitForCleanup = () => cleanup.promise;
+  const feed = createTombstoneFeed();
+  const partial = snapshot({
+    phase: 'completed',
+    total: 2,
+    counts: {
+      committed: 1,
+      terminalSkipped: 1,
+      retryableFailed: 0,
+      unknown: 0,
+      unattempted: 0,
+    },
+    ledger: [
+      { photoId: 'p1', status: 'terminalSkipped' },
+      { photoId: 'p2', status: 'committed' },
+    ],
+  });
+  const fake = fakeSessionFactory(partial);
+  const configured = options({
+    ...feed,
+    scope,
+    createSession: fake.createSession,
+  });
+  const { result } = await renderHook(() => usePhotoSelection(configured));
+  await act(async () => {
+    result.current.enterSelection('p1');
+    result.current.toggle('p2');
+  });
+
+  let pending!: Promise<void>;
+  await act(async () => {
+    pending = result.current.startSave();
+    await Promise.resolve();
+  });
+
+  await act(async () => {
+    feed.emit('p1');
+  });
+  expect(result.current.selectedIds).toEqual(['p2']);
+  expect(result.current.saveSnapshot?.counts).toEqual({
+    committed: 0,
+    terminalSkipped: 1,
+    retryableFailed: 0,
+    unknown: 0,
+    unattempted: 1,
+  });
+  expect(result.current.saveSnapshot?.ledger).toEqual([
+    { photoId: 'p1', status: 'terminalSkipped' },
+    { photoId: 'p2', status: 'unattempted' },
+  ]);
+
+  await act(async () => {
+    cleanup.resolve();
+    await pending;
+  });
+
+  expect(fake.createSession).toHaveBeenCalledTimes(1);
+  expect(fake.sessions[0].markUnavailable).toHaveBeenCalledWith('p1');
+  expect(fake.sessions[0].start).toHaveBeenCalledTimes(1);
+  expect(result.current.selectionMode).toBe(false);
+  expect(result.current.feedback?.message).toBe('1 saved, 1 unavailable.');
+});
+
 it('retains only retryable/unattempted ids after a partial result', async () => {
   const partial = snapshot({
     phase: 'completed',

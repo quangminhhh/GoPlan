@@ -100,6 +100,30 @@ function pendingSnapshot(photoIds: readonly string[]): SelectedSaveSnapshot {
   };
 }
 
+function markSnapshotUnavailable(
+  snapshot: SelectedSaveSnapshot,
+  photoId: string,
+): SelectedSaveSnapshot {
+  const ledger = snapshot.ledger.map((entry) =>
+    entry.photoId === photoId &&
+    entry.status !== 'committed' &&
+    entry.status !== 'unknown'
+      ? { ...entry, status: 'terminalSkipped' as const }
+      : entry,
+  );
+  return {
+    ...snapshot,
+    counts: {
+      committed: ledger.filter((entry) => entry.status === 'committed').length,
+      terminalSkipped: ledger.filter((entry) => entry.status === 'terminalSkipped').length,
+      retryableFailed: ledger.filter((entry) => entry.status === 'retryableFailed').length,
+      unknown: ledger.filter((entry) => entry.status === 'unknown').length,
+      unattempted: ledger.filter((entry) => entry.status === 'unattempted').length,
+    },
+    ledger,
+  };
+}
+
 function actionableIds(snapshot: SelectedSaveSnapshot): string[] {
   return snapshot.ledger
     .filter(
@@ -190,7 +214,11 @@ export function usePhotoSelection({
   const selectedRef = useRef<Set<string>>(new Set());
   const sessionRef = useRef<SelectedPhotoSaveSession | null>(null);
   const startPromiseRef = useRef<Promise<void> | null>(null);
-  const pendingActionRef = useRef<{ epoch: number; release: () => void } | null>(null);
+  const pendingActionRef = useRef<{
+    epoch: number;
+    release: () => void;
+    unavailableIds: Set<string>;
+  } | null>(null);
   const actionEpochRef = useRef(0);
   const mountedRef = useRef(true);
 
@@ -205,10 +233,6 @@ export function usePhotoSelection({
   const replaceSelected = useCallback((next: Set<string>): void => {
     selectedRef.current = next;
     setSelected(next);
-  }, []);
-
-  const clearPendingSnapshot = useCallback((): void => {
-    setSaveSnapshot(null);
   }, []);
 
   const invalidatePendingAction = useCallback((): boolean => {
@@ -230,20 +254,18 @@ export function usePhotoSelection({
       sessionRef.current?.markUnavailable(photoId);
       if (!selectedRef.current.has(photoId)) return;
 
-      const cancelledPending = invalidatePendingAction();
-      if (cancelledPending) {
-        startPromiseRef.current = null;
-        queueMicrotask(() => {
-          if (mountedRef.current && pendingActionRef.current === null) {
-            clearPendingSnapshot();
-          }
-        });
+      const pendingAction = pendingActionRef.current;
+      if (pendingAction) {
+        pendingAction.unavailableIds.add(photoId);
+        setSaveSnapshot((current) =>
+          current ? markSnapshotUnavailable(current, photoId) : current,
+        );
       }
 
       const next = new Set(selectedRef.current);
       next.delete(photoId);
       replaceSelected(next);
-      if (next.size === 0 && !sessionRef.current) {
+      if (next.size === 0 && !sessionRef.current && !pendingAction) {
         setSelectionMode(false);
         setFeedback({
           kind: 'message',
@@ -252,8 +274,6 @@ export function usePhotoSelection({
       }
     },
     [
-      clearPendingSnapshot,
-      invalidatePendingAction,
       replaceSelected,
       scope,
       scopeTicket,
@@ -294,32 +314,33 @@ export function usePhotoSelection({
     if (removed.length === 0) {
       return;
     }
-    const cancelledPending = invalidatePendingAction();
-    if (cancelledPending) {
-      startPromiseRef.current = null;
-      // The ownership fence must close synchronously; the derived presentation
-      // can clear on the next microtask without causing a cascading effect
-      // render. Guard it so a deliberate new Save tap cannot be erased.
-      queueMicrotask(() => {
-        if (mountedRef.current && pendingActionRef.current === null) {
-          clearPendingSnapshot();
-        }
-      });
-    }
+    const pendingAction = pendingActionRef.current;
     const next = new Set(selectedRef.current);
     for (const photoId of removed) {
       next.delete(photoId);
       sessionRef.current?.markUnavailable(photoId);
+      if (pendingAction) {
+        pendingAction.unavailableIds.add(photoId);
+      }
+    }
+    if (pendingAction) {
+      setSaveSnapshot((current) =>
+        removed.reduce(
+          (nextSnapshot, photoId) =>
+            nextSnapshot ? markSnapshotUnavailable(nextSnapshot, photoId) : nextSnapshot,
+          current,
+        ),
+      );
     }
     replaceSelected(next);
-    if (next.size === 0 && !sessionRef.current) {
+    if (next.size === 0 && !sessionRef.current && !pendingAction) {
       setSelectionMode(false);
       setFeedback({
         kind: 'message',
         message: `${removed.length} ${removed.length === 1 ? 'photo is' : 'photos are'} no longer available.`,
       });
     }
-  }, [clearPendingSnapshot, invalidatePendingAction, replaceSelected, tombstonedPhotoIds]);
+  }, [replaceSelected, tombstonedPhotoIds]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (state: AppStateStatus) => {
@@ -426,7 +447,7 @@ export function usePhotoSelection({
       replaceSelected(new Set(nextIds));
       setFeedback(resultFeedback(snapshot));
 
-      if (snapshot.phase === 'completed' && nextIds.length === 0) {
+      if (nextIds.length === 0) {
         sessionRef.current = null;
         await session.close('cancelled');
         if (!mountedRef.current || !scope.isCurrent(ownerTicket)) return;
@@ -478,7 +499,12 @@ export function usePhotoSelection({
     let reserved = true;
     const actionEpoch = actionEpochRef.current + 1;
     actionEpochRef.current = actionEpoch;
-    pendingActionRef.current = { epoch: actionEpoch, release: releaseAction };
+    const unavailableIds = new Set<string>();
+    pendingActionRef.current = {
+      epoch: actionEpoch,
+      release: releaseAction,
+      unavailableIds,
+    };
     setSaveSnapshot(pendingSnapshot(frozenIds));
     setFeedback(null);
     const reservedActionLock: PhotoSaveActionLock = {
@@ -528,6 +554,9 @@ export function usePhotoSelection({
       });
       pendingActionRef.current = null;
       sessionRef.current = session;
+      for (const photoId of unavailableIds) {
+        session.markUnavailable(photoId);
+      }
       setSaveSnapshot(session.getSnapshot());
 
       await session.start();

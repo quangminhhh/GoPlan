@@ -1,9 +1,11 @@
-import { act, renderHook } from '@testing-library/react-native';
+import { Suspense } from 'react';
+import { Text } from 'react-native';
+import { act, render, renderHook } from '@testing-library/react-native';
 import { createDeferred } from '@test/fakeProtectedTransport';
 import { useTripPhotoScope } from '../hooks/useTripPhotoScope';
 
 describe('useTripPhotoScope', () => {
-  it('keeps one owner and invalidates the old ticket when a new trip is observed', async () => {
+  it('keeps one committed owner and invalidates the old ticket when a new trip commits', async () => {
     const rendered = await renderHook(
       ({ tripId }: { tripId: string }) => useTripPhotoScope(tripId),
       { initialProps: { tripId: 'trip-a' } },
@@ -14,10 +16,55 @@ describe('useTripPhotoScope', () => {
     await rendered.rerender({ tripId: 'trip-b' });
 
     const tripB = rendered.result.current.capture();
-    expect(rendered.result.current).toBe(owner);
     expect(tripB).toEqual({ tripId: 'trip-b', generation: tripA.generation + 1 });
     expect(owner.isCurrent(tripA)).toBe(false);
-    expect(owner.isCurrent(tripB)).toBe(true);
+    expect(rendered.result.current.isCurrent(tripB)).toBe(true);
+  });
+
+  it('does not publish or mutate the committed ticket from an abandoned render', async () => {
+    const suspended = createDeferred<void>();
+    const committedScopes: ReturnType<typeof useTripPhotoScope>[] = [];
+
+    function Harness({ tripId, shouldSuspend }: { tripId: string; shouldSuspend: boolean }) {
+      const scope = useTripPhotoScope(tripId);
+      if (shouldSuspend) {
+        throw suspended.promise;
+      }
+      committedScopes[0] = scope;
+      return null;
+    }
+
+    const view = await render(
+      <Suspense fallback={<Text>Suspended</Text>}>
+        <Harness tripId="trip-a" shouldSuspend={false} />
+      </Suspense>,
+    );
+    const initialScope = committedScopes[0];
+    if (!initialScope) throw new Error('Expected the initial scope to commit.');
+    const tripA = initialScope.capture();
+    const listener = jest.fn();
+    initialScope.subscribeInvalidation(listener);
+
+    await view.rerender(
+      <Suspense fallback={<Text>Suspended</Text>}>
+        <Harness tripId="trip-b" shouldSuspend />
+      </Suspense>,
+    );
+
+    expect(initialScope.isCurrent(tripA)).toBe(true);
+    expect(listener).not.toHaveBeenCalled();
+
+    await view.rerender(
+      <Suspense fallback={<Text>Suspended</Text>}>
+        <Harness tripId="trip-c" shouldSuspend={false} />
+      </Suspense>,
+    );
+
+    const currentScope = committedScopes[0];
+    if (!currentScope) throw new Error('Expected Trip C scope to commit.');
+    const tripC = currentScope.capture();
+    expect(tripC).toEqual({ tripId: 'trip-c', generation: tripA.generation + 1 });
+    expect(listener).toHaveBeenCalledWith(tripA, tripC);
   });
 
   it('publishes the committed transition to subscribers', async () => {

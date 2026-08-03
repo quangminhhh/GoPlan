@@ -126,4 +126,3 @@ export async function discardAppOwnedPickerSources(
   }
   await Promise.all(Array.from(unique, (uri) => discard(uri).catch(() => undefined)));
 }
-
