@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -23,6 +24,7 @@ from chat.services import (
     add_reaction,
     build_reactions_payload,
     remove_reaction,
+    _push_reaction_update,
 )
 from test_helpers import create_completed_user
 from trips.models import MemberStatus, Trip, TripMember, TripRole, TripStatus
@@ -151,7 +153,7 @@ class AddReactionServiceTests(APITestCase):
 
     @patch("chat.services._push_reaction_update")
     def test_add_reaction_happy_path(self, mock_push):
-        reactions = add_reaction(
+        payload = add_reaction(
             user=self.member,
             trip_id=self.trip.id,
             message_id=self.message.id,
@@ -160,8 +162,10 @@ class AddReactionServiceTests(APITestCase):
         self.assertTrue(MessageReaction.objects.filter(
             message=self.message, user=self.member, emoji="❤️"
         ).exists())
-        self.assertEqual(len(reactions), 1)
-        self.assertEqual(reactions[0]["emoji"], "❤️")
+        self.assertEqual(len(payload["reactions"]), 1)
+        self.assertEqual(payload["reactions"][0]["emoji"], "❤️")
+        self.assertEqual(payload["change_sequence"], 1)
+        self.assertIsInstance(payload["updated_at"], str)
 
     def test_add_invalid_emoji_raises(self):
         with self.assertRaises(ChatReactionInvalidEmojiError):
@@ -183,6 +187,10 @@ class AddReactionServiceTests(APITestCase):
                 message_id=self.message.id,
                 emoji="❤️",
             )
+        self.trip.refresh_from_db()
+        self.message.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 0)
+        self.assertEqual(self.message.change_sequence, 0)
 
     def test_add_non_member_raises(self):
         with self.assertRaises(TripNotFoundError):
@@ -202,7 +210,7 @@ class AddReactionServiceTests(APITestCase):
             message_id=self.message.id,
             emoji="❤️",
         )
-        reactions = add_reaction(
+        payload = add_reaction(
             user=self.member,
             trip_id=self.trip.id,
             message_id=self.message.id,
@@ -214,8 +222,9 @@ class AddReactionServiceTests(APITestCase):
         self.assertTrue(MessageReaction.objects.filter(
             message=self.message, user=self.member, emoji="😂"
         ).exists())
-        self.assertEqual(len(reactions), 1)
-        self.assertEqual(reactions[0]["emoji"], "😂")
+        self.assertEqual(len(payload["reactions"]), 1)
+        self.assertEqual(payload["reactions"][0]["emoji"], "😂")
+        self.assertEqual(payload["change_sequence"], 2)
 
     def test_add_wrong_trip_message_raises(self):
         other_captain = create_completed_user("other-cap@example.com", "othcap", "OTC001")
@@ -288,7 +297,7 @@ class RemoveReactionServiceTests(APITestCase):
         MessageReaction.objects.create(
             message=self.message, user=self.member, emoji="😂"
         )
-        reactions = remove_reaction(
+        payload = remove_reaction(
             user=self.member,
             trip_id=self.trip.id,
             message_id=self.message.id,
@@ -297,7 +306,8 @@ class RemoveReactionServiceTests(APITestCase):
         self.assertFalse(MessageReaction.objects.filter(
             message=self.message, user=self.member, emoji="😂"
         ).exists())
-        self.assertEqual(reactions, [])
+        self.assertEqual(payload["reactions"], [])
+        self.assertEqual(payload["change_sequence"], 1)
 
     def test_remove_nonexistent_raises(self):
         with self.assertRaises(ChatReactionNotFoundError):
@@ -409,6 +419,8 @@ class MessageReactionAPIAddTests(APITestCase):
         self.assertEqual(len(response.data["reactions"]), 1)
         self.assertEqual(response.data["reactions"][0]["emoji"], "❤️")
         self.assertEqual(response.data["reactions"][0]["count"], 1)
+        self.assertEqual(response.data["change_sequence"], 1)
+        self.assertIsInstance(response.data["updated_at"], str)
 
     def test_add_invalid_emoji_400(self):
         response = self.client.post(
@@ -573,6 +585,8 @@ class MessageReactionAPIRemoveTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("reactions", response.data)
         self.assertEqual(response.data["reactions"], [])
+        self.assertEqual(response.data["change_sequence"], 1)
+        self.assertIsInstance(response.data["updated_at"], str)
 
     def test_delete_to_reaction_collection_url_returns_405(self):
         response = self.client.delete(
@@ -676,14 +690,15 @@ class AIMessageReactionTests(APITestCase):
             ai_status="SUCCESS",
         )
 
-        reactions = add_reaction(
+        payload = add_reaction(
             user=self.member,
             trip_id=self.trip.id,
             message_id=ai_message.id,
             emoji="👍",
         )
 
-        self.assertEqual(reactions[0]["emoji"], "👍")
+        self.assertEqual(payload["reactions"][0]["emoji"], "👍")
+        self.assertEqual(payload["change_sequence"], 1)
         self.assertTrue(
             MessageReaction.objects.filter(
                 message=ai_message,
@@ -691,3 +706,92 @@ class AIMessageReactionTests(APITestCase):
                 emoji="👍",
             ).exists()
         )
+
+
+class ReactionSequenceContractTests(APITestCase):
+
+    def setUp(self):
+        self.captain = create_completed_user(
+            "sequence-react-cap@example.com",
+            "seqreactcap",
+            "SRC001",
+        )
+        self.member = create_completed_user(
+            "sequence-react-mem@example.com",
+            "seqreactmem",
+            "SRM001",
+        )
+        self.trip = _make_trip(self.captain)
+        _add_member(self.trip, self.member)
+        self.message = _make_message(self.trip, self.captain)
+
+    @patch("chat.services._push_reaction_update")
+    def test_reversed_reaction_events_expose_current_sequence(self, mock_push):
+        newer_timestamp = timezone.now()
+        older_timestamp = newer_timestamp - timedelta(days=1)
+        callbacks = []
+
+        with patch(
+            "chat.services.transaction.on_commit",
+            side_effect=callbacks.append,
+        ):
+            with patch("chat.services.timezone.now", return_value=newer_timestamp):
+                first = add_reaction(
+                    user=self.member,
+                    trip_id=self.trip.id,
+                    message_id=self.message.id,
+                    emoji="❤️",
+                )
+            with patch("chat.services.timezone.now", return_value=older_timestamp):
+                second = add_reaction(
+                    user=self.member,
+                    trip_id=self.trip.id,
+                    message_id=self.message.id,
+                    emoji="😂",
+                )
+
+        self.assertEqual(len(callbacks), 2)
+        for callback in reversed(callbacks):
+            callback()
+
+        reversed_delivery = [
+            call.kwargs["payload"] for call in mock_push.call_args_list
+        ]
+        self.assertEqual(
+            [payload["change_sequence"] for payload in reversed_delivery],
+            [second["change_sequence"], first["change_sequence"]],
+        )
+        self.assertGreater(
+            reversed_delivery[0]["change_sequence"],
+            reversed_delivery[1]["change_sequence"],
+        )
+        self.assertLess(
+            reversed_delivery[0]["updated_at"],
+            reversed_delivery[1]["updated_at"],
+        )
+        self.message.refresh_from_db()
+        self.assertEqual(
+            self.message.change_sequence,
+            reversed_delivery[0]["change_sequence"],
+        )
+
+    @patch("chat.services.async_to_sync")
+    def test_reaction_websocket_payload_carries_sequence_and_updated_at(
+        self,
+        mock_async_to_sync,
+    ):
+        self.message.change_sequence = 42
+        self.message.updated_at = timezone.now()
+        payload = {
+            "reactions": [],
+            "change_sequence": self.message.change_sequence,
+            "updated_at": self.message.updated_at.isoformat(),
+        }
+
+        _push_reaction_update(message=self.message, payload=payload)
+
+        group_send = mock_async_to_sync.return_value
+        event = group_send.call_args.args[1]["data"]
+        self.assertEqual(event["change_sequence"], 42)
+        self.assertEqual(event["updated_at"], self.message.updated_at.isoformat())
+        self.assertEqual(event["reactions"], [])

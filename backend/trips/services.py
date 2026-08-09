@@ -825,10 +825,9 @@ def _get_visible_trip_membership(trip_id, actor, *, for_update: bool = False) ->
 
 def _get_locked_trip(trip_id, *, actor=None) -> Trip:
     if actor is not None:
-        trip, _membership = _get_visible_trip_membership(
+        trip, _membership = _get_active_trip_membership_for_update(
             trip_id,
             actor,
-            for_update=True,
         )
         return trip
     try:

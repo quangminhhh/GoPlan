@@ -3,8 +3,12 @@ from __future__ import annotations
 import uuid
 
 from django.conf import settings
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models import F, Q
+
+
+CHAT_CHANGE_SEQUENCE_MAX = 9_007_199_254_740_991
 
 
 # -------- Status / Role Choices --------
@@ -102,6 +106,13 @@ class Trip(models.Model):
         related_name="created_trips",
     )
     cancelled_at    = models.DateTimeField(null=True, blank=True)
+    chat_change_sequence = models.BigIntegerField(
+        default=0,
+        validators=[
+            MinValueValidator(0),
+            MaxValueValidator(CHAT_CHANGE_SEQUENCE_MAX),
+        ],
+    )
     created_at      = models.DateTimeField(auto_now_add=True)
     updated_at      = models.DateTimeField(auto_now=True)
 
@@ -115,7 +126,14 @@ class Trip(models.Model):
             models.CheckConstraint(
                 condition=Q(budget_estimate__isnull=True) | Q(budget_estimate__gte=0),
                 name="trip_budget_estimate_non_negative",
-            )
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(chat_change_sequence__gte=0)
+                    & Q(chat_change_sequence__lte=CHAT_CHANGE_SEQUENCE_MAX)
+                ),
+                name="trip_chat_change_sequence_safe",
+            ),
         ]
 
     def __str__(self) -> str:

@@ -78,6 +78,7 @@ class TripChatMessagesAPITests(APITestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.data["message"]["content"], "Hello API")
+        self.assertEqual(response.data["message"]["change_sequence"], 1)
         self.assertEqual(
             response.data["message"]["client_message_id"],
             str(client_message_id),
@@ -183,7 +184,63 @@ class TripChatMessagesAPITests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["results"][0]["content"], "History")
+        self.assertEqual(response.data["results"][0]["change_sequence"], 1)
         self.assertIn("next_cursor", response.data)
+
+    def test_get_changed_since_uses_sequence_contract(self):
+        self.client.post(
+            _messages_url(self.trip.id),
+            {"content": "Sequence one", "client_message_id": str(uuid4())},
+            format="json",
+            **_auth(self.member),
+        )
+        self.client.post(
+            _messages_url(self.trip.id),
+            {"content": "Sequence two", "client_message_id": str(uuid4())},
+            format="json",
+            **_auth(self.member),
+        )
+
+        response = self.client.get(
+            f"{_messages_url(self.trip.id)}?changed_since=1",
+            **_auth(self.member),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [message["content"] for message in response.data["results"]],
+            ["Sequence two"],
+        )
+        self.assertEqual(response.data["results"][0]["change_sequence"], 2)
+        self.assertFalse(response.data["has_more"])
+
+    def test_get_changed_since_id_forwards_tuple_cursor(self):
+        messages = [
+            ChatMessage.objects.create(
+                trip=self.trip,
+                sender=self.member,
+                sender_display_name_snapshot=self.member.display_name,
+                sender_identify_tag_snapshot=self.member.identify_tag,
+                content=content,
+                change_sequence=7,
+            )
+            for content in ("Legacy duplicate one", "Legacy duplicate two")
+        ]
+        ordered = sorted(messages, key=lambda message: message.id)
+
+        response = self.client.get(
+            (
+                f"{_messages_url(self.trip.id)}?changed_since=7"
+                f"&changed_since_id={ordered[0].id}"
+            ),
+            **_auth(self.member),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [message["id"] for message in response.data["results"]],
+            [str(ordered[1].id)],
+        )
 
     def test_get_terminal_trip_history_allowed(self):
         ChatMessage.objects.create(
@@ -216,6 +273,40 @@ class TripChatMessagesAPITests(APITestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data["error_code"], "INVALID_QUERY")
+
+    def test_get_rejects_mixed_timestamp_and_sequence_sync_modes(self):
+        response = self.client.get(
+            (
+                f"{_messages_url(self.trip.id)}?changed_since=0"
+                f"&updated_since={timezone.now().isoformat()}"
+            ),
+            **_auth(self.member),
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error_code"], "INVALID_QUERY")
+
+    def test_get_rejects_changed_since_id_without_sequence(self):
+        response = self.client.get(
+            f"{_messages_url(self.trip.id)}?changed_since_id={uuid4()}",
+            **_auth(self.member),
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error_code"], "INVALID_QUERY")
+
+    def test_get_rejects_changed_since_outside_safe_integer_range(self):
+        for changed_since in (-1, 9_007_199_254_740_992):
+            with self.subTest(changed_since=changed_since):
+                response = self.client.get(
+                    (
+                        f"{_messages_url(self.trip.id)}"
+                        f"?changed_since={changed_since}"
+                    ),
+                    **_auth(self.member),
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.data["error_code"], "INVALID_QUERY")
 
 
 class TripChatThrottleTests(APITestCase):

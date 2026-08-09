@@ -1,33 +1,21 @@
 from __future__ import annotations
 
-from django.db import transaction
-from django.utils import timezone
-from pydantic import ValidationError as PydanticValidationError
+from django.db import OperationalError
 from rest_framework import permissions, status
 from rest_framework import serializers as drf_serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.permissions import IsProfileCompleted
-from ai.agent.drafts import build_action_draft_payload, can_cancel_action_draft
+from ai.agent.drafts import build_action_draft_payload
 from ai.agent.draft_mutations import (
     AIActionDraftPatchFieldNotAllowedError,
     AIActionDraftTargetNotFoundError,
+    cancel_action_draft,
     patch_action_draft,
 )
-from ai.agent.schemas import (
-    ConfirmTransferReceivedArgs,
-    CreateExpenseArgs,
-    CreateTimelineActivityArgs,
-    DeleteExpenseArgs,
-    DeleteTimelineActivityArgs,
-    FinalizeSettlementArgs,
-    MarkTransferSentArgs,
-    ReopenSettlementArgs,
-    SetExpenseContributionArgs,
-    UpdateExpenseArgs,
-    UpdateTimelineActivityArgs,
-    UpdateTimelineActivityStatusArgs,
+from ai.agent.draft_validation import (
+    AIActionDraftFieldValidationError,
 )
 from ai.agent.executor import (
     AIActionDraftExpiredError,
@@ -39,7 +27,7 @@ from ai.agent.executor import (
 )
 from ai.models import AIActionDraft, AIActionDraftStatus
 from ai.serializers import AIActionDraftPatchSerializer
-from chat.services import ensure_user_can_access_trip_chat, push_chat_message
+from chat.services import ensure_user_can_access_trip_chat
 from expenses.services import (
     CollectorNotParticipantError,
     ContributionUserNotParticipantError,
@@ -68,66 +56,6 @@ from trips.services import (
 )
 
 AI_PERMISSIONS = [permissions.IsAuthenticated, IsProfileCompleted]
-
-_SCHEMA_BY_ACTION = {
-    "timeline.activity.create":             CreateTimelineActivityArgs,
-    "timeline.activity.update":             UpdateTimelineActivityArgs,
-    "timeline.activity.delete":             DeleteTimelineActivityArgs,
-    "timeline.activity.status.update":      UpdateTimelineActivityStatusArgs,
-    "expense.create":                       CreateExpenseArgs,
-    "expense.update":                       UpdateExpenseArgs,
-    "expense.delete":                       DeleteExpenseArgs,
-    "expense.contribution.set":             SetExpenseContributionArgs,
-    "settlement.finalize":                  FinalizeSettlementArgs,
-    "settlement.reopen":                    ReopenSettlementArgs,
-    "settlement.transfer.mark_sent":        MarkTransferSentArgs,
-    "settlement.transfer.confirm_received": ConfirmTransferReceivedArgs,
-}
-
-
-def _field_errors_from_pydantic(
-    exc: PydanticValidationError,
-    *,
-    relevant_fields: set[str] | None = None,
-) -> dict[str, str]:
-    """
-    Extract field errors from a PydanticValidationError.
-
-    When ``relevant_fields`` is provided, only errors relevant to those fields
-    are returned, which prevents errors about unrelated missing required fields
-    (expected during NEEDS_INFO status) from blocking the patch.
-
-    Field-level errors: included when their top-level loc key is in
-    ``relevant_fields``.
-
-    Model-level errors (empty loc, from model_validator): included when any
-    of the ``relevant_fields`` appears in the error message, and attributed
-    to the matching field(s).
-    """
-    errors = {}
-    for e in exc.errors(include_url=False):
-        loc = e["loc"]
-        msg = e["msg"]
-        if loc:
-            path = ".".join(str(p) for p in loc)
-            top_key = str(loc[0])
-            if relevant_fields is not None and top_key not in relevant_fields:
-                continue
-            errors[path] = msg
-        elif relevant_fields is not None:
-            # Model-level validator error (cross-field); attribute to any
-            # patch field mentioned in the error message.
-            for field in relevant_fields:
-                if field in msg:
-                    errors[field] = msg
-    return errors
-
-
-def _try_resolve_draft_for_validation(*, trip_id, draft_id) -> AIActionDraft | None:
-    try:
-        return AIActionDraft.objects.get(pk=draft_id, trip_id=trip_id)
-    except AIActionDraft.DoesNotExist:
-        return None
 
 
 def _error(
@@ -172,7 +100,10 @@ class AIActionDraftDetailAPIView(APIView):
         return Response({"draft": build_action_draft_payload(draft, viewer=request.user)})
 
     def patch(self, request, trip_id, draft_id):
-        serializer = AIActionDraftPatchSerializer(data=request.data)
+        serializer = AIActionDraftPatchSerializer(
+            data=request.data,
+            context={"request": request},
+        )
         serializer.is_valid(raise_exception=True)
 
         try:
@@ -185,43 +116,6 @@ class AIActionDraftDetailAPIView(APIView):
             )
 
         patch_payload = serializer.validated_data.get("payload", {})
-
-        # v2-aware payload validation: catch obviously-broken patches (e.g. end < start)
-        # before they reach the domain mutation. Surface structured field_errors.
-        # Only errors for fields present in patch_payload are surfaced — errors
-        # about unrelated missing required fields are expected during NEEDS_INFO.
-        draft_for_validation = _try_resolve_draft_for_validation(
-            trip_id=trip_id, draft_id=draft_id,
-        )
-        if draft_for_validation is not None:
-            schema = _SCHEMA_BY_ACTION.get(draft_for_validation.action_type)
-            if schema is not None and patch_payload:
-                # Exclude blank values from the merged payload: blank means
-                # "still missing" and is handled downstream by patch_action_draft.
-                non_blank_patch = {
-                    k: v for k, v in patch_payload.items()
-                    if v not in (None, "") and not (isinstance(v, str) and not v.strip())
-                }
-                if non_blank_patch:
-                    merged = {**(draft_for_validation.payload or {}), **non_blank_patch}
-                    try:
-                        schema.model_validate(merged)
-                    except PydanticValidationError as exc:
-                        field_errors = _field_errors_from_pydantic(
-                            exc, relevant_fields=set(non_blank_patch.keys()),
-                        )
-                        if field_errors:
-                            return Response(
-                                {
-                                    "detail": "Field validation failed.",
-                                    "error_code": "FIELD_VALIDATION_FAILED",
-                                    "field_errors": field_errors,
-                                    "draft": build_action_draft_payload(
-                                        draft_for_validation, viewer=request.user,
-                                    ),
-                                },
-                                status=status.HTTP_400_BAD_REQUEST,
-                            )
 
         try:
             draft = patch_action_draft(
@@ -238,8 +132,6 @@ class AIActionDraftDetailAPIView(APIView):
             )
         except AIActionDraftExpiredError as exc:
             expired_draft = _get_draft_or_404(trip_id=trip_id, draft_id=draft_id)
-            if expired_draft.response_message_id is not None:
-                push_chat_message(expired_draft.response_message)
             return _error(
                 str(exc),
                 exc.error_code,
@@ -253,11 +145,26 @@ class AIActionDraftDetailAPIView(APIView):
             return _error(str(exc), exc.error_code, status.HTTP_409_CONFLICT)
         except AIActionDraftPatchFieldNotAllowedError as exc:
             return _error(str(exc), exc.error_code, status.HTTP_400_BAD_REQUEST)
+        except AIActionDraftFieldValidationError as exc:
+            current_draft = _get_draft_or_404(
+                trip_id=trip_id,
+                draft_id=draft_id,
+            )
+            return Response(
+                {
+                    "detail": str(exc),
+                    "error_code": exc.error_code,
+                    "field_errors": exc.field_errors,
+                    "draft": build_action_draft_payload(
+                        current_draft,
+                        viewer=request.user,
+                    ),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         except AIActionDraftTargetNotFoundError as exc:
             return _error(str(exc), exc.error_code, status.HTTP_400_BAD_REQUEST)
 
-        if draft.response_message_id is not None:
-            push_chat_message(draft.response_message)
         return Response({"draft": build_action_draft_payload(draft, viewer=request.user)})
 
 
@@ -275,73 +182,35 @@ class AIActionDraftCancelAPIView(APIView):
                 status.HTTP_404_NOT_FOUND,
             )
 
-        expired_draft = None
-        with transaction.atomic():
-            try:
-                draft = (
-                    AIActionDraft.objects
-                    .select_for_update(of=("self",))
-                    .select_related("response_message")
-                    .get(pk=draft_id, trip_id=trip_id)
-                )
-            except AIActionDraft.DoesNotExist:
-                return _error(
-                    "Draft not found.",
-                    "AI_DRAFT_NOT_FOUND",
-                    status.HTTP_404_NOT_FOUND,
-                )
-
-            if (
-                draft.status in {AIActionDraftStatus.NEEDS_INFO, AIActionDraftStatus.READY}
-                and draft.expires_at <= timezone.now()
-            ):
-                draft.status = AIActionDraftStatus.EXPIRED
-                draft.save(update_fields=["status", "updated_at"])
-                if draft.response_message_id is not None:
-                    draft.response_message.updated_at = timezone.now()
-                    draft.response_message.save(update_fields=["updated_at"])
-                expired_draft = draft
-            elif draft.status in {
-                AIActionDraftStatus.CONFIRMED,
-                AIActionDraftStatus.CANCELLED,
-                AIActionDraftStatus.EXPIRED,
-                AIActionDraftStatus.FAILED,
-            }:
-                return Response({
-                    "draft": build_action_draft_payload(draft, viewer=request.user)
-                })
-            elif not can_cancel_action_draft(draft, viewer=request.user):
-                return _error(
-                    "You cannot cancel this draft.",
-                    "AI_DRAFT_FORBIDDEN",
-                    status.HTTP_403_FORBIDDEN,
-                )
-            else:
-                draft.status = AIActionDraftStatus.CANCELLED
-                draft.cancelled_by = request.user
-                draft.cancelled_at = timezone.now()
-                draft.save(
-                    update_fields=[
-                        "status",
-                        "cancelled_by",
-                        "cancelled_at",
-                        "updated_at",
-                    ]
-                )
-                if draft.response_message_id is not None:
-                    draft.response_message.updated_at = timezone.now()
-                    draft.response_message.save(update_fields=["updated_at"])
-                    transaction.on_commit(lambda: push_chat_message(draft.response_message))
-
-        if expired_draft is not None:
-            if expired_draft.response_message_id is not None:
-                push_chat_message(expired_draft.response_message)
+        try:
+            draft = cancel_action_draft(
+                draft_id=draft_id,
+                trip_id=trip_id,
+                actor=request.user,
+            )
+        except AIActionDraft.DoesNotExist:
             return _error(
-                "Draft expired.",
-                "AI_DRAFT_EXPIRED",
+                "Draft not found.",
+                "AI_DRAFT_NOT_FOUND",
+                status.HTTP_404_NOT_FOUND,
+            )
+        except AIActionDraftExpiredError as exc:
+            expired_draft = _get_draft_or_404(
+                trip_id=trip_id,
+                draft_id=draft_id,
+            )
+            return _error(
+                str(exc),
+                exc.error_code,
                 status.HTTP_409_CONFLICT,
                 draft=expired_draft,
                 viewer=request.user,
+            )
+        except AIActionDraftForbiddenError as exc:
+            return _error(
+                str(exc),
+                exc.error_code,
+                status.HTTP_403_FORBIDDEN,
             )
 
         return Response({"draft": build_action_draft_payload(draft, viewer=request.user)})
@@ -353,6 +222,14 @@ def _confirm_error_response(
     draft: AIActionDraft | None = None,
     viewer=None,
 ) -> Response | None:
+    if isinstance(exc, OperationalError):
+        # COMMIT-time failures can leave the execution outcome ambiguous. A 5xx
+        # tells clients to reconcile with GET instead of treating it as a known 409.
+        return _error(
+            "Draft execution failed.",
+            "AI_DRAFT_EXECUTION_FAILED",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
     if isinstance(exc, AIActionDraftForbiddenError):
         return _error(
             str(exc),
@@ -465,6 +342,7 @@ def _should_persist_confirm_failure(exc: Exception) -> bool:
             AIActionDraftExpiredError,
             AIActionDraftNotReadyError,
             AIActionDraft.DoesNotExist,
+            OperationalError,
             TransferNotSentError,
         ),
     )
@@ -524,8 +402,6 @@ class AIActionDraftConfirmAPIView(APIView):
                         "AI_DRAFT_NOT_FOUND",
                         status.HTTP_404_NOT_FOUND,
                     )
-                if expired_draft.response_message_id is not None:
-                    push_chat_message(expired_draft.response_message)
                 return _error(
                     str(exc),
                     exc.error_code,
@@ -538,12 +414,6 @@ class AIActionDraftConfirmAPIView(APIView):
                 trip_id=trip_id,
                 exc=exc,
             )
-            if (
-                failed_draft is not None
-                and failed_draft.status == AIActionDraftStatus.FAILED
-                and failed_draft.response_message_id is not None
-            ):
-                push_chat_message(failed_draft.response_message)
             error_draft = (
                 failed_draft
                 if failed_draft is not None
@@ -565,6 +435,4 @@ class AIActionDraftConfirmAPIView(APIView):
                 viewer=request.user,
             )
 
-        if draft.response_message_id is not None:
-            push_chat_message(draft.response_message)
         return Response({"draft": build_action_draft_payload(draft, viewer=request.user)})

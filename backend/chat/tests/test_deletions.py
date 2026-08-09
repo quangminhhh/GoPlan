@@ -119,6 +119,10 @@ class ChatMessageDeletionServiceTests(APITestCase):
 
         self.assertEqual(first, [str(self.message.id)])
         self.assertEqual(second, [str(self.message.id)])
+        self.trip.refresh_from_db()
+        self.message.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 0)
+        self.assertEqual(self.message.change_sequence, 0)
 
     def test_delete_for_everyone_tombstones_message_and_removes_reactions(self):
         MessageReaction.objects.create(message=self.message, user=self.member, emoji="👍")
@@ -134,6 +138,9 @@ class ChatMessageDeletionServiceTests(APITestCase):
         self.assertEqual(deleted.content, "")
         self.assertIsNotNone(deleted.deleted_for_everyone_at)
         self.assertEqual(deleted.deleted_for_everyone_by_id, self.captain.id)
+        self.assertEqual(deleted.change_sequence, 1)
+        self.trip.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 1)
         self.assertFalse(MessageReaction.objects.filter(message=deleted).exists())
         payload = build_chat_message_payload(deleted, viewer=self.captain)
         self.assertTrue(payload["is_deleted_for_everyone"])
@@ -141,6 +148,23 @@ class ChatMessageDeletionServiceTests(APITestCase):
         self.assertEqual(payload["reactions"], [])
         self.assertIsNone(payload["delete_for_everyone_until"])
         self.assertFalse(payload["can_delete_for_everyone"])
+
+    def test_repeated_delete_for_everyone_does_not_allocate_again(self):
+        first = delete_message_for_everyone(
+            user=self.captain,
+            trip_id=self.trip.id,
+            message_id=self.message.id,
+        )
+        second = delete_message_for_everyone(
+            user=self.captain,
+            trip_id=self.trip.id,
+            message_id=self.message.id,
+        )
+
+        self.assertEqual(first.change_sequence, 1)
+        self.assertEqual(second.change_sequence, 1)
+        self.trip.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 1)
 
     def test_updated_since_returns_delete_tombstone(self):
         before_delete = timezone.now()
@@ -161,6 +185,24 @@ class ChatMessageDeletionServiceTests(APITestCase):
         self.assertEqual([m["id"] for m in page["results"]], [str(self.message.id)])
         self.assertTrue(page["results"][0]["is_deleted_for_everyone"])
         self.assertEqual(page["results"][0]["content"], "")
+
+    def test_changed_since_returns_sequenced_delete_tombstone(self):
+        deleted = delete_message_for_everyone(
+            user=self.captain,
+            trip_id=self.trip.id,
+            message_id=self.message.id,
+        )
+
+        page = list_chat_messages(
+            user=self.member,
+            trip_id=self.trip.id,
+            changed_since=0,
+            limit=10,
+        )
+
+        self.assertEqual([m["id"] for m in page["results"]], [str(self.message.id)])
+        self.assertTrue(page["results"][0]["is_deleted_for_everyone"])
+        self.assertEqual(page["results"][0]["change_sequence"], deleted.change_sequence)
 
     def test_payload_exposes_server_delete_window_for_active_message(self):
         payload = build_chat_message_payload(self.message, viewer=self.captain)
@@ -377,6 +419,10 @@ class ChatMessageDeletionPushTests(TransactionTestCase):
         self.assertEqual(
             mock_send.call_args[0][1]["data"]["message"]["id"],
             str(message.id),
+        )
+        self.assertEqual(
+            mock_send.call_args[0][1]["data"]["message"]["change_sequence"],
+            deleted.change_sequence,
         )
 
 

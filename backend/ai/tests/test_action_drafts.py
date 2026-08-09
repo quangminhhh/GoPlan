@@ -24,6 +24,7 @@ from ai.models import (
 )
 from chat.models import ChatMessage, ChatMessageSenderKind
 from expenses.services import (
+    confirm_transfer_received,
     create_expense,
     finalize_settlement,
     mark_transfer_sent,
@@ -434,14 +435,15 @@ class AIActionDraftAPITests(APITestCase, AIActionDraftModelTests):
             expires_at=timezone.now() + timedelta(hours=24),
         )
 
-        response = self.client.post(self._cancel_url(draft.id))
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(self._cancel_url(draft.id))
 
         self.assertEqual(response.status_code, 200)
         draft.refresh_from_db()
         self.assertEqual(draft.status, AIActionDraftStatus.CANCELLED)
         self.assertEqual(draft.cancelled_by_id, self.user.id)
 
-    @patch("ai.views.push_chat_message")
+    @patch("ai.chat_changes.push_chat_message")
     def test_cancel_expired_draft_marks_expired_and_returns_conflict(self, push_chat_message):
         self.client.force_authenticate(self.user)
         draft = AIActionDraft.objects.create(
@@ -459,7 +461,8 @@ class AIActionDraftAPITests(APITestCase, AIActionDraftModelTests):
             expires_at=timezone.now() - timedelta(seconds=1),
         )
 
-        response = self.client.post(self._cancel_url(draft.id))
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(self._cancel_url(draft.id))
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.data["error_code"], "AI_DRAFT_EXPIRED")
@@ -470,7 +473,7 @@ class AIActionDraftAPITests(APITestCase, AIActionDraftModelTests):
 
 
 class AIActionDraftTransferRefreshTests(AIActionDraftModelTests):
-    @patch("ai.agent.draft_notifications.push_chat_message")
+    @patch("ai.chat_changes.push_chat_message")
     def test_manual_mark_transfer_sent_refreshes_ai_transfer_drafts(self, push_chat_message):
         member = create_completed_user(
             "agent-transfer-member@example.com",
@@ -526,16 +529,328 @@ class AIActionDraftTransferRefreshTests(AIActionDraftModelTests):
             )
 
         self.response_message.refresh_from_db()
+        self.trip.refresh_from_db()
         draft.refresh_from_db()
         self.assertGreater(self.response_message.updated_at, previous_updated_at)
+        self.assertEqual(self.trip.chat_change_sequence, 1)
+        self.assertEqual(self.response_message.change_sequence, 1)
         self.assertTrue(
             build_action_draft_payload(draft, viewer=self.user)["can_confirm"]
         )
         push_chat_message.assert_called_once()
         self.assertEqual(push_chat_message.call_args.args[0].id, self.response_message.id)
+        self.assertEqual(push_chat_message.call_args.args[0].change_sequence, 1)
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_manual_confirm_received_refreshes_ai_transfer_drafts(
+        self,
+        push_chat_message,
+    ):
+        payer = create_completed_user(
+            "agent-transfer-payer@example.com",
+            "agenttransferpayer",
+            "AID007",
+        )
+        TripMember.objects.create(
+            trip=self.trip,
+            user=payer,
+            role=TripRole.MEMBER,
+            status=MemberStatus.ACTIVE,
+        )
+        expense = create_expense(
+            trip_id=self.trip.id,
+            actor=self.user,
+            title="Dinner",
+            total_amount=Decimal("100000"),
+            collector=self.user,
+        )
+        set_contribution(
+            trip_id=self.trip.id,
+            expense_id=expense.id,
+            target_user_id=self.user.id,
+            actor=self.user,
+            amount=Decimal("100000"),
+        )
+        settlement = finalize_settlement(trip_id=self.trip.id, actor=self.user)
+        transfer = settlement.transfers.get()
+        mark_transfer_sent(
+            trip_id=self.trip.id,
+            transfer_id=transfer.id,
+            actor=payer,
+        )
+        draft = AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            requested_by=self.user,
+            action_type="settlement.transfer.confirm_received",
+            status=AIActionDraftStatus.READY,
+            payload={"transfer_id": str(transfer.id)},
+            preview={"title": "Confirm received"},
+            missing_fields=[],
+            preconditions={},
+            required_confirmation=AI_CONFIRMATION_TRANSFER_RECIPIENT,
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            confirm_transfer_received(
+                trip_id=self.trip.id,
+                transfer_id=transfer.id,
+                actor=self.user,
+            )
+
+        self.trip.refresh_from_db()
+        self.response_message.refresh_from_db()
+        draft.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 1)
+        self.assertEqual(self.response_message.change_sequence, 1)
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        push_chat_message.assert_called_once()
+        self.assertEqual(
+            push_chat_message.call_args.args[0].change_sequence,
+            1,
+        )
 
 
 class AIActionDraftPatchTests(APITestCase, AIActionDraftModelTests):
+    def _create_patch_draft(
+        self,
+        *,
+        payload=None,
+        missing_fields=None,
+        status=AIActionDraftStatus.NEEDS_INFO,
+        expires_at=None,
+    ):
+        return AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            requested_by=self.user,
+            action_type="expense.create",
+            status=status,
+            required_confirmation="CAPTAIN",
+            payload=payload if payload is not None else {"title": "Lunch"},
+            preview={"title": "Lunch"},
+            missing_fields=(
+                missing_fields
+                if missing_fields is not None
+                else [{"name": "total_amount", "label": "Amount"}]
+            ),
+            preconditions={},
+            expires_at=expires_at or timezone.now() + timedelta(hours=24),
+        )
+
+    def _assert_patch_request_is_a_true_noop(
+        self,
+        *,
+        request_data,
+        draft,
+        push_chat_message,
+    ):
+        self.client.force_authenticate(self.user)
+        original_payload = draft.payload
+        draft_updated_at = draft.updated_at
+        message_updated_at = self.response_message.updated_at
+        original_trip_sequence = self.trip.chat_change_sequence
+        original_message_sequence = self.response_message.change_sequence
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.patch(
+                f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                request_data,
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.data), {"draft"})
+        self.assertEqual(response.data["draft"]["status"], AIActionDraftStatus.NEEDS_INFO)
+        draft.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(draft.payload, original_payload)
+        self.assertEqual(draft.updated_at, draft_updated_at)
+        self.assertEqual(self.response_message.updated_at, message_updated_at)
+        self.assertEqual(
+            self.response_message.change_sequence,
+            original_message_sequence,
+        )
+        self.assertEqual(self.trip.chat_change_sequence, original_trip_sequence)
+        self.assertEqual(callbacks, [])
+        push_chat_message.assert_not_called()
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_patch_with_absent_payload_is_a_true_noop(self, push_chat_message):
+        draft = self._create_patch_draft()
+
+        self._assert_patch_request_is_a_true_noop(
+            request_data={},
+            draft=draft,
+            push_chat_message=push_chat_message,
+        )
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_patch_with_empty_payload_is_a_true_noop(self, push_chat_message):
+        draft = self._create_patch_draft()
+
+        self._assert_patch_request_is_a_true_noop(
+            request_data={"payload": {}},
+            draft=draft,
+            push_chat_message=push_chat_message,
+        )
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_patch_with_effectively_unchanged_value_is_a_true_noop(
+        self,
+        push_chat_message,
+    ):
+        draft = self._create_patch_draft(
+            payload={"title": "Lunch", "total_amount": "500000"},
+        )
+
+        self._assert_patch_request_is_a_true_noop(
+            request_data={"payload": {"total_amount": "500000"}},
+            draft=draft,
+            push_chat_message=push_chat_message,
+        )
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_empty_patch_still_expires_before_noop_return(self, push_chat_message):
+        draft = self._create_patch_draft(
+            expires_at=timezone.now() - timedelta(seconds=1),
+        )
+        self.client.force_authenticate(self.user)
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.patch(
+                f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                {},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["error_code"], "AI_DRAFT_EXPIRED")
+        self.assertEqual(response.data["draft"]["status"], AIActionDraftStatus.EXPIRED)
+        draft.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.EXPIRED)
+        self.assertEqual(self.trip.chat_change_sequence, 1)
+        self.assertEqual(self.response_message.change_sequence, 1)
+        self.assertEqual(len(callbacks), 1)
+        push_chat_message.assert_not_called()
+        callbacks[0]()
+        push_chat_message.assert_called_once()
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_empty_patch_still_checks_editable_status_before_noop_return(
+        self,
+        push_chat_message,
+    ):
+        draft = self._create_patch_draft(
+            payload={"title": "Lunch", "total_amount": "500000"},
+            missing_fields=[],
+            status=AIActionDraftStatus.READY,
+        )
+        self.client.force_authenticate(self.user)
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.patch(
+                f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                {"payload": {}},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.data,
+            {
+                "detail": "Draft is not waiting for more information.",
+                "error_code": "AI_DRAFT_NOT_READY",
+            },
+        )
+        self.trip.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 0)
+        self.assertEqual(self.response_message.change_sequence, 0)
+        self.assertEqual(callbacks, [])
+        push_chat_message.assert_not_called()
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_empty_patch_still_checks_permission_before_noop_return(
+        self,
+        push_chat_message,
+    ):
+        member = create_completed_user(
+            "agent-empty-patch-member@example.com",
+            "agentemptypatch",
+            "AEP001",
+        )
+        TripMember.objects.create(
+            trip=self.trip,
+            user=member,
+            role=TripRole.MEMBER,
+            status=MemberStatus.ACTIVE,
+        )
+        draft = self._create_patch_draft()
+        self.client.force_authenticate(member)
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.patch(
+                f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                {},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(
+            response.data,
+            {
+                "detail": "You cannot update this draft.",
+                "error_code": "AI_DRAFT_FORBIDDEN",
+            },
+        )
+        self.trip.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 0)
+        self.assertEqual(self.response_message.change_sequence, 0)
+        self.assertEqual(callbacks, [])
+        push_chat_message.assert_not_called()
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_unchanged_disallowed_field_still_errors_before_noop_return(
+        self,
+        push_chat_message,
+    ):
+        draft = self._create_patch_draft()
+        self.client.force_authenticate(self.user)
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.patch(
+                f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                {"payload": {"title": "Lunch"}},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data,
+            {
+                "detail": (
+                    "Only fields currently requested by this draft can be updated. "
+                    "Unsupported field(s): title."
+                ),
+                "error_code": "AI_DRAFT_PATCH_FIELD_NOT_ALLOWED",
+            },
+        )
+        self.trip.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 0)
+        self.assertEqual(self.response_message.change_sequence, 0)
+        self.assertEqual(callbacks, [])
+        push_chat_message.assert_not_called()
+
     def test_requester_patches_missing_fields_and_draft_becomes_ready(self):
         self.client.force_authenticate(self.user)
         draft = AIActionDraft.objects.create(
@@ -817,7 +1132,7 @@ class AIActionDraftPatchTests(APITestCase, AIActionDraftModelTests):
 class AIActionDraftDisplayAndSummaryTests(AIActionDraftModelTests):
     """Test that tool-created drafts keep display and summary after finishing."""
 
-    @patch("ai.lifecycle.push_chat_message")
+    @patch("ai.chat_changes.push_chat_message")
     def test_draft_persisted_with_display_and_summary(self, _push):
         # Arrange: put the interaction back into PENDING so finish_interaction_success can run
         self.interaction.status = AIInteractionStatus.PENDING
@@ -897,8 +1212,139 @@ class AIActionDraftPatchFieldValidationTests(APITestCase, AIActionDraftModelTest
 
         self.assertEqual(res.status_code, 400)
         self.assertEqual(res.data["error_code"], "FIELD_VALIDATION_FAILED")
+        self.assertEqual(res.data["detail"], "Field validation failed.")
         self.assertTrue(any("end_time" in k for k in res.data["field_errors"]))
         self.assertIn("draft", res.data)
+        self.assertEqual(res.data["draft"]["id"], str(draft.id))
+        self.assertEqual(
+            set(res.data),
+            {"detail", "error_code", "field_errors", "draft"},
+        )
+
+    def test_field_validation_precedes_expiry_without_mutating_snapshot(self):
+        draft = self._create_needs_info_activity_draft()
+        draft.expires_at = timezone.now() - timedelta(seconds=1)
+        draft.save(update_fields=["expires_at"])
+        self.client.force_authenticate(self.user)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {
+                "start_time": "2026-04-20T10:00:00+07:00",
+                "end_time": "2026-04-20T08:00:00+07:00",
+            }},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data["error_code"], "FIELD_VALIDATION_FAILED")
+        self.assertEqual(res.data["draft"]["status"], AIActionDraftStatus.EXPIRED)
+        draft.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(self.trip.chat_change_sequence, 0)
+        self.assertEqual(self.response_message.change_sequence, 0)
+
+    def test_field_validation_precedes_forbidden_and_preserves_current_draft(self):
+        draft = self._create_needs_info_activity_draft()
+        member = create_completed_user(
+            "agent-field-validation-member@example.com",
+            "agentfieldmember",
+            "AIF001",
+        )
+        TripMember.objects.create(
+            trip=self.trip,
+            user=member,
+            role=TripRole.MEMBER,
+            status=MemberStatus.ACTIVE,
+        )
+        self.client.force_authenticate(member)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {
+                "start_time": "2026-04-20T10:00:00+07:00",
+                "end_time": "2026-04-20T08:00:00+07:00",
+            }},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data["error_code"], "FIELD_VALIDATION_FAILED")
+        self.assertFalse(res.data["draft"]["can_edit"])
+        draft.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(self.trip.chat_change_sequence, 0)
+
+    def test_field_validation_precedes_not_editable_status(self):
+        draft = self._create_needs_info_activity_draft()
+        draft.status = AIActionDraftStatus.READY
+        draft.save(update_fields=["status"])
+        self.client.force_authenticate(self.user)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {
+                "start_time": "2026-04-20T10:00:00+07:00",
+                "end_time": "2026-04-20T08:00:00+07:00",
+            }},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data["error_code"], "FIELD_VALIDATION_FAILED")
+        self.assertEqual(res.data["draft"]["status"], AIActionDraftStatus.READY)
+        self.trip.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 0)
+
+    def test_valid_patch_forbidden_error_keeps_legacy_body_without_draft(self):
+        draft = self._create_needs_info_activity_draft()
+        member = create_completed_user(
+            "agent-valid-field-member@example.com",
+            "agentvalidmember",
+            "AIF002",
+        )
+        TripMember.objects.create(
+            trip=self.trip,
+            user=member,
+            role=TripRole.MEMBER,
+            status=MemberStatus.ACTIVE,
+        )
+        self.client.force_authenticate(member)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {
+                "start_time": "2026-04-20T08:00:00+07:00",
+                "end_time": "2026-04-20T10:00:00+07:00",
+            }},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 403)
+        self.assertEqual(res.data["error_code"], "AI_DRAFT_FORBIDDEN")
+        self.assertEqual(set(res.data), {"detail", "error_code"})
+
+    def test_valid_patch_not_editable_error_keeps_legacy_body_without_draft(self):
+        draft = self._create_needs_info_activity_draft()
+        draft.status = AIActionDraftStatus.READY
+        draft.save(update_fields=["status"])
+        self.client.force_authenticate(self.user)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {
+                "start_time": "2026-04-20T08:00:00+07:00",
+                "end_time": "2026-04-20T10:00:00+07:00",
+            }},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(res.data["error_code"], "AI_DRAFT_NOT_READY")
+        self.assertEqual(set(res.data), {"detail", "error_code"})
 
     def test_patch_valid_time_range_passes_pydantic_check(self):
         draft = self._create_needs_info_activity_draft()
@@ -985,7 +1431,7 @@ class AIActionDraftNullResponseMessageTests(APITestCase, AIActionDraftModelTests
         defaults.update(kwargs)
         return AIActionDraft.objects.create(**defaults)
 
-    @patch("ai.views.push_chat_message")
+    @patch("ai.chat_changes.push_chat_message")
     def test_patch_draft_without_response_message_does_not_crash(self, push_chat_message):
         self.client.force_authenticate(self.user)
         draft = self._make_v2_draft()
@@ -1001,7 +1447,7 @@ class AIActionDraftNullResponseMessageTests(APITestCase, AIActionDraftModelTests
         self.assertEqual(draft.payload["total_amount"], "500000")
         push_chat_message.assert_not_called()
 
-    @patch("ai.views.push_chat_message")
+    @patch("ai.chat_changes.push_chat_message")
     def test_confirm_or_cancel_paths_skip_response_message_when_null(self, push_chat_message):
         self.client.force_authenticate(self.user)
         draft = self._make_v2_draft(
