@@ -173,4 +173,3 @@ describe('PhotoUploadSheet progress and controls', () => {
     expect(screen.getByLabelText('Resume')).toBeTruthy();
   });
 });
-
