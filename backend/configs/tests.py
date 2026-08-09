@@ -1,14 +1,109 @@
 import logging
 import os
+import subprocess
+import sys
 from unittest.mock import patch
 
 from django.core.exceptions import ImproperlyConfigured
 from django.test import SimpleTestCase
 
-from configs.settings import env_int, env_positive_int
+from configs.settings import env_int, env_origins, env_positive_int
 
 
 class SettingsEnvironmentTests(SimpleTestCase):
+    def test_env_origins_parses_trimmed_explicit_origins(self):
+        with patch.dict(
+            os.environ,
+            {
+                "TEST_ALLOWED_ORIGINS": (
+                    " https://app.example.com, http://127.0.0.1:8000 "
+                )
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                env_origins("TEST_ALLOWED_ORIGINS"),
+                ("https://app.example.com", "http://127.0.0.1:8000"),
+            )
+
+    def test_env_origins_rejects_missing_or_blank_allowlist(self):
+        for value in (None, "", " , "):
+            with self.subTest(value=value):
+                environment = (
+                    {} if value is None else {"TEST_ALLOWED_ORIGINS": value}
+                )
+                with patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesMessage(
+                        ImproperlyConfigured,
+                        "TEST_ALLOWED_ORIGINS must contain at least one origin.",
+                    ):
+                        env_origins("TEST_ALLOWED_ORIGINS")
+
+    def test_env_origins_rejects_permissive_values(self):
+        for value in (
+            "*",
+            "null",
+            "https://*.example.com",
+        ):
+            with self.subTest(value=value):
+                with patch.dict(
+                    os.environ,
+                    {"TEST_ALLOWED_ORIGINS": value},
+                    clear=True,
+                ):
+                    with self.assertRaisesMessage(
+                        ImproperlyConfigured,
+                        "TEST_ALLOWED_ORIGINS must contain only explicit HTTP(S) origins.",
+                    ):
+                        env_origins("TEST_ALLOWED_ORIGINS")
+
+    def test_env_origins_rejects_non_origin_urls(self):
+        invalid_origins = (
+            "ftp://api.example.com",
+            "https://user@example.com",
+            "https://api.example.com/path",
+            "https://api.example.com?query=1",
+            "https://api.example.com#fragment",
+            "https://api.example.com:not-a-port",
+            "http://[::1",
+            "http://[]",
+            "https://bad host.example",
+            "https://example.com\\evil",
+            "https://.example.com",
+        )
+        for value in invalid_origins:
+            with self.subTest(value=value):
+                with patch.dict(
+                    os.environ,
+                    {"TEST_ALLOWED_ORIGINS": value},
+                    clear=True,
+                ):
+                    with self.assertRaisesMessage(
+                        ImproperlyConfigured,
+                        f"TEST_ALLOWED_ORIGINS contains an invalid origin: {value}.",
+                    ):
+                        env_origins("TEST_ALLOWED_ORIGINS")
+
+    def test_asgi_startup_rejects_unsafe_origin_allowlists(self):
+        cases = (
+            ("*", "must contain only explicit HTTP(S) origins"),
+            ("", "must contain at least one origin"),
+        )
+        for value, expected_error in cases:
+            with self.subTest(value=value):
+                environment = os.environ.copy()
+                environment["CORS_ALLOWED_ORIGINS"] = value
+                result = subprocess.run(
+                    [sys.executable, "-c", "import configs.asgi"],
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                    text=True,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+
     def test_env_int_uses_default_when_variable_is_missing(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(env_int("DB_CONN_MAX_AGE", 0), 0)
