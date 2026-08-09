@@ -21,7 +21,14 @@ type Props = {
 };
 
 function getChatWarning(errorCode: string | null): string | null {
-  if (errorCode === "GAP_FILL_INCOMPLETE") return "Some messages may be missing.";
+  if (
+    errorCode === "GAP_FILL_FAILED" ||
+    errorCode === "GAP_FILL_INCOMPLETE" ||
+    errorCode === "CHANGE_SYNC_FAILED" ||
+    errorCode === "CHANGE_SYNC_INCOMPLETE"
+  ) {
+    return "Some chat updates may be missing. Reconnecting will retry recovery.";
+  }
   if (errorCode === "SERVER_ERROR" || errorCode === "INVALID_PAYLOAD") {
     return "Realtime updates are unavailable.";
   }
@@ -67,8 +74,11 @@ export function ChatRoom({
 }: Props) {
   const { status: wsStatus } = useWebSocket();
   const chat = useTripChat(tripId, currentUser);
-  const isChatClosed = isTerminal || chat.sendLockReason === "terminal";
-  const chatWarning = getChatWarning(chat.errorCode);
+  const isChatClosed = isTerminal || chat.sendLockReason !== null;
+  const chatWarning =
+    chat.sendLockReason === "subscription"
+      ? "Realtime chat is unavailable. Chat is read-only until reconnect."
+      : getChatWarning(chat.errorCode);
 
   if (chat.status === "loading") {
     return (
@@ -131,7 +141,9 @@ export function ChatRoom({
       />
       {isChatClosed ? (
         <div className="border-t border-border bg-muted/40 px-3 py-3 text-center text-xs text-muted-foreground">
-          This trip is closed — sending new messages is disabled.
+          {chat.sendLockReason === "subscription"
+            ? "Realtime connection required — chat changes are temporarily disabled."
+            : "This trip is closed — sending new messages is disabled."}
         </div>
       ) : (
         <RichComposer

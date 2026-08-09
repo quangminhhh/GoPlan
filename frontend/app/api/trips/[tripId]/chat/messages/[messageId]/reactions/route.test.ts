@@ -48,7 +48,11 @@ describe("BFF /api/trips/[tripId]/chat/messages/[messageId]/reactions", () => {
     const { POST } = await import(
       "@/app/api/trips/[tripId]/chat/messages/[messageId]/reactions/route"
     );
-    const payload = { reactions: [{ emoji: "👍", count: 1, reacted_by_ids: ["u-1"] }] };
+    const payload = {
+      reactions: [{ emoji: "👍", count: 1, reacted_by_ids: ["u-1"] }],
+      change_sequence: 42,
+      updated_at: "2026-08-10T12:00:00Z",
+    };
     protectedUpstreamMock.protectedUpstreamCall.mockResolvedValue({
       ok: true,
       data: payload,
@@ -69,5 +73,18 @@ describe("BFF /api/trips/[tripId]/chat/messages/[messageId]/reactions", () => {
         authorization: "Bearer t",
       }),
     );
+  });
+
+  it("rejects malformed trip IDs without forwarding the reaction", async () => {
+    const { POST } = await import(
+      "@/app/api/trips/[tripId]/chat/messages/[messageId]/reactions/route"
+    );
+
+    const response = await POST(buildPostRequest({ emoji: "👍" }) as never, {
+      params: Promise.resolve({ tripId: "invalid", messageId: MESSAGE_ID }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(protectedUpstreamMock.protectedUpstreamCall).not.toHaveBeenCalled();
   });
 });

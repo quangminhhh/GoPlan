@@ -11,7 +11,7 @@ const chatMock = vi.hoisted(() => ({
     messages: [] as ChatMessage[],
     pendingClientIds: new Set<string>(),
     failedClientIds: new Set<string>(),
-    sendLockReason: null as "terminal" | null,
+    sendLockReason: null as "terminal" | "subscription" | null,
     hasMoreOlder: false,
     isLoadingOlder: false,
     isSending: false,
@@ -59,6 +59,7 @@ function makeMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
     client_message_id: null,
     created_at: "2026-05-08T10:00:00Z",
     updated_at: "2026-05-08T10:00:00Z",
+    change_sequence: 1,
     is_deleted_for_everyone: false,
     deleted_for_everyone_at: null,
     deleted_for_everyone_by_id: null,
@@ -126,6 +127,24 @@ describe("ChatRoom", () => {
 
     expect(screen.getByText("Realtime updates are unavailable.")).toBeDefined();
     expect(screen.getByLabelText("Message")).toBeDefined();
+  });
+
+  it("surfaces exhausted recovery so reconnect provides a visible retry path", () => {
+    chatMock.state.errorCode = "CHANGE_SYNC_FAILED";
+
+    render(
+      <ChatRoom
+        tripId="trip-1"
+        isTerminal={false}
+        currentUser={CURRENT_USER}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "Some chat updates may be missing. Reconnecting will retry recovery.",
+      ),
+    ).toBeDefined();
   });
 
   it("surfaces delete-window errors as a visible room warning", () => {
@@ -205,5 +224,28 @@ describe("ChatRoom", () => {
     expect(screen.queryByRole("button", { name: "Add reaction" })).toBeNull();
     const reactionButton = screen.getByRole("button", { name: "👍 1" });
     expect((reactionButton as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("keeps retained history read-only while realtime subscription is rejected", () => {
+    chatMock.state.messages = [makeMessage()];
+    chatMock.state.errorCode = "SUBSCRIPTION_LIMIT_REACHED";
+    chatMock.state.sendLockReason = "subscription";
+
+    render(
+      <ChatRoom
+        tripId="trip-1"
+        isTerminal={false}
+        currentUser={CURRENT_USER}
+      />,
+    );
+
+    expect(screen.getByText("hello")).toBeDefined();
+    expect(
+      screen.getByText(
+        "Realtime chat is unavailable. Chat is read-only until reconnect.",
+      ),
+    ).toBeDefined();
+    expect(screen.queryByLabelText("Message")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add reaction" })).toBeNull();
   });
 });

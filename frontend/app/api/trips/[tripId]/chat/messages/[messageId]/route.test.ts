@@ -71,4 +71,18 @@ describe("BFF /api/trips/[tripId]/chat/messages/[messageId]", () => {
       }),
     );
   });
+
+  it("rejects malformed trip IDs without forwarding delete", async () => {
+    const { DELETE } = await import(
+      "@/app/api/trips/[tripId]/chat/messages/[messageId]/route"
+    );
+
+    const response = await DELETE(
+      buildDeleteRequest({ mode: "for_everyone" }) as never,
+      { params: Promise.resolve({ tripId: "invalid", messageId: MESSAGE_ID }) },
+    );
+
+    expect(response.status).toBe(400);
+    expect(protectedUpstreamMock.protectedUpstreamCall).not.toHaveBeenCalled();
+  });
 });

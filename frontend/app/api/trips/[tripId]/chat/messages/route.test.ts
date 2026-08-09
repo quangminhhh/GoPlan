@@ -204,7 +204,7 @@ describe("BFF /api/trips/[tripId]/chat/messages", () => {
     });
   });
 
-  it("forwards updated_since param on GET mutation sync", async () => {
+  it("forwards changed_since sequence params for mutation sync", async () => {
     const { GET } = await import(
       "@/app/api/trips/[tripId]/chat/messages/route"
     );
@@ -218,15 +218,55 @@ describe("BFF /api/trips/[tripId]/chat/messages", () => {
 
     await GET(
       buildGetRequest(
-        `?updated_since=2026-05-08T10%3A00%3A00.000Z&updated_since_id=${lastMessageId}&limit=100`,
+        `?changed_since=42&changed_since_id=${lastMessageId}&limit=100`,
       ) as never,
       { params: Promise.resolve({ tripId: TRIP_ID }) },
     );
 
     expect(protectedUpstreamMock.protectedUpstreamCall).toHaveBeenCalledWith(
       expect.objectContaining({
-        query: `updated_since=2026-05-08T10%3A00%3A00.000Z&updated_since_id=${lastMessageId}&limit=100`,
+        query: `changed_since=42&changed_since_id=${lastMessageId}&limit=100`,
       }),
     );
+  });
+
+  it("canonicalizes uppercase trip UUIDs before calling Django", async () => {
+    const { GET } = await import(
+      "@/app/api/trips/[tripId]/chat/messages/route"
+    );
+    protectedUpstreamMock.protectedUpstreamCall.mockResolvedValue({
+      ok: true,
+      data: { results: [], next_cursor: null },
+      status: 200,
+    });
+
+    await GET(buildGetRequest() as never, {
+      params: Promise.resolve({ tripId: TRIP_ID.toUpperCase() }),
+    });
+
+    expect(protectedUpstreamMock.protectedUpstreamCall).toHaveBeenCalledWith(
+      expect.objectContaining({ path: `/api/trips/${TRIP_ID}/chat/messages` }),
+    );
+  });
+
+  it("rejects malformed trip IDs without issuing an upstream request", async () => {
+    const { GET, POST } = await import(
+      "@/app/api/trips/[tripId]/chat/messages/route"
+    );
+
+    const getResponse = await GET(buildGetRequest() as never, {
+      params: Promise.resolve({ tripId: "not-a-uuid" }),
+    });
+    const postResponse = await POST(buildPostRequest({ content: "hi" }) as never, {
+      params: Promise.resolve({ tripId: "" }),
+    });
+
+    expect(getResponse.status).toBe(400);
+    expect(postResponse.status).toBe(400);
+    await expect(getResponse.json()).resolves.toEqual({
+      detail: "Trip ID is invalid.",
+      error_code: "INVALID_TRIP_ID",
+    });
+    expect(protectedUpstreamMock.protectedUpstreamCall).not.toHaveBeenCalled();
   });
 });
