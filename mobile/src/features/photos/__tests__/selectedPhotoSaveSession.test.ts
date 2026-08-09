@@ -271,7 +271,7 @@ describe('selected save worklist and runner ownership', () => {
     expect(selectedPrimitive).toHaveBeenCalledTimes(1);
   });
 
-  it('requests permission once for the whole session across explicit retry', async () => {
+  it('requests permission once per attempt and rechecks it across explicit retry', async () => {
     const harness = await createHarness();
     let attempt = 0;
     const savePhoto = createSavePhoto(async () => {
@@ -286,7 +286,7 @@ describe('selected save worklist and runner ownership', () => {
     expect(session.getSnapshot().counts.retryableFailed).toBe(1);
     await session.start();
 
-    expect(harness.requestPermission).toHaveBeenCalledTimes(1);
+    expect(harness.requestPermission).toHaveBeenCalledTimes(2);
     expect(savePhoto).toHaveBeenCalledTimes(2);
     expect(session.getSnapshot().counts.committed).toBe(1);
   });
@@ -362,7 +362,6 @@ describe('selected save worklist and runner ownership', () => {
     const session = createSession(harness, ['photo-1', 'photo-2'], savePhoto);
 
     await session.start();
-    await session.start();
 
     expect(savePhoto).not.toHaveBeenCalled();
     expect(harness.requestPermission).toHaveBeenCalledTimes(1);
@@ -370,6 +369,43 @@ describe('selected save worklist and runner ownership', () => {
       phase: 'completed',
       permissionDenied: { canAskAgain },
       counts: { unattempted: 2 },
+    });
+  });
+
+  it('observes a Settings permission grant when retrying the existing session', async () => {
+    const harness = await createHarness();
+    harness.requestPermission
+      .mockResolvedValueOnce({
+        granted: false,
+        canAskAgain: false,
+        status: 'denied',
+      })
+      .mockResolvedValueOnce({
+        granted: true,
+        canAskAgain: false,
+        status: 'granted',
+      });
+    const savePhoto = createSavePhoto(async () => ({ status: 'committed' }));
+    const session = createSession(harness, ['photo-1'], savePhoto);
+
+    await session.start();
+    expect(session.getSnapshot()).toMatchObject({
+      phase: 'completed',
+      permissionDenied: { canAskAgain: false },
+      counts: { committed: 0, unattempted: 1 },
+    });
+
+    // Simulates returning from Open Settings and pressing Retry. The hook
+    // intentionally retains this same session, so start() must ask natively
+    // again instead of reusing the first denial.
+    await session.start();
+
+    expect(harness.requestPermission).toHaveBeenCalledTimes(2);
+    expect(savePhoto).toHaveBeenCalledTimes(1);
+    expect(session.getSnapshot()).toMatchObject({
+      phase: 'completed',
+      permissionDenied: null,
+      counts: { committed: 1, unattempted: 0 },
     });
   });
 });
@@ -741,7 +777,7 @@ describe('selected save cancellation and background behavior', () => {
 
     await session.start();
     expect(savePhoto).toHaveBeenCalledTimes(3);
-    expect(harness.requestPermission).toHaveBeenCalledTimes(1);
+    expect(harness.requestPermission).toHaveBeenCalledTimes(2);
     expect(session.getSnapshot().counts.committed).toBe(2);
   });
 

@@ -140,6 +140,36 @@ function createTombstoneFeed() {
   };
 }
 
+it('enters selection mode from the header without preselecting a photo', async () => {
+  const { result } = await renderHook(() => usePhotoSelection(options()));
+
+  await act(async () => {
+    result.current.enterSelectionMode();
+  });
+
+  expect(result.current.selectionMode).toBe(true);
+  expect(result.current.selectedIds).toEqual([]);
+  expect(result.current.selectedCount).toBe(0);
+});
+
+it('does not enter header selection without a usable photo or a current trip scope', async () => {
+  const empty = await renderHook(() =>
+    usePhotoSelection(options({ photos: [] })),
+  );
+  await act(async () => {
+    empty.result.current.enterSelectionMode();
+  });
+  expect(empty.result.current.selectionMode).toBe(false);
+
+  const scope = createScope();
+  const stale = await renderHook(() => usePhotoSelection(options({ scope })));
+  scope.invalidate('trip-2');
+  await act(async () => {
+    stale.result.current.enterSelectionMode();
+  });
+  expect(stale.result.current.selectionMode).toBe(false);
+});
+
 it('keeps ordered selection, enforces 100, and adds loaded ids without dropping deep ids', async () => {
   const photos = Array.from({ length: 130 }, (_unused, index) => photo(`p${index}`));
   const { result } = await renderHook(() => usePhotoSelection(options({ photos })));
@@ -355,6 +385,85 @@ it('retains only retryable/unattempted ids after a partial result', async () => 
   expect(result.current.selectionMode).toBe(true);
   expect(result.current.selectedIds).toEqual(['retry', 'rest']);
   expect(result.current.feedback?.message).toContain('Check Photos');
+});
+
+it('routes Retry through the retained session after a Settings permission denial', async () => {
+  const denied = snapshot({
+    phase: 'completed',
+    total: 1,
+    counts: {
+      committed: 0,
+      terminalSkipped: 0,
+      retryableFailed: 0,
+      unknown: 0,
+      unattempted: 1,
+    },
+    ledger: [{ photoId: 'p1', status: 'unattempted' }],
+    permissionDenied: { canAskAgain: false },
+  });
+  const committed = snapshot({
+    phase: 'completed',
+    total: 1,
+    counts: {
+      committed: 1,
+      terminalSkipped: 0,
+      retryableFailed: 0,
+      unknown: 0,
+      unattempted: 0,
+    },
+    ledger: [{ photoId: 'p1', status: 'committed' }],
+  });
+  let current = snapshot({
+    total: 1,
+    counts: {
+      committed: 0,
+      terminalSkipped: 0,
+      retryableFailed: 0,
+      unknown: 0,
+      unattempted: 1,
+    },
+    ledger: [{ photoId: 'p1', status: 'unattempted' }],
+  });
+  let attempt = 0;
+  const sessions: SelectedPhotoSaveSession[] = [];
+  const createSession = jest.fn((sessionOptions: CreateSelectedPhotoSaveSessionOptions) => {
+    const session: SelectedPhotoSaveSession = {
+      getSnapshot: () => current,
+      start: jest.fn(async () => {
+        current = attempt === 0 ? denied : committed;
+        attempt += 1;
+        sessionOptions.onSnapshot?.(current);
+      }),
+      pause: jest.fn(),
+      stop: jest.fn(),
+      markUnavailable: jest.fn(),
+      close: jest.fn(async () => undefined),
+    };
+    sessions.push(session);
+    sessionOptions.onSnapshot?.(current);
+    return session;
+  });
+  const { result } = await renderHook(() =>
+    usePhotoSelection(options({ createSession })),
+  );
+
+  await act(async () => {
+    result.current.enterSelection('p1');
+    await result.current.startSave();
+  });
+  expect(result.current.saveSnapshot?.permissionDenied).toEqual({ canAskAgain: false });
+  expect(result.current.selectedIds).toEqual(['p1']);
+
+  // Opening Settings does not replace the selection runner. Retry must call
+  // start() on this same session, whose permission check is attempt-scoped.
+  await act(async () => {
+    await result.current.startSave();
+  });
+
+  expect(createSession).toHaveBeenCalledTimes(1);
+  expect(sessions[0].start).toHaveBeenCalledTimes(2);
+  expect(result.current.selectionMode).toBe(false);
+  expect(result.current.selectedIds).toEqual([]);
 });
 
 it('keeps an unknown warning detached and exposes no actionable unknown id', async () => {

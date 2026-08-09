@@ -131,8 +131,8 @@ export function SessionProvider({ children }: PropsWithChildren) {
       // request or render a protected route.
       await startPrivateMediaSession(appAllowsPrivateMedia());
       if (cancelled || !isAuthTicketCurrent(ticket) || !isPrivateMediaSessionOpen()) {
-        if (cancelled && isAuthTicketCurrent(ticket)) {
-          void requestAuthSessionClose('restoreFailure');
+        if (isAuthTicketCurrent(ticket)) {
+          await requestAuthSessionClose('restoreFailure');
         }
         return;
       }

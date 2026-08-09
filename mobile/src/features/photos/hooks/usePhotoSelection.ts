@@ -61,6 +61,7 @@ export interface UsePhotoSelectionResult {
   selectedCount: number;
   saveSnapshot: SelectedSaveSnapshot | null;
   feedback: SelectionSaveFeedback | null;
+  enterSelectionMode: () => void;
   enterSelection: (photoId: string) => void;
   toggle: (photoId: string) => void;
   isSelected: (photoId: string) => boolean;
@@ -344,20 +345,38 @@ export function usePhotoSelection({
     return () => subscription.remove();
   }, [invalidatePendingAction]);
 
+  const selectionEntryIsOpen = useCallback(
+    (): boolean =>
+      scope.isCurrent(scopeTicket) &&
+      !selectionMode &&
+      !sessionRef.current &&
+      !pendingActionRef.current &&
+      !saveSnapshot,
+    [saveSnapshot, scope, scopeTicket, selectionMode],
+  );
+
+  const enterSelectionMode = useCallback(() => {
+    if (
+      !selectionEntryIsOpen() ||
+      !photos.some((photo) => !tombstonedPhotoIds.has(photo.id))
+    ) {
+      return;
+    }
+    setSelectionMode(true);
+    replaceSelected(new Set());
+    setSaveSnapshot(null);
+    setFeedback(null);
+  }, [photos, replaceSelected, selectionEntryIsOpen, tombstonedPhotoIds]);
+
   const enterSelection = useCallback(
     (photoId: string) => {
-      if (
-        sessionRef.current ||
-        pendingActionRef.current ||
-        saveSnapshot ||
-        tombstonedPhotoIds.has(photoId)
-      ) return;
+      if (!selectionEntryIsOpen() || tombstonedPhotoIds.has(photoId)) return;
       setSelectionMode(true);
       replaceSelected(new Set([photoId]));
       setSaveSnapshot(null);
       setFeedback(null);
     },
-    [replaceSelected, saveSnapshot, tombstonedPhotoIds],
+    [replaceSelected, selectionEntryIsOpen, tombstonedPhotoIds],
   );
 
   const toggle = useCallback(
@@ -586,6 +605,7 @@ export function usePhotoSelection({
     selectedCount: stateMatchesTrip ? selected.size : 0,
     saveSnapshot: stateMatchesTrip ? saveSnapshot : null,
     feedback: stateMatchesTrip ? feedback : null,
+    enterSelectionMode,
     enterSelection,
     toggle,
     isSelected,

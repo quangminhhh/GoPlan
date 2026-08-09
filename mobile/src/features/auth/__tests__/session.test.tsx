@@ -36,6 +36,8 @@ import * as SecureStore from 'expo-secure-store';
 // eslint-disable-next-line import/first
 import type { PropsWithChildren } from 'react';
 // eslint-disable-next-line import/first
+import { AppState, type AppStateStatus } from 'react-native';
+// eslint-disable-next-line import/first
 import {
   __resetAuthSessionLifecycleForTests,
   beginAuthCredentialRotation,
@@ -53,7 +55,10 @@ import { getAccessToken, getRefreshToken } from '@/shared/api/token-store';
 import {
   __resetPrivateMediaLifecycleForTests,
   isPrivateMediaSessionOpen,
+  registerPrivateMediaPurger,
 } from '@/shared/media/privateMediaLifecycle';
+// eslint-disable-next-line import/first
+import { purgeProtectedAssets } from '@/shared/media/protectedAssetStore';
 // eslint-disable-next-line import/first
 import { photoSaveTempCoordinator } from '@/shared/media/photoSaveTempStore';
 // eslint-disable-next-line import/first
@@ -123,9 +128,14 @@ beforeEach(() => {
   __resetPrivateMediaLifecycleForTests();
   secureStore.clear();
   jest.clearAllMocks();
+  jest.spyOn(AppState, 'addEventListener').mockReturnValue({ remove: jest.fn() });
   mockFetchMe.mockResolvedValue(user);
   mockLogout.mockResolvedValue(undefined);
   installSuccessfulRotation();
+});
+
+afterEach(() => {
+  jest.restoreAllMocks();
 });
 
 describe('SessionProvider', () => {
@@ -147,6 +157,50 @@ describe('SessionProvider', () => {
     expect(mockFetchMe).not.toHaveBeenCalled();
     expect(getAuthSnapshot().phase).toBe('signedOut');
     expect(isPrivateMediaSessionOpen()).toBe(false);
+  });
+
+  it('closes restore when backgrounding shuts the media gate during startup purge', async () => {
+    const purgeStarted = deferred<void>();
+    const purgeGate = deferred<void>();
+    let appStateListener: ((state: AppStateStatus) => void) | undefined;
+    jest.spyOn(AppState, 'addEventListener').mockImplementation((_type, listener) => {
+      appStateListener = listener;
+      return { remove: jest.fn() };
+    });
+    registerPrivateMediaPurger('protected-assets', async () => {
+      purgeStarted.resolve();
+      await purgeGate.promise;
+    });
+    restoreWith({ access: 'access-1', refresh: 'refresh-1' });
+    let unmount: (() => Promise<void>) | undefined;
+
+    try {
+      const rendered = await renderHook(useSession, { wrapper });
+      const { result } = rendered;
+      unmount = rendered.unmount;
+      await purgeStarted.promise;
+      expect(appStateListener).toBeDefined();
+
+      await act(async () => {
+        appStateListener?.('background');
+      });
+      expect(result.current.status).toBe('restoring');
+      expect(getAuthSnapshot().phase).toBe('opening');
+      expect(isPrivateMediaSessionOpen()).toBe(false);
+
+      await act(async () => {
+        purgeGate.resolve();
+      });
+
+      await waitFor(() => expect(result.current.status).toBe('signedOut'));
+      await waitFor(() => expect(getAuthSnapshot().phase).toBe('signedOut'));
+      expect(isPrivateMediaSessionOpen()).toBe(false);
+      expect(mockRefresh).not.toHaveBeenCalled();
+    } finally {
+      purgeGate.resolve();
+      await unmount?.();
+      registerPrivateMediaPurger('protected-assets', purgeProtectedAssets);
+    }
   });
 
   it('persists and publishes sign-in credentials in coordinator order', async () => {

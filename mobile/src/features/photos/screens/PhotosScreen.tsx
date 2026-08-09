@@ -81,10 +81,6 @@ export function PhotosScreen() {
     onTripNotFound: handleTripNotFound,
   });
 
-  const startPicking = useCallback(() => {
-    void pickPhotos();
-  }, [pickPhotos]);
-
   const closeUpload = useCallback(() => {
     void closeUploadSession();
   }, [closeUploadSession]);
@@ -143,6 +139,7 @@ export function PhotosScreen() {
     selectedCount,
     saveSnapshot: selectionSaveSnapshot,
     feedback: selectionFeedback,
+    enterSelectionMode,
     enterSelection,
     toggle: toggleSelection,
     isSelected,
@@ -163,6 +160,32 @@ export function PhotosScreen() {
     onTripUnavailable: handleTripNotFound,
     resolveAmbiguousNotFound: resolveAssetNotFound,
   });
+
+  const selectionActionActive = selectionMode || selectionSaveSnapshot !== null;
+  const uploadDisabled = uploadPicking || uploadSnapshot !== null || selectionActionActive;
+  const selectionEntryDisabled =
+    uploadPicking ||
+    uploadSnapshot !== null ||
+    selectionActionActive ||
+    photos.every((photo) => tombstonedPhotoIds.has(photo.id));
+
+  const startPicking = useCallback(() => {
+    if (uploadDisabled) return;
+    void pickPhotos();
+  }, [pickPhotos, uploadDisabled]);
+
+  const handleEnterSelectionMode = useCallback(() => {
+    if (selectionEntryDisabled) return;
+    enterSelectionMode();
+  }, [enterSelectionMode, selectionEntryDisabled]);
+
+  const handleEnterSelection = useCallback(
+    (photoId: string) => {
+      if (selectionEntryDisabled) return;
+      enterSelection(photoId);
+    },
+    [enterSelection, selectionEntryDisabled],
+  );
 
   // A long press enters selection mode rather than opening the photo, and a tap
   // toggles only while selection mode is on.
@@ -259,12 +282,38 @@ export function PhotosScreen() {
     <Pressable
       accessibilityRole="button"
       accessibilityLabel="Upload photos"
-      disabled={uploadPicking}
+      accessibilityState={{ disabled: uploadDisabled }}
+      disabled={uploadDisabled}
       onPress={startPicking}
       style={styles.action}
     >
-      <Text style={styles.actionText}>Upload</Text>
+      <Text style={[styles.actionText, uploadDisabled && styles.disabledActionText]}>Upload</Text>
     </Pressable>
+  );
+
+  const headerActions = (
+    <View style={styles.headerActions}>
+      {uploadAction}
+      {!selectionMode ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Select photos"
+          accessibilityState={{ disabled: selectionEntryDisabled }}
+          disabled={selectionEntryDisabled}
+          onPress={handleEnterSelectionMode}
+          style={styles.action}
+        >
+          <Text
+            style={[
+              styles.actionText,
+              selectionEntryDisabled && styles.disabledActionText,
+            ]}
+          >
+            Select
+          </Text>
+        </Pressable>
+      ) : null}
+    </View>
   );
 
   const uploadSheet = uploadSnapshot ? (
@@ -273,6 +322,21 @@ export function PhotosScreen() {
       onStart={startUpload}
       onStop={stopUpload}
       onClose={closeUpload}
+    />
+  ) : null;
+
+  const selectionBar = selectionMode ? (
+    <PhotoSelectionBar
+      selectedCount={selectedCount}
+      loadedCount={photos.length}
+      saveSnapshot={selectionSaveSnapshot}
+      feedback={selectionFeedback}
+      onSelectLoaded={selectLoaded}
+      onClear={clearSelection}
+      onExit={exitSelection}
+      onSave={handleStartSelectionSave}
+      onCancelSave={cancelSelectionSave}
+      onHeightChange={setSelectionBarHeight}
     />
   ) : null;
 
@@ -303,8 +367,11 @@ export function PhotosScreen() {
             onEndReached={handleEndReached}
             onRetryPage={handleRetryPage}
             onPhotoPress={handleTilePress}
-            onPhotoLongPress={enterSelection}
+            onPhotoLongPress={selectionEntryDisabled ? undefined : handleEnterSelection}
             onAssetNotFound={handleAssetNotFound}
+            selectionMode={selectionMode}
+            isSelected={isSelected}
+            bottomInset={selectionMode ? selectionBarHeight : 0}
             ListEmptyComponent={
               <View style={styles.emptyList} testID="photos-empty">
                 <Text style={styles.emptyTitle}>No photos yet</Text>
@@ -312,15 +379,19 @@ export function PhotosScreen() {
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel="Upload photos"
-                  disabled={uploadPicking}
+                  accessibilityState={{ disabled: uploadDisabled }}
+                  disabled={uploadDisabled}
                   onPress={startPicking}
                   style={styles.action}
                 >
-                  <Text style={styles.actionText}>Upload photos</Text>
+                  <Text style={[styles.actionText, uploadDisabled && styles.disabledActionText]}>
+                    Upload photos
+                  </Text>
                 </Pressable>
               </View>
             }
           />
+          {selectionBar}
         </View>
         {uploadSheet}
         {detachedFeedback ? (
@@ -337,7 +408,7 @@ export function PhotosScreen() {
 
   return (
     <Screen edges={['bottom']}>
-      <Stack.Screen options={{ headerRight: () => uploadAction }} />
+      <Stack.Screen options={{ headerRight: () => headerActions }} />
       <View style={styles.fill}>
         {inlineError ? (
           <View style={styles.banner} testID="photos-inline-error">
@@ -355,26 +426,13 @@ export function PhotosScreen() {
           onEndReached={handleEndReached}
           onRetryPage={handleRetryPage}
           onPhotoPress={handleTilePress}
-          onPhotoLongPress={enterSelection}
+          onPhotoLongPress={selectionEntryDisabled ? undefined : handleEnterSelection}
           onAssetNotFound={handleAssetNotFound}
           selectionMode={selectionMode}
           isSelected={isSelected}
           bottomInset={selectionMode ? selectionBarHeight : 0}
         />
-        {selectionMode ? (
-          <PhotoSelectionBar
-            selectedCount={selectedCount}
-            loadedCount={photos.length}
-            saveSnapshot={selectionSaveSnapshot}
-            feedback={selectionFeedback}
-            onSelectLoaded={selectLoaded}
-            onClear={clearSelection}
-            onExit={exitSelection}
-            onSave={handleStartSelectionSave}
-            onCancelSave={cancelSelectionSave}
-            onHeightChange={setSelectionBarHeight}
-          />
-        ) : null}
+        {selectionBar}
       </View>
       {uploadSheet}
       {currentPhoto && !selectionMode ? (
@@ -427,6 +485,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
   },
   actionText: { ...typography.label, color: colors.primary },
+  disabledActionText: { color: colors.textMuted },
+  headerActions: { alignItems: 'center', flexDirection: 'row', gap: spacing.xs },
   banner: {
     backgroundColor: colors.warningSoft,
     marginHorizontal: spacing.lg,

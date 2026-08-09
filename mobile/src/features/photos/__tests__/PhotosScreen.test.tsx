@@ -11,7 +11,12 @@ const mockPhotoScope = {
 
 jest.mock('expo-router', () => ({
   useLocalSearchParams: () => ({ tripId: 'trip-1' }),
-  Stack: { Screen: () => null },
+  Stack: {
+    Screen: (props: unknown) => {
+      const { options } = props as { options?: { headerRight?: () => null } };
+      return options?.headerRight?.() ?? null;
+    },
+  },
 }));
 
 jest.mock('../hooks/usePhotoUpload', () => ({
@@ -134,6 +139,7 @@ function selectionState(overrides: Record<string, unknown> = {}) {
     selectedCount: 0,
     saveSnapshot: null,
     feedback: null,
+    enterSelectionMode: jest.fn(),
     enterSelection: jest.fn(),
     toggle: jest.fn(),
     isSelected: jest.fn(() => false),
@@ -178,6 +184,7 @@ it('shows the empty state when the trip has no photos yet', async () => {
 
   expect(screen.getByTestId('photos-empty')).toBeTruthy();
   expect(screen.getByText('No photos yet')).toBeTruthy();
+  expect(screen.queryByLabelText('Select photos')).toBeNull();
 });
 
 it('offers a retry when the first load failed', async () => {
@@ -319,6 +326,172 @@ it('offers an upload affordance from the empty state', async () => {
   await fireEvent.press(screen.getByText('Upload photos'));
 
   expect(pick).toHaveBeenCalledTimes(1);
+});
+
+it('keeps retained selection controls reachable when the gallery becomes empty', async () => {
+  const pick = jest.fn(async () => undefined);
+  const exit = jest.fn();
+  const startSave = jest.fn(async () => undefined);
+  mockUseTripPhotos.mockReturnValue(hookState());
+  mockUsePhotoUpload.mockReturnValue(uploadState({ pick }));
+  mockUsePhotoSelection.mockReturnValue(
+    selectionState({
+      selectionMode: true,
+      selectedIds: ['p1'],
+      selectedCount: 1,
+      saveSnapshot: {
+        phase: 'completed',
+        stage: null,
+        total: 1,
+        currentOrdinal: null,
+        counts: {
+          committed: 0,
+          terminalSkipped: 0,
+          retryableFailed: 0,
+          unknown: 0,
+          unattempted: 1,
+        },
+        ledger: [{ photoId: 'p1', status: 'unattempted' }],
+        failure: null,
+        permissionDenied: { canAskAgain: false },
+      },
+      exit,
+      startSave,
+    }),
+  );
+  await render(<PhotosScreen />);
+
+  expect(screen.getByTestId('photos-empty')).toBeTruthy();
+  expect(screen.getByTestId('photo-selection-bar')).toBeTruthy();
+  const uploadActions = screen.getAllByLabelText('Upload photos');
+  expect(uploadActions).toHaveLength(2);
+  for (const upload of uploadActions) {
+    expect(upload.props.accessibilityState).toEqual({ disabled: true });
+    await fireEvent.press(upload);
+  }
+  await fireEvent.press(screen.getByLabelText('Retry'));
+  await fireEvent.press(screen.getByLabelText('Exit selection'));
+
+  expect(pick).not.toHaveBeenCalled();
+  expect(startSave).toHaveBeenCalledTimes(1);
+  expect(exit).toHaveBeenCalledTimes(1);
+});
+
+it('offers Select in the header and enters selection mode without preselecting a photo', async () => {
+  const enterSelectionMode = jest.fn();
+  const enterSelection = jest.fn();
+  mockUseTripPhotos.mockReturnValue(hookState({ photos: [photo('p1')] }));
+  mockUsePhotoSelection.mockReturnValue(
+    selectionState({ enterSelectionMode, enterSelection }),
+  );
+  await render(<PhotosScreen />);
+
+  await fireEvent.press(screen.getByLabelText('Select photos'));
+
+  expect(enterSelectionMode).toHaveBeenCalledTimes(1);
+  expect(enterSelection).not.toHaveBeenCalled();
+});
+
+it('keeps long press as a shortcut that selects the pressed tile', async () => {
+  const enterSelection = jest.fn();
+  mockUseTripPhotos.mockReturnValue(hookState({ photos: [photo('p1')] }));
+  mockUsePhotoSelection.mockReturnValue(selectionState({ enterSelection }));
+  await render(<PhotosScreen />);
+
+  await fireEvent(screen.getByTestId('photo-tile-p1'), 'longPress');
+
+  expect(enterSelection).toHaveBeenCalledWith('p1');
+});
+
+it('keeps Upload disabled in selection mode before a save starts', async () => {
+  const pick = jest.fn(async () => undefined);
+  mockUseTripPhotos.mockReturnValue(hookState({ photos: [photo('p1')] }));
+  mockUsePhotoUpload.mockReturnValue(uploadState({ pick }));
+  mockUsePhotoSelection.mockReturnValue(
+    selectionState({
+      selectionMode: true,
+      selectedIds: ['p1'],
+      selectedCount: 1,
+      saveSnapshot: null,
+    }),
+  );
+  await render(<PhotosScreen />);
+
+  const upload = screen.getByLabelText('Upload photos');
+  expect(upload.props.accessibilityState).toEqual({ disabled: true });
+  await fireEvent.press(upload);
+
+  expect(pick).not.toHaveBeenCalled();
+});
+
+it('keeps Upload disabled throughout an active selection save', async () => {
+  const pick = jest.fn(async () => undefined);
+  mockUseTripPhotos.mockReturnValue(hookState({ photos: [photo('p1')] }));
+  mockUsePhotoUpload.mockReturnValue(uploadState({ pick }));
+  mockUsePhotoSelection.mockReturnValue(
+    selectionState({
+      selectionMode: true,
+      selectedIds: ['p1'],
+      selectedCount: 1,
+      saveSnapshot: {
+        phase: 'running',
+        stage: 'saving',
+        total: 1,
+        currentOrdinal: 1,
+        counts: {
+          committed: 0,
+          terminalSkipped: 0,
+          retryableFailed: 0,
+          unknown: 0,
+          unattempted: 1,
+        },
+        ledger: [{ photoId: 'p1', status: 'unattempted' }],
+        failure: null,
+        permissionDenied: null,
+      },
+    }),
+  );
+  await render(<PhotosScreen />);
+
+  const upload = screen.getByLabelText('Upload photos');
+  expect(upload.props.accessibilityState).toEqual({ disabled: true });
+  await fireEvent.press(upload);
+
+  expect(pick).not.toHaveBeenCalled();
+  expect(screen.queryByLabelText('Select photos')).toBeNull();
+});
+
+it('disables selection entry while an upload session owns the photo surface', async () => {
+  const enterSelectionMode = jest.fn();
+  mockUseTripPhotos.mockReturnValue(hookState({ photos: [photo('p1')] }));
+  mockUsePhotoUpload.mockReturnValue(
+    uploadState({
+      snapshot: {
+        phase: 'selected',
+        items: [],
+        selectedCount: 1,
+        processedCount: 0,
+        uploadedCount: 0,
+        rejectedCount: 0,
+        pendingCount: 1,
+        unknownCount: 0,
+        failedCount: 0,
+        batchesUploaded: 0,
+        activePreparation: null,
+        activeBatch: null,
+        stopping: false,
+        error: null,
+      },
+    }),
+  );
+  mockUsePhotoSelection.mockReturnValue(selectionState({ enterSelectionMode }));
+  await render(<PhotosScreen />);
+
+  const select = screen.getByLabelText('Select photos');
+  expect(select.props.accessibilityState).toEqual({ disabled: true });
+  await fireEvent.press(select);
+
+  expect(enterSelectionMode).not.toHaveBeenCalled();
 });
 
 it('shows the upload sheet once a selection exists', async () => {

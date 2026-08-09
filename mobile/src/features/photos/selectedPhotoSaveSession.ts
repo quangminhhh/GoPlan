@@ -200,9 +200,6 @@ export function createSelectedPhotoSaveSession(
   let currentOrdinal: number | null = null;
   let failure: PhotoFailure | null = null;
   let permissionDenied: { canAskAgain: boolean } | null = null;
-  let permissionResult: Awaited<
-    ReturnType<PhotoLibraryAdapter['requestAddOnlyPermission']>
-  > | null = null;
   let intent: RunnerIntent = 'running';
   let closeInterruption: PhotoSaveInterruption = 'cancelled';
   let runnerPromise: Promise<void> | null = null;
@@ -338,14 +335,18 @@ export function createSelectedPhotoSaveSession(
         return;
       }
 
-      if (permissionResult === null) {
-        try {
-          permissionResult = await library.requestAddOnlyPermission();
-        } catch (caught) {
-          failure = toPhotoFailure(caught);
-          settlePhaseAfterAttempt();
-          return;
-        }
+      let permissionResult: Awaited<
+        ReturnType<PhotoLibraryAdapter['requestAddOnlyPermission']>
+      >;
+      try {
+        // Permission may change while the app is in Settings. Cache it only
+        // for this attempt so rapid taps share one prompt through runnerPromise,
+        // while an explicit Retry/Resume observes the current native state.
+        permissionResult = await library.requestAddOnlyPermission();
+      } catch (caught) {
+        failure = toPhotoFailure(caught);
+        settlePhaseAfterAttempt();
+        return;
       }
       if (!isRunnerOpen(captured)) {
         settlePhaseAfterAttempt();
