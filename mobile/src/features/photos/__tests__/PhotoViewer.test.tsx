@@ -1,9 +1,11 @@
 const mockDeleteTripPhoto = jest.fn();
+const mockGetTripPhoto = jest.fn();
 const mockSaveTripPhotoToLibrary = jest.fn();
 
 jest.mock('../api', () => ({
   ...jest.requireActual('../api'),
   deleteTripPhoto: (...args: unknown[]) => mockDeleteTripPhoto(...args),
+  getTripPhoto: (...args: unknown[]) => mockGetTripPhoto(...args),
 }));
 
 jest.mock('../photoSave', () => ({
@@ -20,6 +22,8 @@ jest.mock('@/shared/media/AuthenticatedImage', () => {
     AuthenticatedImage: (props: Record<string, unknown>) =>
       createElement(View, {
         backgroundColor: props.backgroundColor,
+        accessibilityLabel: props.accessibilityLabel,
+        accessible: props.accessible,
         height: props.height,
         testID: `authenticated-${String(props.assetKey)}`,
         width: props.width,
@@ -236,6 +240,7 @@ function createViewerScopeHarness(tripId = 'trip-1') {
 beforeEach(() => {
   jest.clearAllMocks();
   mockDeleteTripPhoto.mockResolvedValue(undefined);
+  mockGetTripPhoto.mockResolvedValue(photo('p1'));
   mockSaveTripPhotoToLibrary.mockResolvedValue({ status: 'saved' });
 });
 
@@ -249,12 +254,52 @@ describe('PhotoViewer rendering', () => {
     const photos = [photo('p1'), photo('p2'), photo('p3'), photo('p4'), photo('p5')];
     await renderViewer({ photos, currentIndex: 2 });
 
-    expect(screen.getByTestId('zoomable-photo-p2')).toBeTruthy();
+    expect(
+      screen.getByTestId('zoomable-photo-p2', { includeHiddenElements: true }),
+    ).toBeTruthy();
     expect(screen.getByTestId('zoomable-photo-p3')).toBeTruthy();
-    expect(screen.getByTestId('zoomable-photo-p4')).toBeTruthy();
+    expect(
+      screen.getByTestId('zoomable-photo-p4', { includeHiddenElements: true }),
+    ).toBeTruthy();
     // A five-photo gallery must not hold five medium variants in memory.
     expect(screen.queryByTestId('zoomable-photo-p1')).toBeNull();
     expect(screen.queryByTestId('zoomable-photo-p5')).toBeNull();
+  });
+
+  it('exposes only the current page to VoiceOver while neighbours preload', async () => {
+    await renderViewer({ currentIndex: 1 });
+
+    expect(screen.queryByTestId('photo-viewer-page-p1')).toBeNull();
+    expect(screen.queryByTestId('photo-viewer-page-p3')).toBeNull();
+    expect(
+      screen.getByTestId('photo-viewer-page-p1', { includeHiddenElements: true }).props,
+    ).toMatchObject({
+      accessibilityElementsHidden: true,
+      importantForAccessibility: 'no-hide-descendants',
+    });
+    expect(screen.getByTestId('photo-viewer-page-p2').props).toMatchObject({
+      accessibilityElementsHidden: false,
+      importantForAccessibility: 'auto',
+    });
+    expect(
+      screen.getByTestId('photo-viewer-page-p3', { includeHiddenElements: true }).props,
+    ).toMatchObject({
+      accessibilityElementsHidden: true,
+      importantForAccessibility: 'no-hide-descendants',
+    });
+    expect(
+      screen.getByTestId('authenticated-trip-photo:trip-1:p1:medium', {
+        includeHiddenElements: true,
+      }).props.accessible,
+    ).toBe(false);
+    expect(screen.getByTestId('authenticated-trip-photo:trip-1:p2:medium').props.accessible).toBe(
+      true,
+    );
+    expect(
+      screen.getByTestId('authenticated-trip-photo:trip-1:p3:medium', {
+        includeHiddenElements: true,
+      }).props.accessible,
+    ).toBe(false);
   });
 
   it('lets only the active page control shared zoom state', () => {
@@ -666,30 +711,55 @@ describe('usePhotoViewer delete', () => {
     });
   });
 
-  it('reconciles rather than guessing when the outcome cannot be known', async () => {
+  it('keeps a page-2 photo when an authoritative detail probe says it still exists', async () => {
     mockDeleteTripPhoto.mockRejectedValue(networkFailure());
-    const options = hookOptions();
+    const options = hookOptions({
+      photos: Array.from({ length: 25 }, (_, index) => photo(`p${index + 1}`)),
+    });
     const { result } = await renderHook(() => usePhotoViewer(options));
     await act(async () => {
-      result.current.open('p1');
+      result.current.open('p21');
     });
 
     await act(async () => {
       await result.current.confirmDelete();
     });
 
-    // The delete may have landed before the connection dropped, so the list is
-    // re-read and no success is claimed either way.
-    expect(options.reconcile).toHaveBeenCalledTimes(1);
+    expect(mockGetTripPhoto).toHaveBeenCalledWith('trip-1', 'p21', expect.anything());
+    expect(options.reconcile).not.toHaveBeenCalled();
     expect(options.removePhoto).not.toHaveBeenCalled();
     expect(result.current.action).toMatchObject({ status: 'error' });
     expect(result.current.action).not.toMatchObject({ status: 'message' });
   });
 
-  it('treats a 5xx the same way as a dropped connection', async () => {
+  it('tombstones a page-2 photo when its detail probe proves the uncertain delete landed', async () => {
+    mockDeleteTripPhoto.mockRejectedValue(networkFailure());
+    mockGetTripPhoto.mockRejectedValue(
+      failure(404, { detail: 'Photo not found.', error_code: 'PHOTO_NOT_FOUND' }),
+    );
+    const options = hookOptions({
+      photos: Array.from({ length: 25 }, (_, index) => photo(`p${index + 1}`)),
+    });
+    const { result } = await renderHook(() => usePhotoViewer(options));
+    await act(async () => {
+      result.current.open('p21');
+    });
+
+    await act(async () => {
+      await result.current.confirmDelete();
+    });
+
+    expect(options.removePhoto).toHaveBeenCalledWith('p21');
+    expect(options.reconcile).not.toHaveBeenCalled();
+    expect(result.current.openPhotoId).toBeNull();
+    expect(result.current.action).toEqual({ status: 'idle' });
+  });
+
+  it('falls back to page-1 reconciliation when both delete and detail probe are uncertain', async () => {
     mockDeleteTripPhoto.mockRejectedValue(
       failure(500, { detail: 'Storage error.', error_code: 'PHOTO_STORAGE_ERROR' }),
     );
+    mockGetTripPhoto.mockRejectedValue(networkFailure());
     const options = hookOptions();
     const { result } = await renderHook(() => usePhotoViewer(options));
     await act(async () => {

@@ -8,6 +8,7 @@ import {
 } from '@/shared/media/privateMediaLifecycle';
 import {
   deleteTripPhoto,
+  getTripPhoto,
   listTripPhotos,
   PHOTO_UPLOAD_TIMEOUT_MS,
   tripPhotoAssetKey,
@@ -148,6 +149,17 @@ describe('deleteTripPhoto', () => {
 
     expect(recorded[0].url).toBe('/trips/trip-1/photos/photo-1');
     expect(recorded[0].method).toBe('delete');
+  });
+});
+
+describe('getTripPhoto', () => {
+  it('gets one authoritative photo from the detail path', async () => {
+    installAdapter(() => ({ status: 200, data: photo }));
+
+    await expect(getTripPhoto('trip-1', 'photo-1')).resolves.toEqual(photo);
+
+    expect(recorded[0].url).toBe('/trips/trip-1/photos/photo-1');
+    expect(recorded[0].method).toBe('get');
   });
 });
 

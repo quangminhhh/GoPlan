@@ -444,6 +444,15 @@ def _get_photo_for_member(*, trip_id, photo_id, actor, for_update: bool = False)
         raise TripPhotoNotFoundError("PHOTO_NOT_FOUND", "Photo not found.") from exc
 
 
+def get_trip_photo(*, trip_id, photo_id, actor):
+    """Return one photo together with the membership used for its permissions."""
+    return _get_photo_for_member(
+        trip_id=trip_id,
+        photo_id=photo_id,
+        actor=actor,
+    )
+
+
 def delete_trip_photo(*, trip_id, photo_id, actor) -> None:
     with transaction.atomic():
         membership, photo = _get_photo_for_member(

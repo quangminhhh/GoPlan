@@ -22,7 +22,7 @@
     "expo-image-manipulator": "57.0.2",
     "expo-image-picker": "57.0.2",
     "expo-linking": "~57.0.1",
-    "expo-media-library": "57.0.1",
+    "expo-media-library": "~57.0.3",
     "expo-router": "~57.0.3",
     "expo-secure-store": "~57.0.0",
     "expo-splash-screen": "~57.0.2",
@@ -64,6 +64,46 @@
     "lint": "expo lint",
     "test": "jest",
     "typecheck": "tsc --noEmit"
+  },
+  "expo": {
+    "autolinking": {
+      "ios": {
+        "buildFromSource": [
+          "expo-media-library"
+        ]
+      }
+    },
+    "install": {
+      "exclude": [
+        "@expo/ui",
+        "@types/jest",
+        "eslint-config-expo",
+        "expo",
+        "expo-constants",
+        "expo-dev-client",
+        "expo-device",
+        "expo-file-system",
+        "expo-font",
+        "expo-glass-effect",
+        "expo-image",
+        "expo-image-manipulator",
+        "expo-image-picker",
+        "expo-linking",
+        "expo-modules-core",
+        "expo-router",
+        "expo-secure-store",
+        "expo-splash-screen",
+        "expo-status-bar",
+        "expo-symbols",
+        "expo-system-ui",
+        "expo-web-browser",
+        "jest-expo",
+        "react-native",
+        "react-native-reanimated",
+        "react-native-screens",
+        "react-native-worklets"
+      ]
+    }
   },
   "private": true,
   "jest": {

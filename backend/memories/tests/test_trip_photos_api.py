@@ -222,6 +222,44 @@ class TripPhotosAPITests(APITestCase):
         self.assertEqual(response.status_code, 204)
         self.assertFalse(TripPhoto.objects.filter(pk=photo_id).exists())
 
+    def test_member_can_retrieve_one_photo_as_authoritative_delete_probe(self):
+        upload_response = self.client.post(
+            _photos_url(self.trip.id),
+            {"files": [_make_upload()]},
+            format="multipart",
+            **_auth(self.member),
+        )
+        uploaded = upload_response.data["photos"][0]
+
+        response = self.client.get(
+            _photo_detail_url(self.trip.id, uploaded["id"]),
+            **_auth(self.member),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, uploaded)
+
+    def test_detail_probe_returns_photo_not_found_after_delete(self):
+        upload_response = self.client.post(
+            _photos_url(self.trip.id),
+            {"files": [_make_upload()]},
+            format="multipart",
+            **_auth(self.member),
+        )
+        photo_id = upload_response.data["photos"][0]["id"]
+        self.client.delete(
+            _photo_detail_url(self.trip.id, photo_id),
+            **_auth(self.member),
+        )
+
+        response = self.client.get(
+            _photo_detail_url(self.trip.id, photo_id),
+            **_auth(self.member),
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data["error_code"], "PHOTO_NOT_FOUND")
+
     def test_captain_can_delete_member_photo(self):
         upload_response = self.client.post(
             _photos_url(self.trip.id),

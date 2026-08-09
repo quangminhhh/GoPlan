@@ -54,6 +54,7 @@ from memories.services import (
     TripPhotoValidationError,
     create_trip_photos,
     delete_trip_photo,
+    get_trip_photo,
     get_trip_photo_asset,
     get_trip_photo_download,
     get_trip_photos_for_download,
@@ -242,6 +243,27 @@ class TripPhotoListCreateAPIView(APIView):
 class TripPhotoDetailAPIView(APIView):
     permission_classes = TRIP_PHOTO_PERMISSIONS
     throttle_scope = "trip_photos_detail"
+
+    def get(self, request, trip_id, photo_id):
+        try:
+            membership, photo = get_trip_photo(
+                trip_id=trip_id,
+                photo_id=photo_id,
+                actor=request.user,
+            )
+        except Exception as exc:
+            response = _map_service_error(exc)
+            if response is None:
+                raise
+            return response
+
+        return Response(
+            TripPhotoSerializer(
+                photo,
+                context={"actor": request.user, "membership": membership},
+            ).data,
+            status=status.HTTP_200_OK,
+        )
 
     def delete(self, request, trip_id, photo_id):
         try:

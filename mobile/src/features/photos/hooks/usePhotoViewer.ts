@@ -14,7 +14,7 @@ import {
   useRef,
   useState,
 } from 'react';
-import { deleteTripPhoto } from '../api';
+import { deleteTripPhoto, getTripPhoto } from '../api';
 import { saveTripPhotoToLibrary, type SavePhotoOutcome } from '../photoSave';
 import type { PhotoLibraryAdapter } from '../photoSaveTypes';
 import {
@@ -274,10 +274,43 @@ export function usePhotoViewer({
       }
 
       if (isUncertainOutcome(failure)) {
-        // The delete may or may not have happened. Ask the server rather than
-        // guessing, and never show a success message on the strength of a
-        // connection error.
-        await reconcile();
+        // The first page cannot prove whether an item loaded from a deeper page
+        // still exists. Probe this exact id and tombstone it only when the
+        // detail endpoint supplies authoritative not-found evidence.
+        try {
+          await getTripPhoto(tripId, photo.id, controller.signal);
+        } catch (probeCaught) {
+          if (!isCurrent()) return;
+          const probeFailure = toPhotoFailure(probeCaught);
+          if (probeFailure.kind === 'notFound') {
+            const notFoundScope = classifyNotFound(probeFailure);
+            if (notFoundScope === 'photo') {
+              removePhoto(photo.id);
+              setOpenPhotoId(null);
+              setAction({ status: 'idle' });
+              return;
+            }
+            if (notFoundScope === 'trip') {
+              onAssetNotFound(photo.id, probeFailure);
+              setOpenPhotoId(null);
+              setAction({ status: 'idle' });
+              return;
+            }
+
+            const resolution = await resolveAmbiguousNotFound(photo.id, probeFailure);
+            if (!isCurrent()) return;
+            if (resolution === 'photo' || resolution === 'trip') {
+              setOpenPhotoId(null);
+              setAction({ status: 'idle' });
+              return;
+            }
+          } else {
+            // A second transport/server failure still leaves the result unknown.
+            // Keep the existing broad refresh as best-effort freshness for page 1,
+            // but never infer deletion from an absent id there.
+            await reconcile();
+          }
+        }
         if (!isCurrent()) {
           return;
         }
@@ -299,6 +332,7 @@ export function usePhotoViewer({
     tripId,
     removePhoto,
     reconcile,
+    resolveAmbiguousNotFound,
     onAssetNotFound,
     scope,
     scopeTicket,

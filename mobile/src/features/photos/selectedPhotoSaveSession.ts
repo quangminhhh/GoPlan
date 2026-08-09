@@ -200,6 +200,9 @@ export function createSelectedPhotoSaveSession(
   let currentOrdinal: number | null = null;
   let failure: PhotoFailure | null = null;
   let permissionDenied: { canAskAgain: boolean } | null = null;
+  let permissionResult: Awaited<
+    ReturnType<PhotoLibraryAdapter['requestAddOnlyPermission']>
+  > | null = null;
   let intent: RunnerIntent = 'running';
   let closeInterruption: PhotoSaveInterruption = 'cancelled';
   let runnerPromise: Promise<void> | null = null;
@@ -335,20 +338,21 @@ export function createSelectedPhotoSaveSession(
         return;
       }
 
-      let permission: Awaited<ReturnType<PhotoLibraryAdapter['requestAddOnlyPermission']>>;
-      try {
-        permission = await library.requestAddOnlyPermission();
-      } catch (caught) {
-        failure = toPhotoFailure(caught);
-        settlePhaseAfterAttempt();
-        return;
+      if (permissionResult === null) {
+        try {
+          permissionResult = await library.requestAddOnlyPermission();
+        } catch (caught) {
+          failure = toPhotoFailure(caught);
+          settlePhaseAfterAttempt();
+          return;
+        }
       }
       if (!isRunnerOpen(captured)) {
         settlePhaseAfterAttempt();
         return;
       }
-      if (!permission.granted) {
-        permissionDenied = { canAskAgain: permission.canAskAgain };
+      if (!permissionResult.granted) {
+        permissionDenied = { canAskAgain: permissionResult.canAskAgain };
         settlePhaseAfterAttempt();
         return;
       }

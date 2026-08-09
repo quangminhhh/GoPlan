@@ -300,47 +300,54 @@ export function PhotoViewer({
                 {/* A plain ScrollView rather than a virtualised list: the window is
                     already capped at three items, and FlatList would leave the
                     previous neighbour unrendered until it is scrolled into view. */}
-                {visible.map((item) => (
-                  <View
-                    // Neighbours are pre-mounted. Remount both pages when the active
-                    // id changes so zoom/pan state owned by the old active page
-                    // cannot leave the new page's pager disabled.
-                    key={photoViewerPageKey(item.id, currentPhoto.id)}
-                    style={pageStyle}
-                  >
-                    <ZoomablePhoto
-                      photoId={item.id}
-                      width={mediaViewport.width}
-                      height={mediaViewport.height}
-                      sourceWidth={item.medium_width}
-                      sourceHeight={item.medium_height}
-                      zoomed={zoomed && item.id === currentPhoto.id}
-                      pagerGesture={pagerGesture}
-                      dismissGesture={dismissGesture}
-                      pinchInProgress={pinchInProgress}
-                      onZoomChange={zoomChangeHandlerForPage(
-                        item.id,
-                        currentPhoto.id,
-                        setZoomed,
-                      )}
+                {visible.map((item) => {
+                  const isCurrent = item.id === currentPhoto.id;
+                  return (
+                    <View
+                      // Neighbours are pre-mounted. Remount both pages when the active
+                      // id changes so zoom/pan state owned by the old active page
+                      // cannot leave the new page's pager disabled.
+                      key={photoViewerPageKey(item.id, currentPhoto.id)}
+                      accessibilityElementsHidden={!isCurrent}
+                      importantForAccessibility={isCurrent ? 'auto' : 'no-hide-descendants'}
+                      style={pageStyle}
+                      testID={`photo-viewer-page-${item.id}`}
                     >
-                      <AuthenticatedImage
-                        assetKey={tripPhotoAssetKey(tripId, item.id, 'medium')}
-                        invalidationPrefix={tripPhotoAssetKeyPrefix(tripId)}
-                        path={tripPhotoAssetPath(tripId, item.id, 'medium')}
-                        variant={TRIP_PHOTO_VARIANTS.medium}
+                      <ZoomablePhoto
+                        photoId={item.id}
                         width={mediaViewport.width}
                         height={mediaViewport.height}
-                        contentFit="contain"
-                        backgroundColor={colors.viewerBackground}
-                        accessibilityLabel={`Photo uploaded by ${item.uploaded_by.display_name}`}
                         sourceWidth={item.medium_width}
                         sourceHeight={item.medium_height}
-                        onNotFound={handleNotFound(item.id)}
-                      />
-                    </ZoomablePhoto>
-                  </View>
-                ))}
+                        zoomed={zoomed && isCurrent}
+                        pagerGesture={pagerGesture}
+                        dismissGesture={dismissGesture}
+                        pinchInProgress={pinchInProgress}
+                        onZoomChange={zoomChangeHandlerForPage(
+                          item.id,
+                          currentPhoto.id,
+                          setZoomed,
+                        )}
+                      >
+                        <AuthenticatedImage
+                          assetKey={tripPhotoAssetKey(tripId, item.id, 'medium')}
+                          invalidationPrefix={tripPhotoAssetKeyPrefix(tripId)}
+                          path={tripPhotoAssetPath(tripId, item.id, 'medium')}
+                          variant={TRIP_PHOTO_VARIANTS.medium}
+                          width={mediaViewport.width}
+                          height={mediaViewport.height}
+                          contentFit="contain"
+                          backgroundColor={colors.viewerBackground}
+                          accessibilityLabel={`Photo uploaded by ${item.uploaded_by.display_name}`}
+                          accessible={isCurrent}
+                          sourceWidth={item.medium_width}
+                          sourceHeight={item.medium_height}
+                          onNotFound={handleNotFound(item.id)}
+                        />
+                      </ZoomablePhoto>
+                    </View>
+                  );
+                })}
               </ScrollView>
             </GestureDetector>
           </View>

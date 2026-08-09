@@ -271,7 +271,7 @@ describe('selected save worklist and runner ownership', () => {
     expect(selectedPrimitive).toHaveBeenCalledTimes(1);
   });
 
-  it('requests permission once per explicit retry/resume attempt', async () => {
+  it('requests permission once for the whole session across explicit retry', async () => {
     const harness = await createHarness();
     let attempt = 0;
     const savePhoto = createSavePhoto(async () => {
@@ -286,7 +286,7 @@ describe('selected save worklist and runner ownership', () => {
     expect(session.getSnapshot().counts.retryableFailed).toBe(1);
     await session.start();
 
-    expect(harness.requestPermission).toHaveBeenCalledTimes(2);
+    expect(harness.requestPermission).toHaveBeenCalledTimes(1);
     expect(savePhoto).toHaveBeenCalledTimes(2);
     expect(session.getSnapshot().counts.committed).toBe(1);
   });
@@ -362,8 +362,10 @@ describe('selected save worklist and runner ownership', () => {
     const session = createSession(harness, ['photo-1', 'photo-2'], savePhoto);
 
     await session.start();
+    await session.start();
 
     expect(savePhoto).not.toHaveBeenCalled();
+    expect(harness.requestPermission).toHaveBeenCalledTimes(1);
     expect(session.getSnapshot()).toMatchObject({
       phase: 'completed',
       permissionDenied: { canAskAgain },
@@ -739,7 +741,7 @@ describe('selected save cancellation and background behavior', () => {
 
     await session.start();
     expect(savePhoto).toHaveBeenCalledTimes(3);
-    expect(harness.requestPermission).toHaveBeenCalledTimes(2);
+    expect(harness.requestPermission).toHaveBeenCalledTimes(1);
     expect(session.getSnapshot().counts.committed).toBe(2);
   });
 

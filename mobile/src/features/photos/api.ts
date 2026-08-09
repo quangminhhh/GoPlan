@@ -71,6 +71,19 @@ export function listTripPhotos(
   });
 }
 
+export function getTripPhoto(
+  tripId: string,
+  photoId: string,
+  signal?: AbortSignal,
+): Promise<TripPhoto> {
+  return trackPrivateRequest(signal, async (linkedSignal) => {
+    const { data } = await apiClient.get<TripPhoto>(tripPhotoDetailPath(tripId, photoId), {
+      signal: linkedSignal,
+    });
+    return data;
+  });
+}
+
 export function deleteTripPhoto(tripId: string, photoId: string, signal?: AbortSignal): Promise<void> {
   return trackPrivateRequest(signal, async (linkedSignal) => {
     await apiClient.delete(tripPhotoDetailPath(tripId, photoId), { signal: linkedSignal });
