@@ -28,7 +28,8 @@ export type PrivateMediaPurgerName = 'protected-assets' | 'upload-temp';
 const SESSION_CLOSED_MESSAGE = 'This session is no longer active.';
 
 const purgers = new Map<PrivateMediaPurgerName, () => Promise<void>>();
-const controllers = new Set<AbortController>();
+const protectedControllers = new Set<AbortController>();
+const transferControllers = new Set<AbortController>();
 const activity = new Set<Promise<unknown>>();
 const generationListeners = new Set<() => void>();
 const transferLeaseIdleWaiters = new Set<() => void>();
@@ -40,7 +41,6 @@ let sessionEpoch = 0;
 let activationVersion = 0;
 let generation = 0;
 let transferLeases = 0;
-let purgeDeferred = false;
 let protectedAssetPurgeTail: Promise<void> = Promise.resolve();
 let uploadTempPurgeTail: Promise<void> = Promise.resolve();
 /**
@@ -124,25 +124,29 @@ export function createSessionClosedError(): ProtectedAssetError {
  * everything nested inside it has settled, so an Axios 401 retry counts as part
  * of the operation that started it rather than as untracked work.
  */
-export function trackPrivateOperation<T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+function trackOwnedPrivateOperation<T>(
+  owner: 'protected' | 'transfer',
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
   if (!acquisitionOpen) {
     return Promise.reject(createSessionClosedError());
   }
 
   const controller = new AbortController();
-  controllers.add(controller);
+  const ownedControllers = owner === 'protected' ? protectedControllers : transferControllers;
+  ownedControllers.add(controller);
 
   let operation: Promise<T>;
   try {
     operation = run(controller.signal);
   } catch (error) {
-    controllers.delete(controller);
+    ownedControllers.delete(controller);
     return Promise.reject(error);
   }
 
   activity.add(operation);
   const settle = (): void => {
-    controllers.delete(controller);
+    ownedControllers.delete(controller);
     activity.delete(operation);
   };
   // Both handlers are supplied, so this derived promise can never surface as an
@@ -150,6 +154,21 @@ export function trackPrivateOperation<T>(run: (signal: AbortSignal) => Promise<T
   operation.then(settle, settle);
 
   return operation;
+}
+
+export function trackPrivateOperation<T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  return trackOwnedPrivateOperation('protected', run);
+}
+
+/**
+ * Tracks upload/preprocess work whose current operation may settle after the app
+ * backgrounds. The acquisition gate still closes synchronously, so no later
+ * operation can start. Sign-out aborts this owner as well as protected work.
+ */
+export function trackPrivateTransferOperation<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return trackOwnedPrivateOperation('transfer', run);
 }
 
 /**
@@ -206,6 +225,20 @@ export function trackPrivateRequest<T>(
   });
 }
 
+export function trackPrivateTransferRequest<T>(
+  callerSignal: AbortSignal | undefined,
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return trackPrivateTransferOperation(async (lifecycleSignal) => {
+    const linked = linkAbortSignals([callerSignal, lifecycleSignal]);
+    try {
+      return await run(linked.signal);
+    } finally {
+      linked.dispose();
+    }
+  });
+}
+
 /**
  * Waits for private-network activity that already exists. It never starts a
  * request or a refresh of its own — sign-out must not be able to extend the
@@ -245,16 +278,6 @@ export function acquirePrivateTransferLease(): () => void {
       const waiters = Array.from(transferLeaseIdleWaiters);
       transferLeaseIdleWaiters.clear();
       for (const resolve of waiters) resolve();
-    }
-    if (transferLeases === 0 && purgeDeferred) {
-      if (sessionActive && foregroundDesired) {
-        // Foreground intent wins even when the async resume continuation has not
-        // run yet. A later suspend flips `foregroundDesired` back to false, so a
-        // lease released for the genuinely backgrounded state still purges.
-        purgeDeferred = false;
-      } else {
-        runInvalidationFrontHalf();
-      }
     }
   };
 }
@@ -342,13 +365,16 @@ export async function flushPrivateMediaPurge(): Promise<void> {
  * anything is aborted and long before a file is deleted, so there is no window
  * in which an in-flight completion can observe the old epoch and commit.
  */
-function runInvalidationFrontHalf(): void {
+function runInvalidationFrontHalf(abortTransfers: boolean): void {
   acquisitionOpen = false;
-  purgeDeferred = false;
   sessionEpoch += 1;
 
-  const aborted = Array.from(controllers);
-  controllers.clear();
+  const aborted = Array.from(protectedControllers);
+  protectedControllers.clear();
+  if (abortTransfers) {
+    aborted.push(...transferControllers);
+    transferControllers.clear();
+  }
 
   publishGeneration();
 
@@ -366,7 +392,7 @@ function runInvalidationFrontHalf(): void {
 export function beginPrivateMediaShutdown(): void {
   activationVersion += 1;
   sessionActive = false;
-  runInvalidationFrontHalf();
+  runInvalidationFrontHalf(true);
 }
 
 /** Sign-out barrier as one call, for the paths that do not interleave a logout. */
@@ -402,7 +428,6 @@ async function openAfterStablePurge(activationAtStart: number): Promise<void> {
       continue;
     }
 
-    purgeDeferred = false;
     acquisitionOpen = true;
     publishGeneration();
     return;
@@ -429,8 +454,9 @@ export async function startPrivateMediaSession(startInForeground = true): Promis
 }
 
 /**
- * App moved to background. New work is refused either way; whether the purge
- * runs now or waits depends on an active transfer holding files it still needs.
+ * App moved to background. Protected work is invalidated immediately. A
+ * transfer already in progress may settle, while its separate upload-temp purge
+ * remains fenced by the lease it owns.
  */
 export function suspendPrivateMediaSession(): void {
   foregroundDesired = false;
@@ -438,12 +464,7 @@ export function suspendPrivateMediaSession(): void {
   if (!sessionActive || !acquisitionOpen) {
     return;
   }
-  acquisitionOpen = false;
-  if (transferLeases > 0) {
-    purgeDeferred = true;
-    return;
-  }
-  runInvalidationFrontHalf();
+  runInvalidationFrontHalf(false);
 }
 
 /**
@@ -465,7 +486,8 @@ export async function resumePrivateMediaSession(): Promise<void> {
  * are installed at module import, which happens once per module registry.
  */
 export function __resetPrivateMediaLifecycleForTests(): void {
-  controllers.clear();
+  protectedControllers.clear();
+  transferControllers.clear();
   activity.clear();
   generationListeners.clear();
   sessionActive = false;
@@ -476,7 +498,6 @@ export function __resetPrivateMediaLifecycleForTests(): void {
   transferLeases = 0;
   for (const resolve of Array.from(transferLeaseIdleWaiters)) resolve();
   transferLeaseIdleWaiters.clear();
-  purgeDeferred = false;
   protectedAssetPurgeTail = Promise.resolve();
   uploadTempPurgeTail = Promise.resolve();
   purgeRevision = 0;

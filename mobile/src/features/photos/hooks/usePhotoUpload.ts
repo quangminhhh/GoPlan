@@ -17,7 +17,7 @@ import {
 import { preprocessImage } from '@/shared/media/preprocessImage';
 import {
   acquirePrivateTransferLease,
-  trackPrivateRequest,
+  trackPrivateTransferRequest,
 } from '@/shared/media/privateMediaLifecycle';
 import {
   adoptUploadTempFile,
@@ -283,7 +283,7 @@ export function usePhotoUpload({
     if (!owner || runningRef.current || !ownerIsCurrent(owner)) return;
 
     runningRef.current = true;
-    void trackPrivateRequest(undefined, (signal) => owner.session.start(signal))
+    void trackPrivateTransferRequest(undefined, (signal) => owner.session.start(signal))
       .catch((caught) => {
         if (isCancelledFailure(toPhotoFailure(caught))) {
           // Background/lifecycle gate closure is resumable; the AppState or auth

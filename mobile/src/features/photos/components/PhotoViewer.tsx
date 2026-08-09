@@ -368,10 +368,37 @@ export function PhotoViewer({
           </View>
 
           <View
-            style={[styles.bottomBar, { bottom: insets.bottom }]}
+            style={[styles.bottomStack, { bottom: insets.bottom }]}
             pointerEvents="box-none"
-            testID="photo-viewer-bottom-bar"
+            testID="photo-viewer-bottom-stack"
           >
+            {action.status === 'message' ||
+            action.status === 'error' ||
+            action.status === 'permissionDenied' ? (
+              <PhotoFeedbackToast
+                message={
+                  action.status === 'message'
+                    ? action.message
+                    : action.status === 'error'
+                      ? action.failure.message
+                      : action.canAskAgain
+                        ? 'GoPlan needs permission to add photos to your library.'
+                        : 'Allow photo access for GoPlan in Settings to save photos.'
+                }
+                onDismiss={onDismissAction}
+                {...(action.status === 'permissionDenied' && !action.canAskAgain
+                  ? { actionLabel: 'Open Settings', onAction: onOpenSettings }
+                  : {})}
+                style={styles.toastPlacement}
+                testID="photo-viewer-toast"
+              />
+            ) : null}
+
+            <View
+              style={styles.bottomBar}
+              pointerEvents="box-none"
+              testID="photo-viewer-bottom-bar"
+            >
             <View style={styles.metadata}>
               <Text style={styles.uploader}>
                 {currentPhoto.uploaded_by.display_name}
@@ -439,6 +466,7 @@ export function PhotoViewer({
                 </Pressable>
               ) : null}
             </View>
+            </View>
           </View>
 
           {busy ? (
@@ -447,27 +475,6 @@ export function PhotoViewer({
             </View>
           ) : null}
 
-          {action.status === 'message' ||
-          action.status === 'error' ||
-          action.status === 'permissionDenied' ? (
-            <PhotoFeedbackToast
-              message={
-                action.status === 'message'
-                  ? action.message
-                  : action.status === 'error'
-                    ? action.failure.message
-                    : action.canAskAgain
-                      ? 'GoPlan needs permission to add photos to your library.'
-                      : 'Allow photo access for GoPlan in Settings to save photos.'
-              }
-              onDismiss={onDismissAction}
-              {...(action.status === 'permissionDenied' && !action.canAskAgain
-                ? { actionLabel: 'Open Settings', onAction: onOpenSettings }
-                : {})}
-              style={styles.toastPlacement}
-              testID="photo-viewer-toast"
-            />
-          ) : null}
         </View>
       </GestureHandlerRootView>
     </Modal>
@@ -486,13 +493,17 @@ const styles = StyleSheet.create({
     position: 'absolute',
     right: 0,
   },
-  bottomBar: {
+  bottomStack: {
     gap: spacing.sm,
     left: 0,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.md,
     position: 'absolute',
     right: 0,
+  },
+  bottomBar: {
+    flexShrink: 0,
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.md,
   },
   metadata: { gap: spacing.xxs },
   uploader: { ...typography.label, color: colors.background },
@@ -512,10 +523,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   toastPlacement: {
-    bottom: spacing.xl * 4,
+    flexShrink: 0,
     marginHorizontal: spacing.lg,
-    position: 'absolute',
-    left: 0,
-    right: 0,
   },
 });

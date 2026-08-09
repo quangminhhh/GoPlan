@@ -47,7 +47,7 @@ jest.mock('@/shared/media/uploadTempStore', () => ({
 jest.mock('@/shared/media/privateMediaLifecycle', () => ({
   ...jest.requireActual('@/shared/media/privateMediaLifecycle'),
   acquirePrivateTransferLease: jest.fn(() => () => undefined),
-  trackPrivateRequest: (...args: unknown[]) => mockTrackPrivateRequest(...args),
+  trackPrivateTransferRequest: (...args: unknown[]) => mockTrackPrivateRequest(...args),
 }));
 
 jest.mock('../api', () => ({
@@ -130,7 +130,9 @@ const SELECTED_SNAPSHOT: UploadSnapshot = {
   unknownCount: 0,
   failedCount: 0,
   batchesUploaded: 0,
+  activePreparation: null,
   activeBatch: null,
+  stopping: false,
   error: null,
 };
 

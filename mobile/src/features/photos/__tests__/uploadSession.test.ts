@@ -594,7 +594,15 @@ describe('intent boundaries and precedence', () => {
       const running = session.start();
       await preprocessStarted.promise;
       if (requested === 'pause') session.requestPause();
-      else session.requestStop();
+      else {
+        session.requestStop();
+        expect(session.snapshot()).toMatchObject({
+          phase: 'preprocessing',
+          stopping: true,
+          activePreparation: { current: 1, total: 1 },
+        });
+        expect(harness.uploads).toHaveLength(0);
+      }
       preprocess.resolve(output);
       await running;
 
@@ -642,6 +650,8 @@ describe('intent boundaries and precedence', () => {
     const running = session.start();
     await adoptStarted.promise;
     session.requestStop();
+    expect(session.snapshot()).toMatchObject({ phase: 'preprocessing', stopping: true });
+    expect(harness.uploads).toHaveLength(0);
     adopt.resolve();
     await running;
 
@@ -649,6 +659,47 @@ describe('intent boundaries and precedence', () => {
     expect(harness.uploads).toHaveLength(0);
     expect(harness.tempFiles.size).toBe(0);
     expect(harness.sourceDiscards).toHaveLength(1);
+  });
+
+  it('acknowledges Stop during a deferred upload, settles success, and schedules no next batch', async () => {
+    const harness = createHarness({ encodedBytes: 10 * MIB });
+    const uploadStarted = createDeferred<void>();
+    const uploadResult = createDeferred<TripPhoto[]>();
+    let requestFiles: PreparedUpload[] = [];
+    let uploadSignal: AbortSignal | undefined;
+    harness.deps.uploadBatch = async (files, _onProgress, signal) => {
+      requestFiles = files;
+      uploadSignal = signal;
+      harness.uploads.push(files);
+      uploadStarted.resolve();
+      return uploadResult.promise;
+    };
+    const session = createUploadSession(selection(12), harness.deps);
+
+    const running = session.start();
+    await uploadStarted.promise;
+    session.requestStop();
+
+    expect(session.snapshot()).toMatchObject({
+      phase: 'uploading',
+      stopping: true,
+      uploadedCount: 0,
+    });
+    expect(uploadSignal?.aborted).toBe(false);
+    const publicationsAfterFirstStop = harness.snapshots.length;
+    session.requestStop();
+    expect(harness.snapshots).toHaveLength(publicationsAfterFirstStop);
+
+    uploadResult.resolve(requestFiles.map((file) => serverPhoto(file.id)));
+    await running;
+
+    expect(session.snapshot()).toMatchObject({
+      phase: 'stopped',
+      stopping: false,
+      uploadedCount: 5,
+      pendingCount: 7,
+    });
+    expect(harness.uploads).toHaveLength(1);
   });
 
   it('Stop wins a concurrent 429, retains throttle detail and cannot restart', async () => {
@@ -674,6 +725,41 @@ describe('intent boundaries and precedence', () => {
     expect(harness.uploads).toHaveLength(1);
     expect(harness.tempFiles.size).toBe(0);
     expect(harness.sourceDiscards).toHaveLength(3);
+  });
+
+  it('preserves prior successes when Stop wins a deferred 429 response', async () => {
+    const secondUploadStarted = createDeferred<void>();
+    const secondUpload = createDeferred<TripPhoto[]>();
+    const harness = createHarness({
+      encodedBytes: 10 * MIB,
+      upload: async (files, attempt) => {
+        if (attempt === 1) return files.map((file) => serverPhoto(file.id));
+        secondUploadStarted.resolve();
+        return secondUpload.promise;
+      },
+    });
+    const session = createUploadSession(selection(12), harness.deps);
+
+    const running = session.start();
+    await secondUploadStarted.promise;
+    session.requestStop();
+    expect(session.snapshot()).toMatchObject({
+      phase: 'uploading',
+      stopping: true,
+      uploadedCount: 5,
+    });
+
+    secondUpload.reject(axiosFailure(429, { detail: 'Throttled.' }));
+    await running;
+
+    expect(session.snapshot()).toMatchObject({
+      phase: 'stopped',
+      stopping: false,
+      uploadedCount: 5,
+      pendingCount: 7,
+      error: { kind: 'throttled', message: 'Upload limit reached. Try again later.' },
+    });
+    expect(harness.uploads).toHaveLength(2);
   });
 
   it('Stop wins an uncertain network outcome without scheduling another batch', async () => {

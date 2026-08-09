@@ -56,6 +56,12 @@ export interface AuthenticatedImageProps {
   height: number;
   contentFit: 'cover' | 'contain';
   accessibilityLabel: string;
+  /** Keeps a composite owner such as PhotoTile as the only VoiceOver node. */
+  accessible?: boolean;
+  /** Lets a composite owner expose retry on its own accessibility node. */
+  onRetryAvailabilityChange?: (available: boolean) => void;
+  /** Incremented by a composite owner when its named retry action is invoked. */
+  retryKey?: number;
   /** Source pixel size, used to reserve layout and size the decode. */
   sourceWidth?: number;
   sourceHeight?: number;
@@ -75,6 +81,9 @@ export function AuthenticatedImage({
   height,
   contentFit,
   accessibilityLabel,
+  accessible = true,
+  onRetryAvailabilityChange,
+  retryKey = 0,
   sourceWidth,
   sourceHeight,
   backgroundColor,
@@ -89,7 +98,7 @@ export function AuthenticatedImage({
   // Resetting during render rather than from an effect: this is the "adjust
   // state when a prop changes" pattern, and it avoids the cascading extra render
   // a synchronous setState inside an effect would cause.
-  const loadKey = `${assetKey}|${path}|${attempt}`;
+  const loadKey = `${assetKey}|${path}|${attempt}|${retryKey}`;
   const [renderedLoadKey, setRenderedLoadKey] = useState(loadKey);
   if (renderedLoadKey !== loadKey) {
     setRenderedLoadKey(loadKey);
@@ -155,7 +164,7 @@ export function AuthenticatedImage({
       controller.abort();
       acquired?.release();
     };
-  }, [assetKey, invalidationPrefix, path, variant, transport, attempt]);
+  }, [assetKey, invalidationPrefix, path, variant, transport, attempt, retryKey]);
 
   // A purge clears the local URI immediately; the reacquire only happens once
   // the gate is open again, which for a background purge means after foreground.
@@ -181,6 +190,13 @@ export function AuthenticatedImage({
     decodeRetries.current = 0;
     setAttempt((current) => current + 1);
   }, []);
+
+  const retryAvailable =
+    state.status === 'error' &&
+    (state.error.kind === 'network' || state.error.kind === 'throttled');
+  useEffect(() => {
+    onRetryAvailabilityChange?.(retryAvailable);
+  }, [onRetryAvailabilityChange, retryAvailable]);
 
   const handleDecodeError = useCallback(() => {
     if (decodeRetries.current >= MAX_DECODE_RETRIES) {
@@ -212,11 +228,13 @@ export function AuthenticatedImage({
         // RAM only. Never 'disk' or 'memory-disk' for member-only content (D3).
         cachePolicy="memory"
         recyclingKey={assetKey}
-        accessible
-        accessibilityRole="image"
-        accessibilityLabel={accessibilityLabel}
+        accessible={accessible}
+        accessibilityElementsHidden={!accessible}
+        importantForAccessibility={accessible ? 'auto' : 'no-hide-descendants'}
+        accessibilityRole={accessible ? 'image' : undefined}
+        accessibilityLabel={accessible ? accessibilityLabel : undefined}
         onError={handleDecodeError}
-        testID={`authenticated-image-${assetKey}`}
+        testID={accessible ? `authenticated-image-${assetKey}` : undefined}
       />
     );
   }
@@ -225,23 +243,26 @@ export function AuthenticatedImage({
     const retriable = state.error.kind === 'network' || state.error.kind === 'throttled';
     return (
       <View
+        accessibilityElementsHidden={!accessible}
+        importantForAccessibility={accessible ? 'auto' : 'no-hide-descendants'}
         style={[styles.placeholder, frame, background]}
-        testID={`authenticated-image-error-${assetKey}`}
+        testID={accessible ? `authenticated-image-error-${assetKey}` : undefined}
       >
         {retriable ? (
           <Pressable
+            accessible={accessible}
             accessibilityRole="button"
-            accessibilityLabel="Retry loading this image"
+            accessibilityLabel={accessible ? 'Retry loading this image' : undefined}
             onPress={retry}
             style={styles.retry}
           >
-            <Text style={styles.retryLabel}>Retry</Text>
+            <Text accessible={false} style={styles.retryLabel}>Retry</Text>
           </Pressable>
         ) : (
           <Text
-            accessible
+            accessible={accessible}
             // Says what happened without echoing a path or an identifier.
-            accessibilityLabel="Image unavailable"
+            accessibilityLabel={accessible ? 'Image unavailable' : undefined}
             style={styles.unavailable}
           >
             Unavailable
@@ -255,8 +276,10 @@ export function AuthenticatedImage({
   // resolve.
   return (
     <View
+      accessibilityElementsHidden={!accessible}
+      importantForAccessibility={accessible ? 'auto' : 'no-hide-descendants'}
       style={[styles.placeholder, frame, background]}
-      testID={`authenticated-image-placeholder-${assetKey}`}
+      testID={accessible ? `authenticated-image-placeholder-${assetKey}` : undefined}
     >
       {state.status === 'loading' ? <ActivityIndicator color={colors.textMuted} /> : null}
     </View>

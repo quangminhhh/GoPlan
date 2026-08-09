@@ -414,9 +414,53 @@ describe('PhotoViewer rendering', () => {
     await renderViewer({}, { top: 59, bottom: 34, left: 0, right: 0 });
 
     expect(StyleSheet.flatten(screen.getByTestId('photo-viewer-top-bar').props.style).top).toBe(59);
-    expect(StyleSheet.flatten(screen.getByTestId('photo-viewer-bottom-bar').props.style).bottom).toBe(
-      34,
+    expect(
+      StyleSheet.flatten(screen.getByTestId('photo-viewer-bottom-stack').props.style).bottom,
+    ).toBe(34);
+  });
+
+  it('keeps toast and variable-height bottom content in the same safe-area stack', async () => {
+    await renderViewer(
+      { action: { status: 'message', message: 'Saved to Photos.' } },
+      { top: 59, bottom: 34, left: 0, right: 0 },
     );
+    const bottomBar = screen.getByTestId('photo-viewer-bottom-bar');
+    const bottomStack = screen.getByTestId('photo-viewer-bottom-stack');
+    const toast = screen.getByTestId('photo-viewer-toast');
+
+    await fireEvent(bottomBar, 'layout', {
+      nativeEvent: { layout: { x: 0, y: 700, width: 430, height: 104 } },
+    });
+    expect(StyleSheet.flatten(bottomStack.props.style).bottom).toBe(34);
+    expect(StyleSheet.flatten(toast.props.style).position).toBeUndefined();
+    expect(StyleSheet.flatten(bottomBar.props.style).position).toBeUndefined();
+    expect(StyleSheet.flatten(toast.props.style).flexShrink).toBe(0);
+    expect(StyleSheet.flatten(bottomBar.props.style).flexShrink).toBe(0);
+
+    await fireEvent(bottomBar, 'layout', {
+      nativeEvent: { layout: { x: 0, y: 610, width: 430, height: 194 } },
+    });
+    expect(StyleSheet.flatten(bottomStack.props.style).bottom).toBe(34);
+  });
+
+  it('keeps a long unknown message above the measured controls and announces its real text', async () => {
+    const message =
+      'This photo may already be saved. Check Photos before trying again because the native result was unknown.';
+    await renderViewer(
+      { action: { status: 'error', failure: { kind: 'network', message } } },
+      { top: 59, bottom: 34, left: 0, right: 0 },
+    );
+
+    await fireEvent(screen.getByTestId('photo-viewer-bottom-bar'), 'layout', {
+      nativeEvent: { layout: { x: 0, y: 600, width: 430, height: 204 } },
+    });
+
+    expect(screen.getByTestId('photo-viewer-toast-message').props.children).toBe(message);
+    expect(
+      StyleSheet.flatten(screen.getByTestId('photo-viewer-bottom-stack').props.style).bottom,
+    ).toBe(34);
+    expect(StyleSheet.flatten(screen.getByTestId('photo-viewer-toast').props.style).position).toBeUndefined();
+    expect(screen.getByLabelText('Dismiss message')).toBeTruthy();
   });
 
   it('shows uploader, tag and a localised date', async () => {

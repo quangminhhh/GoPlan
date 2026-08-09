@@ -12,7 +12,10 @@
 
 import { apiClient } from '@/shared/api/client';
 import { toCursorPage, type CursorPage, type CursorPaginatedResponse } from '@/shared/api/pagination';
-import { trackPrivateRequest } from '@/shared/media/privateMediaLifecycle';
+import {
+  trackPrivateRequest,
+  trackPrivateTransferRequest,
+} from '@/shared/media/privateMediaLifecycle';
 import { PHOTO_PAGE_SIZE } from './constants';
 import type { TripPhoto, TripPhotoAssetVariantName, TripPhotoUploadResponse } from './types';
 
@@ -97,7 +100,7 @@ export function uploadTripPhotoBatch(
   files: { uri: string; name: string; type: string }[],
   options: UploadTripPhotoBatchOptions = {},
 ): Promise<TripPhoto[]> {
-  return trackPrivateRequest(options.signal, async (linkedSignal) => {
+  return trackPrivateTransferRequest(options.signal, async (linkedSignal) => {
     const form = new FormData();
     for (const file of files) {
       // React Native's FormData streams a `{uri, name, type}` part off disk. The

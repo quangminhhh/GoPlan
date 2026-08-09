@@ -56,9 +56,64 @@ it('reports its dynamic height and exposes exact native-save progress', async ()
 
   expect(onHeightChange).toHaveBeenCalledWith(142);
   expect(screen.getByText('Saving 12 of 40')).toBeTruthy();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+  expect(screen.getByRole('progressbar').props.accessibilityValue).toEqual({
+    min: 1,
+    max: 40,
+    now: 12,
+  });
   expect(screen.getByLabelText('Select all loaded').props.accessibilityState.disabled).toBe(true);
   await fireEvent.press(screen.getByLabelText('Cancel saving photos'));
   expect(onCancelSave).toHaveBeenCalledTimes(1);
+});
+
+it('uses stage-aware progress and clamps the selected-save ordinal to its total', async () => {
+  const view = await render(
+    <PhotoSelectionBar
+      {...props({
+        saveSnapshot: snapshot({ stage: 'preparing', currentOrdinal: 1, total: 8 }),
+      })}
+    />,
+  );
+
+  expect(screen.getByLabelText('Preparing 1 of 8').props.accessibilityValue).toEqual({
+    min: 1,
+    max: 8,
+    now: 1,
+  });
+
+  await view.rerender(
+    <PhotoSelectionBar
+      {...props({
+        saveSnapshot: snapshot({ stage: 'downloading', currentOrdinal: 9, total: 8 }),
+      })}
+    />,
+  );
+  expect(screen.getByLabelText('Downloading 8 of 8').props.accessibilityValue).toEqual({
+    min: 1,
+    max: 8,
+    now: 8,
+  });
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+});
+
+it('uses indeterminate progress semantics while requesting permission', async () => {
+  await render(
+    <PhotoSelectionBar
+      {...props({
+        saveSnapshot: snapshot({
+          phase: 'requestingPermission',
+          stage: null,
+          currentOrdinal: null,
+        }),
+      })}
+    />,
+  );
+
+  const progress = screen.getByRole('progressbar');
+  expect(progress.props.accessibilityLabel).toBe('Requesting Photos access…');
+  expect(progress.props.accessibilityValue).toBeUndefined();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
 });
 
 it('uses truthful loaded/cap copy and preserves the 100-photo guard', async () => {

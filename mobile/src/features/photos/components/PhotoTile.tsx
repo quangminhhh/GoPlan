@@ -1,5 +1,11 @@
-import { memo, useCallback } from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { memo, useCallback, useMemo, useState } from 'react';
+import {
+  type AccessibilityActionEvent,
+  type AccessibilityActionInfo,
+  Pressable,
+  StyleSheet,
+  View,
+} from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { AuthenticatedImage } from '@/shared/media/AuthenticatedImage';
 import type { ProtectedAssetError } from '@/shared/media/protectedAssetTypes';
@@ -43,22 +49,55 @@ function PhotoTileComponent({
   selectionMode = false,
   selected = false,
 }: PhotoTileProps) {
+  const [retryAvailable, setRetryAvailable] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
   const handlePress = useCallback(() => onPress(photoId), [onPress, photoId]);
   const handleLongPress = useCallback(() => onLongPress?.(photoId), [onLongPress, photoId]);
   const handleNotFound = useCallback(
     (error: ProtectedAssetError) => onAssetNotFound(photoId, toPhotoFailure(error)),
     [onAssetNotFound, photoId],
   );
+  const selectionActionLabel = selectionMode && selected ? 'Deselect photo' : 'Select photo';
+  const accessibilityActions = useMemo<AccessibilityActionInfo[]>(
+    () => [
+      ...(onLongPress || selectionMode
+        ? [{ name: 'toggleSelection', label: selectionActionLabel }]
+        : []),
+      ...(retryAvailable ? [{ name: 'retryImage', label: 'Retry loading photo' }] : []),
+    ],
+    [onLongPress, retryAvailable, selectionActionLabel, selectionMode],
+  );
+  const handleAccessibilityAction = useCallback(
+    (event: AccessibilityActionEvent) => {
+      if (event.nativeEvent.actionName === 'retryImage') {
+        setRetryKey((current) => current + 1);
+        return;
+      }
+      if (event.nativeEvent.actionName === 'toggleSelection') {
+        if (selectionMode) handlePress();
+        else handleLongPress();
+      }
+    },
+    [handleLongPress, handlePress, selectionMode],
+  );
 
   return (
     <Pressable
-      accessibilityRole={selectionMode ? 'checkbox' : 'imagebutton'}
+      accessible
+      accessibilityRole="button"
       accessibilityLabel={
         selectionMode
           ? `Photo uploaded by ${uploaderName}`
           : `Open photo uploaded by ${uploaderName}`
       }
-      accessibilityState={selectionMode ? { checked: selected } : undefined}
+      accessibilityHint={
+        selectionMode
+          ? `Double tap to ${selected ? 'deselect' : 'select'} this photo.`
+          : 'Double tap to open. Use the Select photo action to enter selection mode.'
+      }
+      accessibilityState={{ selected: selectionMode && selected }}
+      accessibilityActions={accessibilityActions}
+      onAccessibilityAction={handleAccessibilityAction}
       onPress={handlePress}
       onLongPress={onLongPress ? handleLongPress : undefined}
       style={({ pressed }) => [styles.tile, { width: size, height: size }, pressed && styles.pressed]}
@@ -73,12 +112,20 @@ function PhotoTileComponent({
         height={size}
         contentFit="cover"
         accessibilityLabel={`Photo uploaded by ${uploaderName}`}
+        accessible={false}
+        onRetryAvailabilityChange={setRetryAvailable}
+        retryKey={retryKey}
         sourceWidth={thumbnailWidth}
         sourceHeight={thumbnailHeight}
         onNotFound={handleNotFound}
       />
       {selectionMode ? (
-        <View style={[styles.badge, selected && styles.badgeSelected]} testID={`photo-tile-check-${photoId}`}>
+        <View
+          accessible={false}
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+          style={[styles.badge, selected && styles.badgeSelected]}
+        >
           {selected ? <Ionicons name="checkmark" size={14} color={colors.background} /> : null}
         </View>
       ) : null}

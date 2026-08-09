@@ -28,18 +28,26 @@ interface PhotoSelectionBarProps {
 
 function progressLabel(snapshot: SelectedSaveSnapshot | null): string | null {
   if (!snapshot) return null;
+  const ordinal =
+    snapshot.currentOrdinal === null
+      ? null
+      : Math.min(snapshot.total, Math.max(1, snapshot.currentOrdinal));
   if (snapshot.phase === 'requestingPermission') return 'Requesting Photos access…';
-  if (snapshot.phase === 'stopping') return 'Stopping after the current photo…';
+  if (snapshot.phase === 'stopping') {
+    return ordinal === null
+      ? 'Stopping after the current photo…'
+      : `Stopping after photo ${ordinal} of ${snapshot.total}…`;
+  }
   if (snapshot.phase === 'paused') return 'Saving paused.';
-  if (snapshot.phase !== 'running' || snapshot.currentOrdinal === null) return null;
+  if (snapshot.phase !== 'running' || ordinal === null) return null;
 
   if (snapshot.stage === 'saving') {
-    return `Saving ${snapshot.currentOrdinal} of ${snapshot.total}`;
+    return `Saving ${ordinal} of ${snapshot.total}`;
   }
   if (snapshot.stage === 'downloading') {
-    return `Downloading ${snapshot.currentOrdinal} of ${snapshot.total}`;
+    return `Downloading ${ordinal} of ${snapshot.total}`;
   }
-  return `Preparing ${snapshot.currentOrdinal} of ${snapshot.total}`;
+  return `Preparing ${ordinal} of ${snapshot.total}`;
 }
 
 function countsLabel(snapshot: SelectedSaveSnapshot | null): string | null {
@@ -79,6 +87,14 @@ export function PhotoSelectionBar({
   const atCap = selectedCount >= PHOTO_SAVE_SELECTION_MAX;
   const hasSession = saveSnapshot !== null;
   const progress = progressLabel(saveSnapshot);
+  const progressValue =
+    active && saveSnapshot?.currentOrdinal !== null && saveSnapshot?.currentOrdinal !== undefined
+      ? {
+          min: 1,
+          max: saveSnapshot.total,
+          now: Math.min(saveSnapshot.total, Math.max(1, saveSnapshot.currentOrdinal)),
+        }
+      : undefined;
   const counts = countsLabel(saveSnapshot);
   const selectLabel =
     loadedCount >= PHOTO_SAVE_SELECTION_MAX ? 'Select up to 100' : 'Select all loaded';
@@ -113,16 +129,28 @@ export function PhotoSelectionBar({
       ) : null}
 
       {progress ? (
-        <View style={styles.progressRow}>
+        <View
+          accessible={active}
+          accessibilityLabel={active ? progress : undefined}
+          accessibilityLiveRegion={active ? 'polite' : 'none'}
+          accessibilityRole={active ? 'progressbar' : undefined}
+          accessibilityValue={progressValue}
+          style={styles.progressRow}
+          testID="photo-selection-progress"
+        >
           {active ? <ActivityIndicator color={colors.primary} /> : null}
-          <Text accessibilityLiveRegion="polite" style={styles.progress}>
+          <Text accessible={!active} style={styles.progress}>
             {progress}
           </Text>
         </View>
       ) : null}
 
       {counts ? (
-        <Text accessibilityLiveRegion="polite" style={styles.progress} testID="photo-save-counts">
+        <Text
+          accessibilityLiveRegion={active ? 'none' : 'polite'}
+          style={styles.progress}
+          testID="photo-save-counts"
+        >
           {counts}
         </Text>
       ) : null}

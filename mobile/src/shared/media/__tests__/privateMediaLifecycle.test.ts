@@ -14,6 +14,7 @@ import {
   subscribeToPrivateMediaGeneration,
   suspendPrivateMediaSession,
   trackPrivateOperation,
+  trackPrivateTransferOperation,
   waitForPrivateNetworkIdle,
 } from '../privateMediaLifecycle';
 import { createDeferred, flushMicrotasks } from '@test/fakeProtectedTransport';
@@ -159,42 +160,89 @@ describe('private network activity barrier', () => {
 });
 
 describe('transfer leases', () => {
-  it('defers a background purge while a transfer holds files it still needs', async () => {
+  it('invalidates protected work immediately while a held upload lease fences only upload temp', async () => {
     await startPrivateMediaSession();
     purgeLog.length = 0;
     const release = acquirePrivateTransferLease();
+    const transferResult = createDeferred<void>();
+    let transferAborted = false;
+    const transfer = trackPrivateTransferOperation(async (signal) => {
+      signal.addEventListener('abort', () => {
+        transferAborted = true;
+      });
+      try {
+        await transferResult.promise;
+      } finally {
+        release();
+      }
+    });
+    let protectedAborted = false;
+    const protectedWork = trackPrivateOperation(async (signal) => {
+      await new Promise<void>((resolve) => {
+        signal.addEventListener('abort', () => {
+          protectedAborted = true;
+          resolve();
+        });
+      });
+    });
 
     suspendPrivateMediaSession();
 
-    // New work is refused, but the epoch has not moved and nothing was deleted:
-    // an upload mid-batch keeps its temp files.
+    // The privacy boundary is synchronous even though upload-temp is still in
+    // use by the operation that already started.
     expect(isPrivateMediaSessionOpen()).toBe(false);
-    expect(getPrivateMediaEpoch()).toBe(0);
-    expect(purgeLog).toEqual([]);
+    expect(getPrivateMediaEpoch()).toBe(1);
+    expect(protectedAborted).toBe(true);
+    expect(transferAborted).toBe(false);
+    expect(getPrivateTransferLeaseCount()).toBe(1);
 
-    release();
+    await protectedWork;
+    await flushMicrotasks();
+    expect(purgeLog).toEqual(['protected-assets']);
+
+    transferResult.resolve();
+    await transfer;
     await flushPrivateMediaPurge();
 
     expect(getPrivateMediaEpoch()).toBe(1);
     expect(purgeLog).toEqual(['protected-assets', 'upload-temp']);
   });
 
-  it('cancels a deferred purge when the app foregrounds before the lease releases', async () => {
+  it('does not cancel protected cleanup or reopen early when foreground wins before release', async () => {
     await startPrivateMediaSession();
     purgeLog.length = 0;
+    const protectedStarted = createDeferred<void>();
+    const protectedGate = createDeferred<void>();
+    protectedPurge = async () => {
+      purgeLog.push('protected-assets');
+      protectedStarted.resolve();
+      await protectedGate.promise;
+    };
     const release = acquirePrivateTransferLease();
 
     suspendPrivateMediaSession();
-    await resumePrivateMediaSession();
+    const resuming = resumePrivateMediaSession();
+    await protectedStarted.promise;
+
+    expect(getPrivateMediaEpoch()).toBe(1);
+    expect(isPrivateMediaSessionOpen()).toBe(false);
+    expect(purgeLog).toEqual(['protected-assets']);
+
+    protectedGate.resolve();
+    await flushMicrotasks();
+    // The protected barrier completed, but the separate upload-temp barrier is
+    // still fenced and the acquisition gate cannot admit a second transfer.
+    expect(isPrivateMediaSessionOpen()).toBe(false);
+
     release();
-    await flushPrivateMediaPurge();
+    await resuming;
 
     expect(isPrivateMediaSessionOpen()).toBe(true);
-    expect(getPrivateMediaEpoch()).toBe(0);
-    expect(purgeLog).toEqual([]);
+    expect(getPrivateMediaEpoch()).toBe(1);
+    expect(purgeLog).toEqual(['protected-assets', 'upload-temp']);
   });
 
-  it('cancels a deferred purge when the lease releases before resume continues', async () => {
+  it('runs upload-temp purge after release when the lease releases before resume continues', async () => {
     await startPrivateMediaSession();
     purgeLog.length = 0;
     const release = acquirePrivateTransferLease();
@@ -208,8 +256,35 @@ describe('transfer leases', () => {
     await flushPrivateMediaPurge();
 
     expect(isPrivateMediaSessionOpen()).toBe(true);
-    expect(getPrivateMediaEpoch()).toBe(0);
-    expect(purgeLog).toEqual([]);
+    expect(getPrivateMediaEpoch()).toBe(1);
+    expect(purgeLog).toEqual(['protected-assets', 'upload-temp']);
+  });
+
+  it('handles repeated background and foreground transitions without duplicate invalidation', async () => {
+    await startPrivateMediaSession();
+    purgeLog.length = 0;
+
+    suspendPrivateMediaSession();
+    suspendPrivateMediaSession();
+    const firstResume = resumePrivateMediaSession();
+    const duplicateResume = resumePrivateMediaSession();
+    await Promise.all([firstResume, duplicateResume]);
+
+    expect(getPrivateMediaEpoch()).toBe(1);
+    expect(isPrivateMediaSessionOpen()).toBe(true);
+    expect(purgeLog).toEqual(['protected-assets', 'upload-temp']);
+
+    suspendPrivateMediaSession();
+    await resumePrivateMediaSession();
+
+    expect(getPrivateMediaEpoch()).toBe(2);
+    expect(isPrivateMediaSessionOpen()).toBe(true);
+    expect(purgeLog).toEqual([
+      'protected-assets',
+      'upload-temp',
+      'protected-assets',
+      'upload-temp',
+    ]);
   });
 
   it('purges immediately on background when nothing holds a lease', async () => {
@@ -236,8 +311,12 @@ describe('transfer leases', () => {
     };
 
     const release = acquirePrivateTransferLease();
-    const operation = trackPrivateOperation(async (signal) => {
+    let transferAborted = false;
+    const operation = trackPrivateTransferOperation(async (signal) => {
       expect(signal.aborted).toBe(false);
+      signal.addEventListener('abort', () => {
+        transferAborted = true;
+      });
       try {
         // Model a native/Axios request that observes abort but cannot release its
         // file synchronously. Its promise owns the request-body lease until the
@@ -250,6 +329,7 @@ describe('transfer leases', () => {
     });
 
     beginPrivateMediaShutdown();
+    expect(transferAborted).toBe(true);
     await flushMicrotasks();
 
     expect(getPrivateMediaEpoch()).toBe(1);

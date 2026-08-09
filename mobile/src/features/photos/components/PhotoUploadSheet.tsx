@@ -12,6 +12,12 @@ interface PhotoUploadSheetProps {
 
 const RUNNING_PHASES = new Set(['preprocessing', 'uploading']);
 
+function stoppingLabel(snapshot: UploadSnapshot): string {
+  if (snapshot.phase === 'preprocessing') return 'Stopping after current preparation…';
+  if (snapshot.phase === 'uploading') return 'Stopping after current upload…';
+  return 'Stopping after current operation…';
+}
+
 function remainingCount(snapshot: UploadSnapshot): number {
   return snapshot.items.filter(
     (item) =>
@@ -23,6 +29,7 @@ function remainingCount(snapshot: UploadSnapshot): number {
 }
 
 export function uploadSummaryLine(snapshot: UploadSnapshot): string {
+  if (snapshot.stopping) return stoppingLabel(snapshot);
   switch (snapshot.phase) {
     case 'idle':
       return 'Ready to upload';
@@ -59,6 +66,24 @@ export function uploadSummaryLine(snapshot: UploadSnapshot): string {
 }
 
 function ActiveProgress({ snapshot }: { snapshot: UploadSnapshot }) {
+  if (snapshot.phase === 'preprocessing' && snapshot.activePreparation) {
+    const total = Math.max(1, snapshot.activePreparation.total);
+    const current = Math.min(total, Math.max(1, snapshot.activePreparation.current));
+    return (
+      <View
+        accessible
+        accessibilityLabel={`Preparing photo ${current} of ${total}`}
+        accessibilityLiveRegion="polite"
+        accessibilityRole="progressbar"
+        accessibilityValue={{ min: 1, max: total, now: current }}
+        style={styles.indeterminateProgress}
+        testID="photo-upload-preparation-progress"
+      >
+        <ActivityIndicator color={colors.primary} size="small" />
+      </View>
+    );
+  }
+
   const batch = snapshot.activeBatch;
   if (snapshot.phase !== 'uploading' || !batch) return null;
 
@@ -67,12 +92,13 @@ function ActiveProgress({ snapshot }: { snapshot: UploadSnapshot }) {
       <View
         accessible
         accessibilityLabel={`Uploading batch ${batch.number}`}
+        accessibilityLiveRegion="polite"
         accessibilityRole="progressbar"
         style={styles.indeterminateProgress}
         testID="photo-upload-progress-indeterminate"
       >
         <ActivityIndicator color={colors.primary} size="small" />
-        <Text style={styles.progressText}>Uploading…</Text>
+        <Text accessible={false} style={styles.progressText}>Uploading…</Text>
       </View>
     );
   }
@@ -89,6 +115,7 @@ function ActiveProgress({ snapshot }: { snapshot: UploadSnapshot }) {
       <View
         accessible
         accessibilityLabel={`Upload progress ${percent} percent`}
+        accessibilityLiveRegion="polite"
         accessibilityRole="progressbar"
         accessibilityValue={{ min: 0, max: 100, now: percent }}
         style={styles.progressTrack}
@@ -129,7 +156,11 @@ export function PhotoUploadSheet({ snapshot, onStart, onStop, onClose }: PhotoUp
           <Text accessibilityRole="header" style={styles.title}>
             Upload photos
           </Text>
-          <Text accessibilityLiveRegion="polite" style={styles.summary}>
+          <Text
+            accessible={!running}
+            accessibilityLiveRegion={running ? 'none' : 'polite'}
+            style={styles.summary}
+          >
             {uploadSummaryLine(snapshot)}
           </Text>
           <Text style={styles.aggregate} testID="photo-upload-aggregate">
@@ -175,7 +206,12 @@ export function PhotoUploadSheet({ snapshot, onStart, onStop, onClose }: PhotoUp
           {canStart ? <Button title="Start upload" onPress={onStart} /> : null}
           {canResume ? <Button title="Resume" onPress={onStart} /> : null}
           {running ? (
-            <Button title="Stop after current batch" variant="secondary" onPress={onStop} />
+            <Button
+              title={snapshot.stopping ? 'Stopping…' : 'Stop after current operation'}
+              variant="secondary"
+              disabled={snapshot.stopping}
+              onPress={onStop}
+            />
           ) : null}
           {!running ? (
             <Button

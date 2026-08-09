@@ -19,7 +19,9 @@ function snapshot(overrides: Partial<UploadSnapshot> = {}): UploadSnapshot {
     unknownCount: 0,
     failedCount: 0,
     batchesUploaded: 0,
+    activePreparation: null,
     activeBatch: null,
+    stopping: false,
     error: null,
     ...overrides,
   };
@@ -74,6 +76,30 @@ describe('uploadSummaryLine', () => {
 });
 
 describe('PhotoUploadSheet progress and controls', () => {
+  it('exposes structured determinate preprocessing progress with one AX progress node', async () => {
+    await render(
+      <PhotoUploadSheet
+        snapshot={snapshot({
+          phase: 'preprocessing',
+          items: [item(1, 'rejected'), item(2, 'processing'), item(3, 'queued')],
+          selectedCount: 3,
+          activePreparation: { current: 2, total: 3 },
+        })}
+        onStart={noop}
+        onStop={noop}
+        onClose={noop}
+      />,
+    );
+
+    expect(screen.getByText('Preparing photo 2 of 3')).toBeTruthy();
+    expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+    expect(screen.getByRole('progressbar').props.accessibilityValue).toEqual({
+      min: 1,
+      max: 3,
+      now: 2,
+    });
+  });
+
   it('renders and clamps known multipart progress with accessibility value', async () => {
     await render(
       <PhotoUploadSheet
@@ -104,6 +130,7 @@ describe('PhotoUploadSheet progress and controls', () => {
       max: 100,
       now: 100,
     });
+    expect(screen.getAllByRole('progressbar')).toHaveLength(1);
   });
 
   it('renders an accessible indeterminate spinner without a percentage', async () => {
@@ -126,7 +153,50 @@ describe('PhotoUploadSheet progress and controls', () => {
 
     expect(screen.getByTestId('photo-upload-progress-indeterminate')).toBeTruthy();
     expect(screen.getByLabelText('Uploading batch 1')).toBeTruthy();
+    expect(screen.getByRole('progressbar').props.accessibilityValue).toBeUndefined();
     expect(screen.queryByText(/%/)).toBeNull();
+  });
+
+  it('acknowledges Stop immediately with phase-specific copy and a disabled repeat action', async () => {
+    const onStop = jest.fn();
+    const view = await render(
+      <PhotoUploadSheet
+        snapshot={snapshot({
+          phase: 'preprocessing',
+          stopping: true,
+          activePreparation: { current: 1, total: 2 },
+        })}
+        onStart={noop}
+        onStop={onStop}
+        onClose={noop}
+      />,
+    );
+
+    expect(screen.getByText('Stopping after current preparation…')).toBeTruthy();
+    const preparingStop = screen.getByLabelText('Stopping…');
+    expect(preparingStop.props.accessibilityState.disabled).toBe(true);
+    await fireEvent.press(preparingStop);
+    expect(onStop).not.toHaveBeenCalled();
+
+    await view.rerender(
+      <PhotoUploadSheet
+        snapshot={snapshot({
+          phase: 'uploading',
+          stopping: true,
+          activeBatch: {
+            number: 1,
+            itemCount: 2,
+            loadedBytes: 25,
+            totalBytes: 100,
+          },
+        })}
+        onStart={noop}
+        onStop={onStop}
+        onClose={noop}
+      />,
+    );
+    expect(screen.getByText('Stopping after current upload…')).toBeTruthy();
+    expect(screen.getByLabelText('Stopping…').props.accessibilityState.disabled).toBe(true);
   });
 
   it('does not offer Resume after Stop wins a throttle response', async () => {

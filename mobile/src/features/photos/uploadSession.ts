@@ -57,6 +57,11 @@ export interface ActiveBatchProgress {
   totalBytes: number | null;
 }
 
+export interface ActivePreparationProgress {
+  current: number;
+  total: number;
+}
+
 export interface UploadSnapshot {
   phase: UploadPhase;
   items: UploadItem[];
@@ -69,7 +74,10 @@ export interface UploadSnapshot {
   unknownCount: number;
   failedCount: number;
   batchesUploaded: number;
+  activePreparation: ActivePreparationProgress | null;
   activeBatch: ActiveBatchProgress | null;
+  /** Synchronous acknowledgement while the current awaited operation settles. */
+  stopping: boolean;
   error: PhotoFailure | null;
 }
 
@@ -218,6 +226,23 @@ export function createUploadSession(
   }
 
   function snapshot(): UploadSnapshot {
+    const preparationItem =
+      phase === 'preprocessing'
+        ? items.find((item) => item.state === 'processing') ??
+          items.find((item) => item.state === 'queued')
+        : undefined;
+    const activePreparation = preparationItem
+      ? {
+          current: Math.min(items.length, Math.max(1, preparationItem.index)),
+          total: items.length,
+        }
+      : null;
+    const terminal =
+      phase === 'complete' ||
+      phase === 'partial' ||
+      phase === 'stopped' ||
+      phase === 'cancelled' ||
+      phase === 'tripGone';
     return {
       phase,
       items: items.map((item) => ({ ...item })),
@@ -231,7 +256,9 @@ export function createUploadSession(
       unknownCount: countBy('unknown'),
       failedCount: countBy('failed'),
       batchesUploaded,
+      activePreparation,
       activeBatch: activeBatch ? { ...activeBatch } : null,
+      stopping: intent === 'stop' && !terminal,
       error,
     };
   }
@@ -795,8 +822,10 @@ export function createUploadSession(
     ) {
       return;
     }
+    if (intent === 'stop') {
+      return;
+    }
     promoteIntent('stop');
-    clearActiveBatchProgress();
 
     if (!activeRun) {
       phase = 'stopped';
