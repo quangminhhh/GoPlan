@@ -1,3 +1,5 @@
+import type { AppOwnedPickerSourceUri } from './pickerSourceStore';
+
 /**
  * Shared contract for picking, preprocessing, and uploading images.
  *
@@ -21,7 +23,39 @@ export interface PickedImage {
 
 /** Cancelling the system picker is an ordinary outcome, not an exception. */
 export type PickImageOutcome =
-  | { status: 'picked'; image: PickedImage }
+  | {
+      status: 'picked';
+      image: PickedImage;
+      /** Explicit delete authority; null for Photos originals/non-local URIs. */
+      ownedSourceUri: AppOwnedPickerSourceUri | null;
+    }
+  | { status: 'cancelled' };
+
+/**
+ * Multi-select outcome.
+ *
+ * `unreadable` carries the assets the picker described in a way this app cannot
+ * act on — dimensions of zero, most often an iCloud asset that never
+ * materialised. They are reported per file so the rest of the selection still
+ * uploads, and they are identified by position because a picker-supplied name is
+ * frequently absent and never trustworthy.
+ */
+export type PickedUploadEntry =
+  | {
+      index: number;
+      status: 'readable';
+      image: PickedImage;
+      ownedSourceUri: AppOwnedPickerSourceUri | null;
+    }
+  | {
+      index: number;
+      status: 'unreadable';
+      fileName: string | null;
+      ownedSourceUri: AppOwnedPickerSourceUri | null;
+    };
+
+export type PickImagesOutcome =
+  | { status: 'picked'; entries: PickedUploadEntry[] }
   | { status: 'cancelled' };
 
 export interface PreprocessTarget {

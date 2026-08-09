@@ -2,7 +2,7 @@
 
 ## 1. Scope
 
-This file applies to `mobile/` and overrides root `AGENTS.md` for mobile-specific behavior.
+This file applies to `mobile/` and overrides root `CLAUDE.md` for mobile-specific behavior.
 
 ## 2. Stack
 
@@ -37,6 +37,7 @@ xcrun simctl list devices available
 - Confirm that an available `iPhone 17 Pro Max` and a compatible iOS runtime are already installed. If either is missing, report it before downloading or creating anything.
 - If `.env` does not exist, copy `.env.example` to `.env`; never overwrite an existing real environment file.
 - For the default Simulator workflow, set `EXPO_PUBLIC_API_URL=http://127.0.0.1:8000` in `.env` (no `/api` suffix) and expose the Django service on Mac port `8000`.
+- Start the local backend from the repository root with `podman compose up -d backend mailpit`. Verify it with `curl http://127.0.0.1:8000/admin/login/`; HTTP `200` is the current readiness check because this repository has no `/health` route. Workers are not required for basic app startup, but are required for E2E journeys that exercise background jobs.
 - Boot only when the target is currently `Shutdown`, then open the Simulator UI and wait until boot completes:
 
 ```bash
@@ -45,14 +46,14 @@ open -a Simulator
 xcrun simctl bootstatus "iPhone 17 Pro Max" -b
 ```
 
-When XcodeBuildMCP simulator tools are available, prefer them for discovery, build/run, accessibility inspection, screenshots, gestures, and logs. Set the project to `ios/GoPlan.xcodeproj`, scheme to `GoPlan`, and the runtime-discovered iPhone 17 Pro Max simulator ID; do not persist that ID in the repository.
+When XcodeBuildMCP simulator tools are available, prefer them for discovery, native build/debug, accessibility inspection, screenshots, gestures, and logs. Set the workspace to `ios/GoPlan.xcworkspace` (not the `.xcodeproj`), scheme to `GoPlan`, and the runtime-discovered iPhone 17 Pro Max simulator ID; do not persist that ID in the repository. Daily Metro startup still uses `pnpm start`.
 
 ### Build and install a new development version
 
 Use this the first time, when the app is missing, or after native code/configuration changes:
 
 ```bash
-pnpm exec expo run:ios --device "iPhone 17 Pro Max" --configuration Debug
+pnpm rebuild:sim
 ```
 
 The command builds the native iOS app, installs it in the selected Simulator, launches GoPlan, and starts Metro.
@@ -65,16 +66,33 @@ A rebuild is required when:
 
 A rebuild is **not** required for ordinary TS/TSX/JavaScript changes, Metro-served assets, or an `EXPO_PUBLIC_` value change.
 
+The generated `ios/` directory is ignored. Expo only creates it automatically when it is absent, so after changing `app.json`, an Expo config plugin, or native dependency configuration, explicitly regenerate and then rebuild:
+
+```bash
+pnpm prebuild:ios
+pnpm rebuild:sim
+```
+
+`pnpm prebuild:ios` uses `--clean` and regenerates `ios/`. Before running it, confirm that the generated directory contains no intentional local native edits. Do not run it for ordinary application-code changes. Keep the repository's intentional Expo/React Native ABI pins; do not run blanket `expo install --fix`.
+
 ### Daily development (existing dev build; no native rebuild)
 
 ```bash
-pnpm exec expo start --dev-client --localhost
-xcrun simctl launch "iPhone 17 Pro Max" com.anonymous.goplan
+pnpm start
 ```
 
+- This is the verified one-command workflow. Keep it running in a dedicated terminal or Agent PTY for the whole development/E2E session.
+- The script forces Node to resolve `localhost` to IPv4, starts Metro in development-client mode, and uses Expo's `--ios` deep link to open the installed GoPlan build with the current Metro URL.
+- Do not replace it with a bare `xcrun simctl launch`: that opens the native binary without supplying the current development-server URL. Do not run `pnpm ios`, `pnpm rebuild:sim`, or Xcode build commands for routine JS/TS work.
 - Metro/Fast Refresh handles TS/TSX, JavaScript, styles, assets, and ordinary application logic.
-- After changing an `EXPO_PUBLIC_` value, fully reload the development build. Use `pnpm exec expo start --dev-client --localhost --clear` only if Metro retains a stale value.
-- If the app is not installed or `simctl launch` fails, run the Debug build command above instead of opening Expo Go.
+- After changing an `EXPO_PUBLIC_` value, fully reload the development build. Use `pnpm start:clear` only if Metro retains a stale value; it is a fallback, not the default startup command.
+- If an Agent sandbox prevents Metro from binding a local port, obtain permission to run `pnpm start` on the host. A sandbox bind failure is not evidence that the iOS app needs rebuilding.
+
+Startup is successful only when all of these are true:
+
+1. Expo prints `Using development build` and `Opening exp+goplan://...127.0.0.1:8081 on iPhone 17 Pro Max`.
+2. `curl http://127.0.0.1:8081/status` returns HTTP `200` with `packager-status:running`.
+3. The Simulator displays GoPlan application UI rather than Expo Go, the development launcher, or a red connection-error screen. For Agent QA, confirm this with an XcodeBuildMCP UI snapshot or screenshot.
 
 ### Release-like smoke build
 
@@ -114,10 +132,12 @@ xcrun simctl shutdown "iPhone 17 Pro Max"
 ```
 
 - **Wrong simulator opens:** inspect `xcrun simctl list devices available`, shut down the unintended device, and explicitly target `iPhone 17 Pro Max`.
-- **No development server:** confirm Metro uses `--localhost`, Django is reachable at `127.0.0.1:8000`, and ports `8081` and `8000` are available.
+- **Red screen / cannot connect to development server:** run `lsof -nP -iTCP:8081 -sTCP:LISTEN`. Metro must listen on `127.0.0.1:8081`, not only `[::1]:8081`. Stop the Agent-owned Metro process and restart with `pnpm start`; do not rebuild the app for this IPv4/IPv6 mismatch.
+- **No development server:** run `curl http://127.0.0.1:8081/status`, confirm Django is reachable at `127.0.0.1:8000`, and inspect whether another process owns port `8081`. Do not kill an unrelated process without approval.
 - **Expo Go incompatibility:** close Expo Go and launch the installed GoPlan development build.
-- **Build succeeds but the app does not open:** run `xcrun simctl launch "iPhone 17 Pro Max" com.anonymous.goplan`; then inspect simulator logs if it exits.
-- **Stale JavaScript or environment value:** fully reload first; restart Metro with `--clear` only if needed.
+- **Metro runs but the app does not open:** press `i` in the existing Metro terminal to resend Expo's development-client deep link. If GoPlan is not installed, use `pnpm rebuild:sim`.
+- **Stale JavaScript or environment value:** fully reload first; use `pnpm start:clear` only if needed. A duplicate native-view error immediately after Fast Refresh should also get a full reload before any rebuild.
+- **Native module/config mismatch:** use `pnpm prebuild:ios` followed by `pnpm rebuild:sim` only when native inputs actually changed or logs identify a missing native module.
 - **Missing runtime or device:** stop and report the exact `simctl` output before downloading, creating, erasing, or deleting anything.
 
 Official references: [local app development](https://docs.expo.dev/guides/local-app-development/), [using development builds](https://docs.expo.dev/develop/development-builds/use-development-builds/), and [Expo environment variables](https://docs.expo.dev/guides/environment-variables/).
@@ -154,7 +174,7 @@ Auth or navigation-gate changes additionally require a run on the iPhone 17 Pro 
 
 ## 7. Constraints
 
-- The default dev target is the existing iPhone 17 Pro Max Simulator running a GoPlan development build installed via `pnpm exec expo run:ios --device "iPhone 17 Pro Max"`. Do not point users at App Store Expo Go.
+- The default dev target is the existing iPhone 17 Pro Max Simulator running a GoPlan development build installed via `pnpm rebuild:sim`. Daily development starts with `pnpm start`; do not point users at App Store Expo Go.
 - The debug dev build loads its JS bundle from Metro at launch; without a reachable Metro the app shows a connection error. This is expected in development.
 - Plain HTTP to `127.0.0.1` is for local Simulator development only; release/TestFlight distribution requires a reachable HTTPS backend.
 - Shut down the Simulator after QA to release RAM. Never create/download duplicate runtimes or erase/delete simulator data without owner approval.

@@ -22,6 +22,7 @@
     "expo-image-manipulator": "57.0.2",
     "expo-image-picker": "57.0.2",
     "expo-linking": "~57.0.1",
+    "expo-media-library": "~57.0.3",
     "expo-router": "~57.0.3",
     "expo-secure-store": "~57.0.0",
     "expo-splash-screen": "~57.0.2",
@@ -53,7 +54,10 @@
     "typescript": "~6.0.3"
   },
   "scripts": {
-    "start": "expo start",
+    "start": "NODE_OPTIONS=--dns-result-order=ipv4first expo start --dev-client --localhost --ios",
+    "start:clear": "NODE_OPTIONS=--dns-result-order=ipv4first expo start --dev-client --localhost --ios --clear",
+    "prebuild:ios": "expo prebuild --platform ios --clean",
+    "rebuild:sim": "REACT_NATIVE_PACKAGER_HOSTNAME=localhost expo run:ios --device \"iPhone 17 Pro Max\" --configuration Debug",
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
@@ -61,14 +65,57 @@
     "test": "jest",
     "typecheck": "tsc --noEmit"
   },
+  "expo": {
+    "autolinking": {
+      "ios": {
+        "buildFromSource": [
+          "expo-media-library"
+        ]
+      }
+    },
+    "install": {
+      "exclude": [
+        "@expo/ui",
+        "@types/jest",
+        "eslint-config-expo",
+        "expo",
+        "expo-constants",
+        "expo-dev-client",
+        "expo-device",
+        "expo-file-system",
+        "expo-font",
+        "expo-glass-effect",
+        "expo-image",
+        "expo-image-manipulator",
+        "expo-image-picker",
+        "expo-linking",
+        "expo-modules-core",
+        "expo-router",
+        "expo-secure-store",
+        "expo-splash-screen",
+        "expo-status-bar",
+        "expo-symbols",
+        "expo-system-ui",
+        "expo-web-browser",
+        "jest-expo",
+        "react-native",
+        "react-native-reanimated",
+        "react-native-screens",
+        "react-native-worklets"
+      ]
+    }
+  },
   "private": true,
   "jest": {
     "preset": "jest-expo",
     "setupFiles": [
+      "react-native-gesture-handler/jestSetup.js",
       "<rootDir>/test/setup.ts"
     ],
     "transformIgnorePatterns": [
-      "node_modules/(?!(\\.pnpm|((jest-)?react-native|@react-native(-community)?)|expo(nent)?|@expo(nent)?/.*|@expo-google-fonts/.*|react-navigation|@react-navigation/.*|react-native-svg|@testing-library/react-native|test-renderer))"
+      "node_modules/(?!(\\.pnpm|((jest-)?react-native|@react-native(-community)?)|expo(nent)?|@expo(nent)?/.*|@expo-google-fonts/.*|react-navigation|@react-navigation/.*|react-native-svg|@testing-library/react-native|test-renderer))",
+      "/node_modules/react-native-reanimated/plugin/",
+      "/node_modules/@react-native/babel-preset/"
     ],
     "moduleNameMapper": {
       "^@test/(.*)$": "<rootDir>/test/$1",

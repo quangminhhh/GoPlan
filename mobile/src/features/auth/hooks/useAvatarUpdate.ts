@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { nativeImageCodec } from '@/shared/media/imageCodec';
 import { pickImage } from '@/shared/media/pickImage';
+import { discardAppOwnedPickerSource } from '@/shared/media/pickerSourceStore';
 import { preprocessImage } from '@/shared/media/preprocessImage';
 import { AVATAR_TARGET, describeAvatarError } from '../accountErrors';
 import { deleteAvatarRequest, uploadAvatarRequest } from '../api';
@@ -42,23 +43,24 @@ export function useAvatarUpdate(): AvatarUpdate {
         return;
       }
       setStatus('uploading');
-      // Every temp file this flow creates: the picker's full-resolution copy
-      // and the encoded upload. Both sit in the cache directory and nothing
-      // reads them once the request is done, so without this repeated avatar
-      // changes would pile up megabytes there.
-      const temporaries = [outcome.image.uri];
+      // Encoder outputs and picker sources have different delete authority.
+      // The read URI alone must never authorize deleting a Photos original.
+      const encoderOutputs: string[] = [];
       try {
         const file = await preprocessImage(outcome.image, AVATAR_TARGET, nativeImageCodec);
-        temporaries.push(file.uri);
+        encoderOutputs.push(file.uri);
         // The response carries the whole user; replace it rather than patching
         // avatar_url, so every derived field stays server-authoritative.
         updateUser(await uploadAvatarRequest(file));
       } finally {
         // Cleanup runs on the failure path too, and must never replace the
         // outcome the user is actually waiting on with a delete error.
-        await Promise.all(
-          temporaries.map((uri) => nativeImageCodec.discard(uri).catch(() => undefined)),
-        );
+        await Promise.all([
+          ...encoderOutputs.map((uri) => nativeImageCodec.discard(uri).catch(() => undefined)),
+          outcome.ownedSourceUri
+            ? discardAppOwnedPickerSource(outcome.ownedSourceUri)
+            : Promise.resolve(),
+        ]);
       }
       setStatus('idle');
     } catch (caught) {

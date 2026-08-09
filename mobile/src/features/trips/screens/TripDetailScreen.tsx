@@ -170,6 +170,10 @@ export function TripDetailScreen() {
     router.push(`/trips/${tripId}/expenses`);
   }, [router, tripId]);
 
+  const openPhotos = useCallback(() => {
+    router.push(`/trips/${tripId}/photos`);
+  }, [router, tripId]);
+
   if (status === 'loading') {
     return <LoadingScreen />;
   }
@@ -294,6 +298,7 @@ export function TripDetailScreen() {
               onPress={openExpenses}
               style={({ pressed }) => [
                 styles.planningRow,
+                styles.rowDivider,
                 pressed ? styles.planningRowPressed : null,
               ]}
             >
@@ -304,6 +309,26 @@ export function TripDetailScreen() {
                 <Text style={styles.infoText}>Expenses</Text>
                 <Text style={styles.planningDescription}>
                   Track shared costs and settlement
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={colors.textMuted} />
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Open Photos"
+              onPress={openPhotos}
+              style={({ pressed }) => [
+                styles.planningRow,
+                pressed ? styles.planningRowPressed : null,
+              ]}
+            >
+              <View style={styles.infoIcon}>
+                <Ionicons name="images-outline" size={18} color={colors.primary} />
+              </View>
+              <View style={styles.planningCopy}>
+                <Text style={styles.infoText}>Photos</Text>
+                <Text style={styles.planningDescription}>
+                  Browse and share trip photos
                 </Text>
               </View>
               <Ionicons name="chevron-forward" size={20} color={colors.textMuted} />

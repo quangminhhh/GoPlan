@@ -193,7 +193,7 @@ describe('TripDetailScreen', () => {
     expect(await screen.findByText('Overview')).toBeTruthy();
   });
 
-  it('shows Timeline and Expenses Planning entries to every readable trip', async () => {
+  it('shows Timeline, Expenses and Photos Planning entries to every readable trip', async () => {
     mockUseTripDetail.mockReturnValue(
       readyHook({
         ...tripDetail,
@@ -206,11 +206,14 @@ describe('TripDetailScreen', () => {
     expect(screen.getByRole('header', { name: 'Planning' })).toBeTruthy();
     expect(screen.getByText('Timeline')).toBeTruthy();
     expect(screen.getByText('Expenses')).toBeTruthy();
+    expect(screen.getByText('Photos')).toBeTruthy();
 
     await fireEvent.press(screen.getByRole('button', { name: 'Open Timeline' }));
     expect(mockRouter.push).toHaveBeenCalledWith('/trips/trip-123/timeline');
     await fireEvent.press(screen.getByRole('button', { name: 'Open Expenses' }));
     expect(mockRouter.push).toHaveBeenCalledWith('/trips/trip-123/expenses');
+    await fireEvent.press(screen.getByRole('button', { name: 'Open Photos' }));
+    expect(mockRouter.push).toHaveBeenCalledWith('/trips/trip-123/photos');
   });
 
   it('shows only leave for an active member and no actions for a terminal trip', async () => {

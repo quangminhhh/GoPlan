@@ -32,9 +32,12 @@ export const colors = {
   tealSoft: '#CCFBF1',
   slate: '#475569',
   slateSoft: '#E2E8F0',
+  viewerBackground: '#000000',
+  mediaSelectionOverlay: 'rgba(0, 0, 0, 0.35)',
+  mediaBusyOverlay: 'rgba(0, 0, 0, 0.4)',
 } as const;
 
-export const spacing = { xs: 4, sm: 8, md: 16, lg: 24, xl: 32 } as const;
+export const spacing = { xxs: 2, xs: 4, sm: 8, md: 16, lg: 24, xl: 32 } as const;
 
 export const typography = {
   largeTitle: { fontSize: 34, lineHeight: 41, fontWeight: '700' },

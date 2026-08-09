@@ -35,19 +35,18 @@ GoPlan's mobile app — Expo (React Native) client for the GoPlan group trip pla
 4. Build and install the development client (first time or after native changes)
 
    ```bash
-   pnpm exec expo run:ios --device "iPhone 17 Pro Max" --configuration Debug
+   pnpm rebuild:sim
    ```
 
-   Use the installed GoPlan development build, not App Store Expo Go. Rebuild when native dependencies, `app.json`/config plugins, entitlements, or files under `ios/` change.
+   Use the installed GoPlan development build, not App Store Expo Go. After changing `app.json`, config plugins, or native dependency configuration, run `pnpm prebuild:ios` before `pnpm rebuild:sim`. The prebuild command regenerates the ignored `ios/` directory, so do not use it for ordinary app-code changes.
 
 5. Start the dev server (daily workflow; no native rebuild)
 
    ```bash
-   pnpm exec expo start --dev-client --localhost
-   xcrun simctl launch "iPhone 17 Pro Max" com.anonymous.goplan
+   pnpm start
    ```
 
-   Metro hot-reloads JS/TS, styles, and ordinary app changes. `EXPO_PUBLIC_` changes need a full reload, not a native rebuild; use `--clear` only if Metro retains a stale value.
+   This verified command forces Metro to use IPv4 loopback and deep-links the installed development build to the active server. Keep it running while developing or testing. Metro hot-reloads JS/TS, styles, and ordinary app changes. `EXPO_PUBLIC_` changes need a full reload, not a native rebuild; use `pnpm start:clear` only if Metro retains a stale value.
 
 6. Shut down the Simulator after testing to release RAM without deleting app data
 

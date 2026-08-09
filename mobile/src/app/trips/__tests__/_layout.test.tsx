@@ -101,6 +101,15 @@ describe('TripsLayout header actions', () => {
     expect(screen.getByLabelText('Cancel expense form')).toBeTruthy();
   });
 
+  it('registers Photos as a push route', async () => {
+    await render(<TripsLayout />);
+
+    expect(mockRegisterScreen).toHaveBeenCalledWith(
+      '[tripId]/photos/index',
+      expect.objectContaining({ title: 'Photos' }),
+    );
+  });
+
   it('returns to the previous route from the trip detail header when history exists', async () => {
     mockRouter.canGoBack.mockReturnValue(true);
     await render(<TripsLayout />);

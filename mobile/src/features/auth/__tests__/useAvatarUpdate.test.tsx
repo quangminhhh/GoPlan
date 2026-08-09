@@ -5,6 +5,11 @@ jest.mock('@/shared/media/preprocessImage', () => ({ preprocessImage: jest.fn() 
 jest.mock('@/shared/media/imageCodec', () => ({
   nativeImageCodec: { encode: jest.fn(), discard: jest.fn(async () => undefined) },
 }));
+const mockDiscardPickerSource = jest.fn(async (_uri: string) => undefined);
+jest.mock('@/shared/media/pickerSourceStore', () => ({
+  claimAppOwnedPickerSourceUri: jest.fn((uri: string) => uri),
+  discardAppOwnedPickerSource: (uri: string) => mockDiscardPickerSource(uri),
+}));
 jest.mock('../api', () => ({ uploadAvatarRequest: jest.fn(), deleteAvatarRequest: jest.fn() }));
 
 // eslint-disable-next-line import/first
@@ -15,6 +20,8 @@ import { axiosError } from '@test/axiosError';
 import { nativeImageCodec } from '@/shared/media/imageCodec';
 // eslint-disable-next-line import/first
 import { pickImage } from '@/shared/media/pickImage';
+// eslint-disable-next-line import/first
+import { claimAppOwnedPickerSourceUri } from '@/shared/media/pickerSourceStore';
 // eslint-disable-next-line import/first
 import { preprocessImage } from '@/shared/media/preprocessImage';
 // eslint-disable-next-line import/first
@@ -30,6 +37,8 @@ const mockUpload = uploadAvatarRequest as jest.MockedFunction<typeof uploadAvata
 const mockDelete = deleteAvatarRequest as jest.MockedFunction<typeof deleteAvatarRequest>;
 
 const picked = { uri: 'file:///a.heic', width: 4032, height: 4032, fileName: 'IMG_1.HEIC' };
+const ownedSourceUri = claimAppOwnedPickerSourceUri(picked.uri);
+if (!ownedSourceUri) throw new Error('Expected an owned picker test URI.');
 const processed = { uri: 'file:///a.jpg', name: 'IMG_1.jpg', type: 'image/jpeg', width: 512, height: 512, bytes: 60_000 } as const;
 
 describe('useAvatarUpdate', () => {
@@ -38,10 +47,11 @@ describe('useAvatarUpdate', () => {
     // clearAllMocks keeps implementations, so restore the default here rather
     // than letting one test's rejecting discard leak into the next.
     (nativeImageCodec.discard as jest.Mock).mockResolvedValue(undefined);
+    mockDiscardPickerSource.mockResolvedValue(undefined);
   });
 
   it('uploads a picked photo and replaces the session user from the response', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
 
@@ -68,7 +78,7 @@ describe('useAvatarUpdate', () => {
   });
 
   it('reports a preprocess failure without contacting the server', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockRejectedValue(new ImagePreprocessError('BUDGET_UNREACHABLE', 'internal'));
 
     const { result } = await renderHook(useAvatarUpdate);
@@ -84,7 +94,7 @@ describe('useAvatarUpdate', () => {
     ['AVATAR_INVALID_FORMAT', 'Unsupported image format.'],
     ['AVATAR_STORAGE_SAVE_FAILED', 'Could not update avatar storage safely. Please try again.'],
   ])('surfaces the server message for %s and leaves the spinner off', async (errorCode, detail) => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockRejectedValue(axiosError(400, { detail, error_code: errorCode }));
 
@@ -96,7 +106,7 @@ describe('useAvatarUpdate', () => {
   });
 
   it('surfaces a throttled avatar upload as its own state', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockRejectedValue(axiosError(429, {}));
 
@@ -118,7 +128,7 @@ describe('useAvatarUpdate', () => {
   });
 
   it('ignores a second tap that lands before the first upload finishes', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
 
@@ -134,7 +144,7 @@ describe('useAvatarUpdate', () => {
   });
 
   it('ignores a remove tap that lands while an upload is running', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
 
@@ -148,7 +158,7 @@ describe('useAvatarUpdate', () => {
   });
 
   it('releases the lock so a later change still runs', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
 
@@ -159,20 +169,34 @@ describe('useAvatarUpdate', () => {
     expect(mockUpload).toHaveBeenCalledTimes(2);
   });
 
-  it('deletes the picked source and the encoded upload once the request is done', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+  it('deletes the capability-owned source and encoded upload once the request is done', async () => {
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
 
     const { result } = await renderHook(useAvatarUpdate);
     await act(async () => { await result.current.changeAvatar(); });
 
-    expect(nativeImageCodec.discard).toHaveBeenCalledWith(picked.uri);
+    expect(mockDiscardPickerSource).toHaveBeenCalledWith(ownedSourceUri);
+    expect(nativeImageCodec.discard).not.toHaveBeenCalledWith(picked.uri);
+    expect(nativeImageCodec.discard).toHaveBeenCalledWith(processed.uri);
+  });
+
+  it('never deletes a readable source that did not receive picker ownership', async () => {
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri: null });
+    mockPreprocess.mockResolvedValue(processed);
+    mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
+
+    const { result } = await renderHook(useAvatarUpdate);
+    await act(async () => { await result.current.changeAvatar(); });
+
+    expect(mockDiscardPickerSource).not.toHaveBeenCalled();
+    expect(nativeImageCodec.discard).not.toHaveBeenCalledWith(picked.uri);
     expect(nativeImageCodec.discard).toHaveBeenCalledWith(processed.uri);
   });
 
   it('still reports success when deleting a temp file fails', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockResolvedValue(processed);
     mockUpload.mockResolvedValue({ id: 'u1', avatar_url: '/media/a.webp' } as never);
     (nativeImageCodec.discard as jest.Mock).mockRejectedValue(new Error('delete failed'));
@@ -185,18 +209,19 @@ describe('useAvatarUpdate', () => {
   });
 
   it('deletes the picked source even when the upload fails', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockRejectedValue(new ImagePreprocessError('UNREADABLE', 'internal'));
 
     const { result } = await renderHook(useAvatarUpdate);
     await act(async () => { await result.current.changeAvatar(); });
 
-    expect(nativeImageCodec.discard).toHaveBeenCalledWith(picked.uri);
+    expect(mockDiscardPickerSource).toHaveBeenCalledWith(ownedSourceUri);
+    expect(nativeImageCodec.discard).not.toHaveBeenCalledWith(picked.uri);
     expect(result.current.error).not.toBeNull();
   });
 
   it('dismissError clears a previous failure', async () => {
-    mockPick.mockResolvedValue({ status: 'picked', image: picked });
+    mockPick.mockResolvedValue({ status: 'picked', image: picked, ownedSourceUri });
     mockPreprocess.mockRejectedValue(new ImagePreprocessError('UNREADABLE', 'internal'));
 
     const { result } = await renderHook(useAvatarUpdate);

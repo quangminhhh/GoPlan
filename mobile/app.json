@@ -38,7 +38,15 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "GoPlan needs access to your photos so you can set a profile picture."
+          "photosPermission": "Allow GoPlan to access photos you select for profiles and trips."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow GoPlan to access photos you select for profiles and trips.",
+          "savePhotosPermission": "Allow GoPlan to save trip photos to your photo library.",
+          "granularPermissions": ["photo"]
         }
       ]
     ],
