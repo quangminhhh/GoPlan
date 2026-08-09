@@ -1,7 +1,7 @@
 const mockUseSession = jest.fn();
 const mockUnreadCount = jest.fn();
+const mockLastKnownUnreadCount = jest.fn();
 const mockTabsScreen = jest.fn();
-const mockProviderOwner = jest.fn();
 
 jest.mock('expo-router', () => {
   const React = jest.requireActual<typeof import('react')>('react');
@@ -22,11 +22,10 @@ jest.mock('expo-router', () => {
 jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
 jest.mock('@/features/auth/session', () => ({ useSession: () => mockUseSession() }));
 jest.mock('../application/NotificationsProvider', () => ({
-  NotificationsProvider: ({ children, ownerUserId }: { children: import('react').ReactNode; ownerUserId: string }) => {
-    mockProviderOwner(ownerUserId);
-    return children;
-  },
-  useNotifications: () => ({ unreadCount: mockUnreadCount() }),
+  useNotifications: () => ({
+    unreadCount: mockUnreadCount(),
+    lastKnownUnreadCount: mockLastKnownUnreadCount(),
+  }),
 }));
 jest.mock('@/shared/ui/LoadingScreen', () => ({ LoadingScreen: () => null }));
 
@@ -50,13 +49,13 @@ describe('TabsLayout notifications integration', () => {
       status: 'signedIn',
       user: { id: 'user-1', requires_profile_setup: false },
     });
+    mockLastKnownUnreadCount.mockReturnValue(null);
   });
 
-  it('scopes the provider to the authenticated user and caps a large unread badge', async () => {
+  it('caps a large unread badge from the root-owned provider', async () => {
     mockUnreadCount.mockReturnValue(120);
     await render(<TabsLayout />);
 
-    expect(mockProviderOwner).toHaveBeenCalledWith('user-1');
     expect(notificationsOptions()).toEqual(
       expect.objectContaining({ headerShown: false, tabBarBadge: '99+' }),
     );
@@ -66,5 +65,13 @@ describe('TabsLayout notifications integration', () => {
     mockUnreadCount.mockReturnValue(count);
     await render(<TabsLayout />);
     expect(notificationsOptions().tabBarBadge).toBeUndefined();
+  });
+
+  it('shows a degraded dot when the exact count is unknown but unread work was previously known', async () => {
+    mockUnreadCount.mockReturnValue(null);
+    mockLastKnownUnreadCount.mockReturnValue(5);
+    await render(<TabsLayout />);
+
+    expect(notificationsOptions().tabBarBadge).toBe('•');
   });
 });

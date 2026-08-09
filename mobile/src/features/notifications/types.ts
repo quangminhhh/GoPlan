@@ -96,6 +96,8 @@ export interface NotificationsContextValue {
   loadingMore: boolean;
   hasNextPage: boolean;
   unreadCount: number | null;
+  /** Last authoritative count, retained only for degraded badge affordances while `unreadCount` is unknown. */
+  lastKnownUnreadCount: number | null;
   markingAllRead: boolean;
   pendingReadIds: ReadonlySet<string>;
   pendingInvitationActions: ReadonlyMap<string, InvitationAction>;

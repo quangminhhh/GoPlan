@@ -23,6 +23,7 @@ export function NotificationsScreen() {
     loadingMore,
     hasNextPage,
     unreadCount,
+    lastKnownUnreadCount,
     markingAllRead,
     pendingReadIds,
     pendingInvitationActions,
@@ -43,8 +44,10 @@ export function NotificationsScreen() {
   );
 
   const hasUnread = useMemo(
-    () => (unreadCount ?? 0) > 0 || items.some((item) => !item.is_read),
-    [items, unreadCount],
+    () =>
+      (unreadCount ?? lastKnownUnreadCount ?? 0) > 0 ||
+      items.some((item) => !item.is_read),
+    [items, lastKnownUnreadCount, unreadCount],
   );
 
   const openNotification = useCallback(

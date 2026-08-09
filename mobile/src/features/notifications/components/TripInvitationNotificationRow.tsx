@@ -103,13 +103,14 @@ export const TripInvitationNotificationRow = memo(function TripInvitationNotific
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`Trip invitation to ${invitation.trip_name}`}
+        accessibilityValue={{ text: isRead ? 'Read' : 'Unread' }}
         accessibilityState={{ busy: readPending }}
         disabled={readPending}
         onPress={open}
         style={({ pressed }) => [styles.content, pressed && !readPending ? styles.pressed : null]}
       >
         <View style={styles.titleRow}>
-          {!isRead ? <View accessibilityLabel="Unread" style={styles.unreadDot} /> : null}
+          {!isRead ? <View accessible={false} style={styles.unreadDot} /> : null}
           <Text style={styles.title}>
             <Text style={styles.actor}>{actorName}</Text> invited you to a trip
           </Text>

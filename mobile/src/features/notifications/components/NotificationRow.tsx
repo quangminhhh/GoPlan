@@ -106,6 +106,7 @@ export const NotificationRow = memo(function NotificationRow({
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={presentation.title}
+      accessibilityValue={{ text: notification.is_read ? 'Read' : 'Unread' }}
       accessibilityState={{ busy: readPending }}
       disabled={readPending}
       onPress={open}
@@ -116,7 +117,7 @@ export const NotificationRow = memo(function NotificationRow({
       ]}
     >
       <View style={styles.titleRow}>
-        {!notification.is_read ? <View accessibilityLabel="Unread" style={styles.unreadDot} /> : null}
+        {!notification.is_read ? <View accessible={false} style={styles.unreadDot} /> : null}
         <Text style={styles.title}>{presentation.title}</Text>
         {readPending ? <ActivityIndicator size="small" color={colors.primary} /> : null}
       </View>
