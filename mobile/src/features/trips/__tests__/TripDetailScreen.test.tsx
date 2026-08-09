@@ -193,7 +193,7 @@ describe('TripDetailScreen', () => {
     expect(await screen.findByText('Overview')).toBeTruthy();
   });
 
-  it('shows Timeline, Expenses and Photos Planning entries to every readable trip', async () => {
+  it('shows Chat, Timeline, Expenses and Photos Planning entries to every readable trip', async () => {
     mockUseTripDetail.mockReturnValue(
       readyHook({
         ...tripDetail,
@@ -204,10 +204,13 @@ describe('TripDetailScreen', () => {
     await render(<TripDetailScreen />);
 
     expect(screen.getByRole('header', { name: 'Planning' })).toBeTruthy();
+    expect(screen.getByText('Chat')).toBeTruthy();
     expect(screen.getByText('Timeline')).toBeTruthy();
     expect(screen.getByText('Expenses')).toBeTruthy();
     expect(screen.getByText('Photos')).toBeTruthy();
 
+    await fireEvent.press(screen.getByRole('button', { name: 'Open Chat' }));
+    expect(mockRouter.push).toHaveBeenCalledWith('/trips/trip-123/chat');
     await fireEvent.press(screen.getByRole('button', { name: 'Open Timeline' }));
     expect(mockRouter.push).toHaveBeenCalledWith('/trips/trip-123/timeline');
     await fireEvent.press(screen.getByRole('button', { name: 'Open Expenses' }));

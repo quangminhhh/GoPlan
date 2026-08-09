@@ -166,6 +166,10 @@ export function TripDetailScreen() {
     router.push(`/trips/${tripId}/timeline`);
   }, [router, tripId]);
 
+  const openChat = useCallback(() => {
+    router.push(`/trips/${tripId}/chat`);
+  }, [router, tripId]);
+
   const openExpenses = useCallback(() => {
     router.push(`/trips/${tripId}/expenses`);
   }, [router, tripId]);
@@ -271,6 +275,27 @@ export function TripDetailScreen() {
             Planning
           </Text>
           <View style={styles.card}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Open Chat"
+              onPress={openChat}
+              style={({ pressed }) => [
+                styles.planningRow,
+                styles.rowDivider,
+                pressed ? styles.planningRowPressed : null,
+              ]}
+            >
+              <View style={styles.infoIcon}>
+                <Ionicons name="chatbubbles-outline" size={18} color={colors.primary} />
+              </View>
+              <View style={styles.planningCopy}>
+                <Text style={styles.infoText}>Chat</Text>
+                <Text style={styles.planningDescription}>
+                  Message trip members in real time
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={colors.textMuted} />
+            </Pressable>
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Open Timeline"
