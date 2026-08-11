@@ -28,13 +28,18 @@ function isNonEmptyString(value: unknown): value is string {
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Returns one canonical room identity, or null for a malformed route/wire id. */
-export function canonicalizeChatTripId(value: unknown): string | null {
+/** Returns one canonical chat UUID, or null for a malformed route/wire id. */
+export function canonicalizeChatUuid(value: unknown): string | null {
   if (typeof value !== 'string') {
     return null;
   }
   const normalized = value.trim();
   return UUID_PATTERN.test(normalized) ? normalized.toLowerCase() : null;
+}
+
+/** Returns one canonical room identity, or null for a malformed route/wire id. */
+export function canonicalizeChatTripId(value: unknown): string | null {
+  return canonicalizeChatUuid(value);
 }
 
 export function isChatChangeSequence(value: unknown): value is number {
@@ -124,11 +129,16 @@ export function parseChatMessage(value: unknown): ChatMessage | null {
   }
 
   const sender = value.sender;
+  const messageId = canonicalizeChatUuid(value.id);
   const tripId = canonicalizeChatTripId(value.trip_id);
+  const clientMessageId =
+    value.client_message_id === null
+      ? null
+      : canonicalizeChatUuid(value.client_message_id);
   const reactions = parseChatReactionSummaries(value.reactions);
   const actionDrafts = parseActionDrafts(value.action_drafts);
   if (
-    !isNonEmptyString(value.id) ||
+    messageId === null ||
     tripId === null ||
     !isNullableNonEmptyString(sender.id) ||
     typeof sender.display_name !== 'string' ||
@@ -139,7 +149,7 @@ export function parseChatMessage(value: unknown): ChatMessage | null {
       value.ai_status !== 'SUCCESS' &&
       value.ai_status !== 'ERROR') ||
     typeof value.content !== 'string' ||
-    !isNullableNonEmptyString(value.client_message_id) ||
+    (value.client_message_id !== null && clientMessageId === null) ||
     !isNonEmptyString(value.created_at) ||
     !isNonEmptyString(value.updated_at) ||
     !isChatChangeSequence(value.change_sequence) ||
@@ -155,7 +165,7 @@ export function parseChatMessage(value: unknown): ChatMessage | null {
   }
 
   return {
-    id: value.id,
+    id: messageId,
     trip_id: tripId,
     sender: {
       id: sender.id,
@@ -166,7 +176,7 @@ export function parseChatMessage(value: unknown): ChatMessage | null {
     sender_kind: value.sender_kind,
     ai_status: value.ai_status,
     content: value.content,
-    client_message_id: value.client_message_id,
+    client_message_id: clientMessageId,
     created_at: value.created_at,
     updated_at: value.updated_at,
     change_sequence: value.change_sequence,
@@ -188,31 +198,69 @@ export function requireChatMessage(value: unknown): ChatMessage {
   return message;
 }
 
-function requireChatMessages(value: unknown): readonly ChatMessage[] {
+function requireChatMessages(
+  value: unknown,
+  expectedTripId?: string,
+): readonly ChatMessage[] {
   if (!Array.isArray(value)) {
     throw new ChatContractError();
   }
-  return value.map(requireChatMessage);
+  const canonicalExpectedTripId =
+    expectedTripId === undefined
+      ? null
+      : canonicalizeChatTripId(expectedTripId);
+  if (expectedTripId !== undefined && canonicalExpectedTripId === null) {
+    throw new ChatContractError();
+  }
+  return value.map((candidate) => {
+    const message = requireChatMessage(candidate);
+    if (
+      canonicalExpectedTripId !== null &&
+      message.trip_id !== canonicalExpectedTripId
+    ) {
+      throw new ChatContractError();
+    }
+    return message;
+  });
 }
 
-export function parseChatHistoryResponse(value: unknown): ChatHistoryResponse {
+export function requireChatMessageForTrip(
+  value: unknown,
+  expectedTripId: string,
+): ChatMessage {
+  const canonicalExpectedTripId = canonicalizeChatTripId(expectedTripId);
+  const message = requireChatMessage(value);
+  if (
+    canonicalExpectedTripId === null ||
+    message.trip_id !== canonicalExpectedTripId
+  ) {
+    throw new ChatContractError();
+  }
+  return message;
+}
+
+export function parseChatHistoryResponse(
+  value: unknown,
+  expectedTripId?: string,
+): ChatHistoryResponse {
   if (!isRecord(value) || !isNullableString(value.next_cursor)) {
     throw new ChatContractError();
   }
   return {
-    results: requireChatMessages(value.results),
+    results: requireChatMessages(value.results, expectedTripId),
     next_cursor: value.next_cursor,
   };
 }
 
 export function parseChatReconciliationResponse(
   value: unknown,
+  expectedTripId?: string,
 ): ChatGapFillResponse | ChatChangeSyncResponse {
   if (!isRecord(value) || typeof value.has_more !== 'boolean') {
     throw new ChatContractError();
   }
   return {
-    results: requireChatMessages(value.results),
+    results: requireChatMessages(value.results, expectedTripId),
     has_more: value.has_more,
   };
 }
@@ -221,11 +269,16 @@ export function parseHiddenMessageIds(value: unknown): readonly string[] {
   if (!isRecord(value)) {
     throw new ChatContractError();
   }
-  const messageIds = parseStringIds(value.hidden_message_ids, true);
-  if (messageIds === null) {
+  const messageIds = parseStringIds(value.hidden_message_ids, false);
+  const canonicalIds = messageIds?.map(canonicalizeChatUuid) ?? null;
+  if (
+    canonicalIds === null ||
+    canonicalIds.some((messageId) => messageId === null) ||
+    new Set(canonicalIds).size !== canonicalIds.length
+  ) {
     throw new ChatContractError();
   }
-  return messageIds;
+  return canonicalIds as readonly string[];
 }
 
 export function parseReactionResponse(value: unknown): ChatReactionMutationResult {

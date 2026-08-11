@@ -150,6 +150,11 @@ export type TranscriptAction =
       readonly requestVersion: number;
     })
   | (ResourceScopedAction & {
+      readonly type: 'SUSPEND_ACCESS';
+      readonly sendError: ChatApiFailure;
+      readonly mutationError: ChatApiFailure;
+    })
+  | (ResourceScopedAction & {
       readonly type: 'CATCHUP_PHASE';
       readonly phase: 'gap' | 'update' | null;
     })
@@ -758,6 +763,68 @@ export function transcriptReducer(
         pendingDeleteMessageIds: new Set(),
         isHidingMessages: false,
         mutationError: null,
+      };
+    }
+
+    case 'SUSPEND_ACCESS': {
+      const activeSendClientIds = [...state.pending.keys()].filter(
+        (clientMessageId) => !state.failedClientIds.has(clientMessageId),
+      );
+      const interruptedMessageIds = new Set([
+        ...state.reactionOverlays.keys(),
+        ...state.pendingDeleteMessageIds,
+      ]);
+      const interruptedMutation =
+        interruptedMessageIds.size > 0 || state.isHidingMessages;
+      const hadBusyState =
+        activeSendClientIds.length > 0 ||
+        interruptedMutation ||
+        state.isLoadingOlder ||
+        state.isGapFilling ||
+        state.isUpdating;
+      if (!hadBusyState) {
+        return state;
+      }
+
+      const nextVersion = state.version + 1;
+      const pendingVersions = new Map(state.pendingVersions);
+      const failedClientIds = new Set(state.failedClientIds);
+      const failedByClientId = new Map(state.failedByClientId);
+      for (const clientMessageId of activeSendClientIds) {
+        pendingVersions.set(clientMessageId, nextVersion);
+        failedClientIds.add(clientMessageId);
+        failedByClientId.set(clientMessageId, action.sendError);
+      }
+
+      const messageVersions = new Map(state.messageVersions);
+      for (const messageId of state.reactionOverlays.keys()) {
+        messageVersions.set(messageId, nextVersion);
+      }
+      const interruptedMessageId =
+        !state.isHidingMessages && interruptedMessageIds.size === 1
+          ? [...interruptedMessageIds][0]
+          : null;
+
+      return {
+        ...state,
+        version: nextVersion,
+        messageVersions,
+        pendingVersions,
+        failedClientIds,
+        failedByClientId,
+        reactionOverlays: new Map(),
+        pendingReactionMessageIds: new Set(),
+        pendingDeleteMessageIds: new Set(),
+        isLoadingOlder: false,
+        isGapFilling: false,
+        isUpdating: false,
+        isHidingMessages: false,
+        mutationError: interruptedMutation
+          ? {
+              messageId: interruptedMessageId,
+              error: action.mutationError,
+            }
+          : state.mutationError,
       };
     }
 

@@ -1,5 +1,6 @@
 import {
   canonicalizeChatTripId,
+  canonicalizeChatUuid,
   isChatChangeSequence,
   parseChatMessage,
   parseChatReactionSummaries,
@@ -116,8 +117,9 @@ export function parseChatRealtimeEvent(value: unknown): ChatRealtimeEvent | null
     }
     case 'chat.reaction_update': {
       const reactions = parseChatReactionSummaries(value.reactions);
+      const messageId = canonicalizeChatUuid(value.message_id);
       if (
-        !isNonEmptyString(value.message_id) ||
+        messageId === null ||
         reactions === null ||
         !isChatChangeSequence(value.change_sequence) ||
         !isNonEmptyString(value.updated_at)
@@ -127,7 +129,7 @@ export function parseChatRealtimeEvent(value: unknown): ChatRealtimeEvent | null
       return {
         type: value.type,
         ...tripScope,
-        message_id: value.message_id,
+        message_id: messageId,
         reactions,
         change_sequence: value.change_sequence,
         updated_at: value.updated_at,

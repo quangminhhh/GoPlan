@@ -249,6 +249,25 @@ describe('ChatScreen', () => {
     expect(tripASend).not.toHaveBeenCalled();
   });
 
+  it('resets the composer when the signed-in user changes inside the same trip', async () => {
+    mockUseTripChat.mockReturnValue(
+      chatResult({ currentUserId: 'user-a' }),
+    );
+    const view = await render(<ChatScreen />);
+    await fireEvent.changeText(
+      screen.getByLabelText('Message'),
+      'Private draft for user A',
+    );
+
+    mockUseTripChat.mockReturnValue(
+      chatResult({ currentUserId: 'user-b' }),
+    );
+    await view.rerender(<ChatScreen />);
+
+    expect(mockUseTripChat).toHaveBeenLastCalledWith({ tripId: 'trip-1' });
+    expect(screen.getByLabelText('Message').props.value).toBe('');
+  });
+
   it.each([
     ['COMPLETED', 'This completed trip’s chat is read-only.'],
     ['CANCELLED', 'This cancelled trip’s chat is read-only.'],

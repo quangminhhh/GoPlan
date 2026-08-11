@@ -4,13 +4,14 @@ import { normalizeApiError } from '@/shared/api/errors';
 import {
   ChatContractError,
   canonicalizeChatTripId,
+  canonicalizeChatUuid,
   isChatChangeSequence,
   isRecord,
   parseChatHistoryResponse,
   parseChatReconciliationResponse,
   parseHiddenMessageIds,
   parseReactionResponse,
-  requireChatMessage,
+  requireChatMessageForTrip,
 } from './contracts';
 import {
   type AllowedReactionEmoji,
@@ -35,10 +36,6 @@ const RECONCILIATION_DEFAULT_LIMIT = 100;
 const RECONCILIATION_MAX_LIMIT = 200;
 const BULK_HIDE_MAX_MESSAGES = 100;
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0;
-}
-
 function assertLimit(limit: number, maximum: number, label: string): void {
   if (!Number.isInteger(limit) || limit < 1 || limit > maximum) {
     throw new RangeError(`${label} must be an integer from 1 to ${maximum}.`);
@@ -51,6 +48,26 @@ function assertNonEmpty(value: string, label: string): void {
   }
 }
 
+function requireCanonicalUuid(value: unknown, label: string): string {
+  const canonical = canonicalizeChatUuid(value);
+  if (canonical === null) {
+    throw new RangeError(`${label} must be a valid UUID.`);
+  }
+  return canonical;
+}
+
+function canonicalResponseIds(ids: readonly string[]): readonly string[] {
+  const canonicalIds = ids.map(canonicalizeChatUuid);
+  if (canonicalIds.some((id) => id === null)) {
+    throw new ChatContractError();
+  }
+  return canonicalIds as readonly string[];
+}
+
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function chatMessagesPath(tripId: string): string {
   const canonicalTripId = canonicalizeChatTripId(tripId);
   if (canonicalTripId === null) {
@@ -60,7 +77,8 @@ function chatMessagesPath(tripId: string): string {
 }
 
 function chatMessagePath(tripId: string, messageId: string): string {
-  return `${chatMessagesPath(tripId)}/${encodeURIComponent(messageId)}`;
+  const canonicalMessageId = requireCanonicalUuid(messageId, 'Message id');
+  return `${chatMessagesPath(tripId)}/${encodeURIComponent(canonicalMessageId)}`;
 }
 
 function reactionPath(tripId: string, messageId: string): string {
@@ -83,7 +101,7 @@ export async function listChatHistory(
     params,
     signal,
   });
-  return parseChatHistoryResponse(response.data);
+  return parseChatHistoryResponse(response.data, tripId);
 }
 
 export async function gapFillChatMessages(
@@ -93,12 +111,15 @@ export async function gapFillChatMessages(
 ): Promise<ChatGapFillResponse> {
   const limit = options.limit ?? RECONCILIATION_DEFAULT_LIMIT;
   assertLimit(limit, RECONCILIATION_MAX_LIMIT, 'Gap-fill limit');
-  assertNonEmpty(options.since, 'Gap-fill anchor');
+  const canonicalSince = requireCanonicalUuid(
+    options.since,
+    'Gap-fill anchor',
+  );
   const response = await apiClient.get<unknown>(chatMessagesPath(tripId), {
-    params: { since: options.since, limit },
+    params: { since: canonicalSince, limit },
     signal,
   });
-  return parseChatReconciliationResponse(response.data);
+  return parseChatReconciliationResponse(response.data, tripId);
 }
 
 export async function syncChangedChatMessages(
@@ -118,14 +139,16 @@ export async function syncChangedChatMessages(
     limit,
   };
   if (options.changedSinceId !== undefined) {
-    assertNonEmpty(options.changedSinceId, 'Change-sync id');
-    params.changed_since_id = options.changedSinceId;
+    params.changed_since_id = requireCanonicalUuid(
+      options.changedSinceId,
+      'Change-sync id',
+    );
   }
   const response = await apiClient.get<unknown>(chatMessagesPath(tripId), {
     params,
     signal,
   });
-  return parseChatReconciliationResponse(response.data);
+  return parseChatReconciliationResponse(response.data, tripId);
 }
 
 export async function sendChatMessage(
@@ -133,19 +156,33 @@ export async function sendChatMessage(
   input: SendChatMessageInput,
   signal?: AbortSignal,
 ): Promise<SendChatMessageResult> {
+  const canonicalClientMessageId = requireCanonicalUuid(
+    input.clientMessageId,
+    'Client message id',
+  );
   const response = await apiClient.post<unknown>(
     chatMessagesPath(tripId),
     {
       content: input.content,
-      client_message_id: input.clientMessageId,
+      client_message_id: canonicalClientMessageId,
     },
     { signal },
   );
   if (!isRecord(response.data) || (response.status !== 200 && response.status !== 201)) {
     throw new ChatContractError();
   }
+  const message = requireChatMessageForTrip(response.data.message, tripId);
+  const responseClientMessageId = canonicalizeChatUuid(
+    message.client_message_id,
+  );
+  if (responseClientMessageId !== canonicalClientMessageId) {
+    throw new ChatContractError();
+  }
   return {
-    message: requireChatMessage(response.data.message),
+    message: {
+      ...message,
+      client_message_id: responseClientMessageId,
+    },
     disposition: response.status === 201 ? 'created' : 'replayed',
   };
 }
@@ -156,22 +193,51 @@ export async function deleteChatMessage(
   mode: DeleteChatMessageMode,
   signal?: AbortSignal,
 ): Promise<DeleteChatMessageResult> {
+  const canonicalMessageId = requireCanonicalUuid(messageId, 'Message id');
   const response = await apiClient.delete<unknown>(
     chatMessagePath(tripId, messageId),
     { data: { mode }, signal },
   );
   if (mode === 'for_me') {
+    if (
+      !isRecord(response.data) ||
+      !hasOwn(response.data, 'hidden_message_ids') ||
+      hasOwn(response.data, 'message')
+    ) {
+      throw new ChatContractError();
+    }
+    const hiddenMessageIds = canonicalResponseIds(
+      parseHiddenMessageIds(response.data),
+    );
+    if (
+      hiddenMessageIds.length !== 1 ||
+      hiddenMessageIds[0] !== canonicalMessageId
+    ) {
+      throw new ChatContractError();
+    }
     return {
       mode,
-      hidden_message_ids: parseHiddenMessageIds(response.data),
+      hidden_message_ids: hiddenMessageIds,
     };
   }
-  if (!isRecord(response.data)) {
+  if (
+    !isRecord(response.data) ||
+    !hasOwn(response.data, 'message') ||
+    hasOwn(response.data, 'hidden_message_ids')
+  ) {
+    throw new ChatContractError();
+  }
+  const message = requireChatMessageForTrip(response.data.message, tripId);
+  const responseMessageId = canonicalizeChatUuid(message.id);
+  if (
+    responseMessageId !== canonicalMessageId ||
+    !message.is_deleted_for_everyone
+  ) {
     throw new ChatContractError();
   }
   return {
     mode,
-    message: requireChatMessage(response.data.message),
+    message: { ...message, id: responseMessageId },
   };
 }
 
@@ -185,15 +251,32 @@ export async function hideChatMessages(
       `Bulk hide requires 1 to ${BULK_HIDE_MAX_MESSAGES} message ids.`,
     );
   }
-  if (!messageIds.every(isNonEmptyString)) {
-    throw new RangeError('Bulk hide message ids cannot be empty.');
+  const canonicalMessageIds = messageIds.map((messageId) =>
+    canonicalizeChatUuid(messageId),
+  );
+  if (
+    canonicalMessageIds.some((messageId) => messageId === null) ||
+    new Set(canonicalMessageIds).size !== canonicalMessageIds.length
+  ) {
+    throw new RangeError('Bulk hide message ids must be unique UUIDs.');
   }
   const response = await apiClient.post<unknown>(
     `${chatMessagesPath(tripId)}/hide`,
-    { message_ids: [...messageIds] },
+    { message_ids: canonicalMessageIds },
     { signal },
   );
-  return { hidden_message_ids: parseHiddenMessageIds(response.data) };
+  const hiddenMessageIds = canonicalResponseIds(
+    parseHiddenMessageIds(response.data),
+  );
+  const requestedSet = new Set(canonicalMessageIds);
+  if (
+    hiddenMessageIds.length !== canonicalMessageIds.length ||
+    new Set(hiddenMessageIds).size !== hiddenMessageIds.length ||
+    hiddenMessageIds.some((messageId) => !requestedSet.has(messageId))
+  ) {
+    throw new ChatContractError();
+  }
+  return { hidden_message_ids: hiddenMessageIds };
 }
 
 export async function addChatReaction(

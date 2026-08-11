@@ -86,6 +86,37 @@ describe('parseChatRealtimeEvent', () => {
     });
   });
 
+  it('canonicalizes full-message ids, client ids, and reaction patch message ids', () => {
+    const canonicalMessageId = 'a1111111-b111-4111-8111-c11111111111';
+    const canonicalClientId = 'a4444444-b444-4444-8444-c44444444444';
+    expect(
+      parseChatRealtimeEvent({
+        type: 'chat.message',
+        trip_id: tripId,
+        message: {
+          ...message,
+          id: canonicalMessageId.toUpperCase(),
+          client_message_id: canonicalClientId.toUpperCase(),
+        },
+      }),
+    ).toMatchObject({
+      message: {
+        id: canonicalMessageId,
+        client_message_id: canonicalClientId,
+      },
+    });
+    expect(
+      parseChatRealtimeEvent({
+        type: 'chat.reaction_update',
+        trip_id: tripId,
+        message_id: canonicalMessageId.toUpperCase(),
+        reactions: [],
+        change_sequence: 13,
+        updated_at: '2026-08-09T01:00:02+00:00',
+      }),
+    ).toMatchObject({ message_id: canonicalMessageId });
+  });
+
   it('canonicalizes uppercase room ids for acknowledgements and full events', () => {
     const uppercaseTripId = tripId.toUpperCase();
     expect(
@@ -187,6 +218,14 @@ describe('parseChatRealtimeEvent', () => {
           { emoji: '👍', count: 2, reacted_by_ids: ['user-1', 'user-1'] },
         ],
       },
+    },
+    {
+      type: 'chat.reaction_update',
+      trip_id: tripId,
+      message_id: 'not-a-uuid',
+      reactions: [],
+      change_sequence: 13,
+      updated_at: '2026-08-09T01:00:02+00:00',
     },
     {
       type: 'chat.reaction_update',

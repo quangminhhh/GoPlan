@@ -37,6 +37,20 @@ const terminalFailure: ChatApiFailure = {
   status: 409,
 };
 
+const accessUncertainFailure: ChatApiFailure = {
+  ...failure,
+  kind: 'message',
+  message: 'Chat access is temporarily unavailable.',
+  errorCode: 'CHAT_ACCESS_UNCERTAIN',
+};
+
+const mutationInterruptedFailure: ChatApiFailure = {
+  ...failure,
+  kind: 'message',
+  message: 'A chat mutation was interrupted.',
+  errorCode: 'CHAT_MUTATION_INTERRUPTED',
+};
+
 function reaction(
   emoji: ReactionSummary['emoji'],
   ids: readonly string[],
@@ -976,6 +990,114 @@ describe('transcriptReducer', () => {
     });
     expect(afterLiveHistoryUpdate.confirmed.has('server-2')).toBe(true);
     expect(afterLiveHistoryUpdate.terminalLocked).toBe(true);
+  });
+
+  it('suspends only active work while preserving confirmed history and retryable sends', () => {
+    let state = initialWith([message('server-1'), message('server-2')]);
+    state = transcriptReducer(state, {
+      type: 'ADD_PENDING',
+      resourceKey: RESOURCE_KEY,
+      message: message('optimistic:failed', {
+        client_message_id: 'client-failed',
+        content: 'Already retryable',
+      }),
+    });
+    state = transcriptReducer(state, {
+      type: 'FAIL_PENDING',
+      resourceKey: RESOURCE_KEY,
+      cid: 'client-failed',
+      error: failure,
+      requestVersion:
+        state.pendingVersions.get('client-failed') ?? state.version,
+    });
+    state = transcriptReducer(state, {
+      type: 'ADD_PENDING',
+      resourceKey: RESOURCE_KEY,
+      message: message('optimistic:active', {
+        client_message_id: 'client-active',
+        content: 'Retry after access recovers',
+      }),
+    });
+    state = transcriptReducer(state, {
+      type: 'REACTION_START',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'server-1',
+      operationId: 'reaction-active',
+      optimisticReactions: [reaction('👍', ['member-1'])],
+    });
+    const reactionOverlayVersion = selectMessageVersion(state, 'server-1');
+    state = transcriptReducer(state, {
+      type: 'DELETE_START',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'server-2',
+    });
+    state = transcriptReducer(state, {
+      type: 'HIDE_START',
+      resourceKey: RESOURCE_KEY,
+    });
+    state = transcriptReducer(state, {
+      type: 'OLDER_START',
+      resourceKey: RESOURCE_KEY,
+    });
+    state = transcriptReducer(state, {
+      type: 'CATCHUP_PHASE',
+      resourceKey: RESOURCE_KEY,
+      phase: 'update',
+    });
+
+    const confirmed = state.confirmed;
+    const suspended = transcriptReducer(state, {
+      type: 'SUSPEND_ACCESS',
+      resourceKey: RESOURCE_KEY,
+      sendError: accessUncertainFailure,
+      mutationError: mutationInterruptedFailure,
+    });
+
+    expect(suspended.confirmed).toBe(confirmed);
+    expect(suspended.roomStatus).toBe('ready');
+    expect(suspended.pending.size).toBe(2);
+    expect(suspended.pendingClientIds).toEqual(
+      new Set(['client-failed', 'client-active']),
+    );
+    expect(suspended.failedClientIds).toEqual(
+      new Set(['client-failed', 'client-active']),
+    );
+    expect(suspended.failedByClientId.get('client-failed')).toBe(failure);
+    expect(suspended.failedByClientId.get('client-active')).toBe(
+      accessUncertainFailure,
+    );
+    expect(suspended.pendingVersions.get('client-active')).toBe(
+      suspended.version,
+    );
+    expect(suspended.reactionOverlays.size).toBe(0);
+    expect(suspended.pendingReactionMessageIds.size).toBe(0);
+    expect(suspended.pendingDeleteMessageIds.size).toBe(0);
+    expect(suspended.isHidingMessages).toBe(false);
+    expect(suspended.isLoadingOlder).toBe(false);
+    expect(suspended.isGapFilling).toBe(false);
+    expect(suspended.isUpdating).toBe(false);
+    expect(suspended.mutationError).toEqual({
+      messageId: null,
+      error: mutationInterruptedFailure,
+    });
+    expect(selectMessageVersion(suspended, 'server-1')).toBeGreaterThan(
+      reactionOverlayVersion,
+    );
+
+    const repeated = transcriptReducer(suspended, {
+      type: 'SUSPEND_ACCESS',
+      resourceKey: RESOURCE_KEY,
+      sendError: accessUncertainFailure,
+      mutationError: mutationInterruptedFailure,
+    });
+    const wrongResource = transcriptReducer(suspended, {
+      type: 'SUSPEND_ACCESS',
+      resourceKey: 'another-trip',
+      sendError: accessUncertainFailure,
+      mutationError: mutationInterruptedFailure,
+    });
+    expect(repeated).toBe(suspended);
+    expect(wrongResource).toBe(suspended);
   });
 
   it('clears every transcript surface on kick and suppresses all late work until RESET', () => {

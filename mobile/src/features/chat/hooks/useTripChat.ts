@@ -56,6 +56,8 @@ const RECONCILIATION_PAGE_SIZE = 100;
 const RECONCILIATION_MAX_PAGES = 50;
 const TERMINAL_ERROR_CODE = 'TRIP_TERMINAL';
 const SUBSCRIPTION_LIMIT_ERROR_CODE = 'SUBSCRIPTION_LIMIT_REACHED';
+const CHAT_ACCESS_UNCERTAIN_ERROR_CODE = 'CHAT_ACCESS_UNCERTAIN';
+const CHAT_MUTATION_INTERRUPTED_ERROR_CODE = 'CHAT_MUTATION_INTERRUPTED';
 const ACCESS_LOST_ERROR_CODES = new Set(['TRIP_NOT_FOUND', 'FORBIDDEN']);
 const EMPTY_ID_SET: ReadonlySet<string> = new Set();
 const EMPTY_FAILURE_MAP: ReadonlyMap<string, ChatApiFailure> = new Map();
@@ -353,6 +355,11 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     useState<ChatSubscriptionStatus>('inactive');
   const [currentRoomError, setCurrentRoomError] =
     useState<ChatRoomError | null>(null);
+  const clearNonterminalRoomError = useCallback(() => {
+    setCurrentRoomError((current) =>
+      current?.errorCode === TERMINAL_ERROR_CODE ? current : null,
+    );
+  }, []);
 
   const activeResourceKeyRef = useRef(resourceKey);
   const stateRef = useRef(state);
@@ -364,14 +371,15 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       tripDetail.status === 'ready' &&
       tripDetail.detail?.my_membership.status === 'ACTIVE',
   );
-  const tripDetailNotFound =
-    tripDetail.error?.errorCode === 'TRIP_NOT_FOUND';
+  const tripDetailAccessLost =
+    tripDetail.error?.errorCode !== undefined &&
+    ACCESS_LOST_ERROR_CODES.has(tripDetail.error.errorCode);
   const accessStatus: ChatAccessStatus = accessGranted
     ? 'granted'
     : sessionStatus === 'restoring' || tripDetail.status === 'loading'
       ? 'checking'
       : sessionStatus === 'signedOut' ||
-          tripDetailNotFound ||
+          tripDetailAccessLost ||
           (tripDetail.status === 'ready' &&
             tripDetail.detail?.my_membership.status !== 'ACTIVE')
         ? 'denied'
@@ -388,12 +396,13 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
   const initialLoadControllerRef = useRef<AbortController | null>(null);
   const olderLoadControllerRef = useRef<AbortController | null>(null);
   const requestControllersRef = useRef(new Set<AbortController>());
-  const sendLocksRef = useRef(new Set<string>());
-  const reactionLocksRef = useRef(new Set<string>());
+  const mutationControllersRef = useRef(new Set<AbortController>());
+  const sendLocksRef = useRef(new Map<string, symbol>());
+  const reactionLocksRef = useRef(new Map<string, symbol>());
   const liveReactionProofsRef = useRef(new Map<string, LiveReactionProof>());
   const liveDeleteProofsRef = useRef(new Map<string, LiveDeleteProof>());
-  const deleteLocksRef = useRef(new Set<string>());
-  const hideLockRef = useRef(false);
+  const deleteLocksRef = useRef(new Map<string, symbol>());
+  const hideLockRef = useRef<symbol | null>(null);
 
   const dispatch = useCallback(
     (action: TranscriptAction) => {
@@ -442,21 +451,76 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     catchUpRunRef.current = null;
   }, []);
 
+  const invalidateMutationOwnership = useCallback(() => {
+    for (const controller of mutationControllersRef.current) {
+      controller.abort();
+    }
+    mutationControllersRef.current.clear();
+    sendLocksRef.current.clear();
+    reactionLocksRef.current.clear();
+    deleteLocksRef.current.clear();
+    hideLockRef.current = null;
+    liveReactionProofsRef.current.clear();
+    liveDeleteProofsRef.current.clear();
+  }, []);
+
+  const resetTransientSubscriptionOwnership = useCallback(() => {
+    const snapshot = snapshotRef.current;
+    focusGenerationRef.current += 1;
+    if (
+      focusedRef.current &&
+      snapshot.status === 'connected' &&
+      sentEpochRef.current === snapshot.connectionEpoch
+    ) {
+      realtime.send({ type: 'chat.unsubscribe', trip_id: tripId });
+    }
+    abortAllRequests();
+    invalidateMutationOwnership();
+    sentEpochRef.current = null;
+    ackedEpochRef.current = null;
+    rejectedEpochRef.current = null;
+    catchUpRequestedEpochRef.current = null;
+    setSubscriptionStatus('inactive');
+    if (stateRef.current.resourceKey === resourceKey) {
+      dispatch({
+        type: 'SUSPEND_ACCESS',
+        resourceKey,
+        sendError: localFailure(
+          'Chat access is temporarily unavailable. Retry this message after access recovers.',
+          CHAT_ACCESS_UNCERTAIN_ERROR_CODE,
+        ),
+        mutationError: localFailure(
+          'A chat change was interrupted while trip access was being verified. Review the current message before trying again.',
+          CHAT_MUTATION_INTERRUPTED_ERROR_CODE,
+        ),
+      });
+    }
+  }, [
+    abortAllRequests,
+    dispatch,
+    invalidateMutationOwnership,
+    realtime,
+    resourceKey,
+    tripId,
+  ]);
+
   const kickRoom = useCallback(
-    (detail: string) => {
+    (detail: string, errorCode = 'FORBIDDEN') => {
       kickedRef.current = true;
       focusGenerationRef.current += 1;
       abortAllRequests();
+      invalidateMutationOwnership();
       setSubscriptionStatus('inactive');
-      setCurrentRoomError(roomError('FORBIDDEN', detail));
+      setCurrentRoomError(roomError(errorCode, detail));
       dispatch({ type: 'KICKED', resourceKey });
     },
-    [abortAllRequests, dispatch, resourceKey],
+    [abortAllRequests, dispatch, invalidateMutationOwnership, resourceKey],
   );
 
   const applyAuthoritativeFailure = useCallback(
     (error: ChatApiFailure, messageId: string | null = null) => {
       if (error.errorCode === TERMINAL_ERROR_CODE) {
+        invalidateMutationOwnership();
         dispatch({
           type: 'TERMINAL_LOCK',
           resourceKey,
@@ -465,7 +529,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         });
         setCurrentRoomError(roomError(TERMINAL_ERROR_CODE, error.message));
       } else if (isAccessLost(error)) {
-        kickRoom(error.message);
+        kickRoom(error.message, error.errorCode ?? 'FORBIDDEN');
       }
       dispatch({
         type: 'SET_MUTATION_ERROR',
@@ -474,16 +538,12 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         error,
       });
     },
-    [dispatch, kickRoom, resourceKey],
+    [dispatch, invalidateMutationOwnership, kickRoom, resourceKey],
   );
 
   useEffect(() => {
-    const sendLocks = sendLocksRef.current;
-    const reactionLocks = reactionLocksRef.current;
-    const deleteLocks = deleteLocksRef.current;
-    const liveReactionProofs = liveReactionProofsRef.current;
-    const liveDeleteProofs = liveDeleteProofsRef.current;
     let cancelled = false;
+    invalidateMutationOwnership();
     kickedRef.current = false;
     sentEpochRef.current = null;
     ackedEpochRef.current = null;
@@ -499,19 +559,15 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       cancelled = true;
       focusGenerationRef.current += 1;
       abortAllRequests();
-      sendLocks.clear();
-      reactionLocks.clear();
-      liveReactionProofs.clear();
-      liveDeleteProofs.clear();
-      deleteLocks.clear();
-      hideLockRef.current = false;
+      invalidateMutationOwnership();
     };
-  }, [abortAllRequests, dispatch, resourceKey]);
+  }, [abortAllRequests, dispatch, invalidateMutationOwnership, resourceKey]);
 
   const loadInitialHistory = useCallback(async () => {
     if (
       initialLoadControllerRef.current !== null ||
       stateRef.current.roomStatus === 'ready' ||
+      kickedRef.current ||
       !tripId
     ) {
       return;
@@ -543,14 +599,14 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         nextCursor: response.next_cursor,
         requestVersion,
       });
-      setCurrentRoomError(null);
+      clearNonterminalRoomError();
     } catch (caught: unknown) {
       if (controller.signal.aborted || !isResourceCurrent(resourceKey)) {
         return;
       }
       const error = normalizeChatApiError(caught);
       if (isAccessLost(error)) {
-        kickRoom(error.message);
+        kickRoom(error.message, error.errorCode ?? 'FORBIDDEN');
         return;
       }
       setCurrentRoomError(
@@ -569,6 +625,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       }
     }
   }, [
+    clearNonterminalRoomError,
     dispatch,
     isResourceCurrent,
     kickRoom,
@@ -580,11 +637,34 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
 
   useEffect(() => {
     if (accessStatus === 'checking' || accessStatus === 'error') {
-      return;
+      let cancelled = false;
+      queueMicrotask(() => {
+        if (!cancelled) {
+          resetTransientSubscriptionOwnership();
+        }
+      });
+      return () => {
+        cancelled = true;
+      };
     }
     if (accessStatus === 'denied') {
-      abortAllRequests();
-      dispatch({ type: 'KICKED', resourceKey });
+      kickedRef.current = true;
+      const tripDetailErrorCode = tripDetail.error?.errorCode;
+      const hasExactAccessFailure =
+        tripDetailErrorCode !== undefined &&
+        ACCESS_LOST_ERROR_CODES.has(tripDetailErrorCode);
+      const errorCode = hasExactAccessFailure
+        ? tripDetailErrorCode
+        : 'FORBIDDEN';
+      const detail = hasExactAccessFailure
+        ? tripDetail.error?.message ??
+          'You no longer have access to this trip chat.'
+        : 'You no longer have access to this trip chat.';
+      queueMicrotask(() => {
+        if (activeResourceKeyRef.current === resourceKey) {
+          kickRoom(detail, errorCode);
+        }
+      });
       return;
     }
     let cancelled = false;
@@ -599,10 +679,12 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     };
   }, [
     accessStatus,
-    abortAllRequests,
-    dispatch,
+    kickRoom,
     loadInitialHistory,
+    resetTransientSubscriptionOwnership,
     resourceKey,
+    tripDetail.error?.errorCode,
+    tripDetail.error?.message,
   ]);
 
   useEffect(() => {
@@ -614,6 +696,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     ) {
       return;
     }
+    invalidateMutationOwnership();
     dispatch({
       type: 'TERMINAL_LOCK',
       resourceKey,
@@ -626,6 +709,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     });
   }, [
     dispatch,
+    invalidateMutationOwnership,
     resourceKey,
     state.resourceKey,
     state.roomStatus,
@@ -773,7 +857,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         if (!isCatchUpCurrent(run)) return;
         const error = normalizeChatApiError(caught);
         if (isAccessLost(error)) {
-          kickRoom(error.message);
+          kickRoom(error.message, error.errorCode ?? 'FORBIDDEN');
         } else {
           setCurrentRoomError(
             roomError(error.errorCode ?? 'CHAT_SYNC_FAILED', error.message),
@@ -941,7 +1025,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           rejectedEpochRef.current = null;
           catchUpRequestedEpochRef.current = snapshot.connectionEpoch;
           setSubscriptionStatus('subscribed');
-          setCurrentRoomError(null);
+          clearNonterminalRoomError();
           if (stateRef.current.roomStatus === 'ready') {
             void runCatchUp(snapshot.connectionEpoch);
           }
@@ -1027,7 +1111,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           return;
         case 'chat.error': {
           if (ACCESS_LOST_ERROR_CODES.has(event.error_code)) {
-            kickRoom(event.detail);
+            kickRoom(event.detail, event.error_code);
             return;
           }
           if (event.error_code === TERMINAL_ERROR_CODE) {
@@ -1036,6 +1120,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
               TERMINAL_ERROR_CODE,
               409,
             );
+            invalidateMutationOwnership();
             dispatch({
               type: 'TERMINAL_LOCK',
               resourceKey,
@@ -1064,7 +1149,9 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
   }, [
     accessGranted,
     attemptSubscribe,
+    clearNonterminalRoomError,
     dispatch,
+    invalidateMutationOwnership,
     isResourceCurrent,
     kickRoom,
     realtime,
@@ -1122,7 +1209,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
 
   const retryInitialLoad = useCallback(async () => {
     if (accessStatus === 'error') {
-      setCurrentRoomError(null);
+      clearNonterminalRoomError();
       await refreshTripDetail('initial');
       return;
     }
@@ -1132,7 +1219,12 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     ) {
       await loadInitialHistory();
     }
-  }, [accessStatus, loadInitialHistory, refreshTripDetail]);
+  }, [
+    accessStatus,
+    clearNonterminalRoomError,
+    loadInitialHistory,
+    refreshTripDetail,
+  ]);
 
   const loadOlder = useCallback(async () => {
     const current = stateRef.current;
@@ -1170,7 +1262,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       if (controller.signal.aborted || !isResourceCurrent(resourceKey)) return;
       const error = normalizeChatApiError(caught);
       if (isAccessLost(error)) {
-        kickRoom(error.message);
+        kickRoom(error.message, error.errorCode ?? 'FORBIDDEN');
       } else {
         dispatch({
           type: 'OLDER_FAILED',
@@ -1214,8 +1306,12 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         };
       }
 
-      sendLocksRef.current.add(clientMessageId);
+      const ownershipToken = Symbol('chat-send');
+      sendLocksRef.current.set(clientMessageId, ownershipToken);
+      const ownsAttempt = () =>
+        sendLocksRef.current.get(clientMessageId) === ownershipToken;
       const controller = registerController();
+      mutationControllersRef.current.add(controller);
       const requestVersion = stateRef.current.version;
       if (retry) {
         dispatch({ type: 'RETRY_PENDING', resourceKey, cid: clientMessageId });
@@ -1238,7 +1334,11 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           { content, clientMessageId },
           controller.signal,
         );
-        if (controller.signal.aborted || !isResourceCurrent(resourceKey)) {
+        if (
+          controller.signal.aborted ||
+          !isResourceCurrent(resourceKey) ||
+          !ownsAttempt()
+        ) {
           return {
             kind: 'failed',
             clientMessageId,
@@ -1255,7 +1355,11 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         return { kind: response.disposition, clientMessageId };
       } catch (caught: unknown) {
         const error = normalizeChatApiError(caught);
-        if (controller.signal.aborted || !isResourceCurrent(resourceKey)) {
+        if (
+          controller.signal.aborted ||
+          !isResourceCurrent(resourceKey) ||
+          !ownsAttempt()
+        ) {
           return { kind: 'failed', clientMessageId, error };
         }
         if (hasConfirmedClientId(stateRef.current, clientMessageId)) {
@@ -1318,7 +1422,10 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         });
         return { kind: 'failed', clientMessageId, error };
       } finally {
-        sendLocksRef.current.delete(clientMessageId);
+        if (ownsAttempt()) {
+          sendLocksRef.current.delete(clientMessageId);
+        }
+        mutationControllersRef.current.delete(controller);
         releaseController(controller);
       }
     },
@@ -1415,7 +1522,10 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         user.id,
         emoji,
       );
-      reactionLocksRef.current.add(messageId);
+      const ownershipToken = Symbol('chat-reaction');
+      reactionLocksRef.current.set(messageId, ownershipToken);
+      const ownsAttempt = () =>
+        reactionLocksRef.current.get(messageId) === ownershipToken;
       dispatch({
         type: 'REACTION_START',
         resourceKey,
@@ -1424,6 +1534,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         optimisticReactions,
       });
       const controller = registerController();
+      mutationControllersRef.current.add(controller);
 
       try {
         const result = removing
@@ -1439,7 +1550,11 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
               emoji,
               controller.signal,
             );
-        if (controller.signal.aborted || !isResourceCurrent(resourceKey)) {
+        if (
+          controller.signal.aborted ||
+          !isResourceCurrent(resourceKey) ||
+          !ownsAttempt()
+        ) {
           return {
             kind: 'rejected',
             error: localFailure('Reaction update was cancelled.', 'REACTION_CANCELLED'),
@@ -1459,7 +1574,9 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         return { kind: 'applied' };
       } catch (caught: unknown) {
         const error = normalizeChatApiError(caught);
-        const liveProof = liveReactionProofsRef.current.get(messageId);
+        const liveProof = ownsAttempt()
+          ? liveReactionProofsRef.current.get(messageId)
+          : undefined;
         const livePushConfirmed =
           liveProof !== undefined &&
           liveProof.changeSequence > startChangeSequence &&
@@ -1472,6 +1589,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         if (
           !controller.signal.aborted &&
           isResourceCurrent(resourceKey) &&
+          ownsAttempt() &&
           liveProof !== undefined &&
           livePushConfirmed &&
           error.errorCode !== TERMINAL_ERROR_CODE &&
@@ -1490,7 +1608,11 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           });
           return { kind: 'applied' };
         }
-        if (!controller.signal.aborted && isResourceCurrent(resourceKey)) {
+        if (
+          !controller.signal.aborted &&
+          isResourceCurrent(resourceKey) &&
+          ownsAttempt()
+        ) {
           dispatch({
             type: 'REACTION_FAIL',
             resourceKey,
@@ -1504,8 +1626,11 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         }
         return { kind: 'rejected', error };
       } finally {
-        reactionLocksRef.current.delete(messageId);
-        liveReactionProofsRef.current.delete(messageId);
+        if (ownsAttempt()) {
+          reactionLocksRef.current.delete(messageId);
+          liveReactionProofsRef.current.delete(messageId);
+        }
+        mutationControllersRef.current.delete(controller);
         releaseController(controller);
       }
     },
@@ -1536,12 +1661,16 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         );
         return { kind: 'rejected', error };
       }
-      deleteLocksRef.current.add(messageId);
+      const ownershipToken = Symbol('chat-delete');
+      deleteLocksRef.current.set(messageId, ownershipToken);
+      const ownsAttempt = () =>
+        deleteLocksRef.current.get(messageId) === ownershipToken;
       liveDeleteProofsRef.current.delete(messageId);
       const startChangeSequence =
         selectMessageById(stateRef.current, messageId)?.change_sequence ?? -1;
       dispatch({ type: 'DELETE_START', resourceKey, messageId });
       const controller = registerController();
+      mutationControllersRef.current.add(controller);
       const requestVersion = stateRef.current.version;
       try {
         const result = await deleteChatMessage(
@@ -1550,7 +1679,11 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           mode,
           controller.signal,
         );
-        if (controller.signal.aborted || !isResourceCurrent(resourceKey)) {
+        if (
+          controller.signal.aborted ||
+          !isResourceCurrent(resourceKey) ||
+          !ownsAttempt()
+        ) {
           return {
             kind: 'rejected',
             error: localFailure('Message removal was cancelled.', 'DELETE_CANCELLED'),
@@ -1574,7 +1707,9 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         return { kind: 'applied' };
       } catch (caught: unknown) {
         const error = normalizeChatApiError(caught);
-        const liveDeleteProof = liveDeleteProofsRef.current.get(messageId);
+        const liveDeleteProof = ownsAttempt()
+          ? liveDeleteProofsRef.current.get(messageId)
+          : undefined;
         const liveTombstoneConfirmed =
           mode === 'for_everyone' &&
           liveDeleteProof !== undefined &&
@@ -1583,21 +1718,30 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         if (
           !controller.signal.aborted &&
           isResourceCurrent(resourceKey) &&
+          ownsAttempt() &&
           liveTombstoneConfirmed &&
           error.errorCode !== TERMINAL_ERROR_CODE &&
           !isAccessLost(error)
         ) {
           return { kind: 'applied' };
         }
-        if (!controller.signal.aborted && isResourceCurrent(resourceKey)) {
+        if (
+          !controller.signal.aborted &&
+          isResourceCurrent(resourceKey) &&
+          ownsAttempt()
+        ) {
           applyAuthoritativeFailure(error, messageId);
         }
         return { kind: 'rejected', error };
       } finally {
-        deleteLocksRef.current.delete(messageId);
-        liveDeleteProofsRef.current.delete(messageId);
+        const stillOwnsAttempt = ownsAttempt();
+        if (stillOwnsAttempt) {
+          deleteLocksRef.current.delete(messageId);
+          liveDeleteProofsRef.current.delete(messageId);
+        }
+        mutationControllersRef.current.delete(controller);
         releaseController(controller);
-        if (isResourceCurrent(resourceKey)) {
+        if (stillOwnsAttempt && isResourceCurrent(resourceKey)) {
           dispatch({
             type: 'DELETE_END',
             resourceKey,
@@ -1623,7 +1767,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     async (messageIds: readonly string[]): Promise<ChatMutationOutcome> => {
       const blocked = mutationBlockedFailure();
       if (blocked !== null) return { kind: 'rejected', error: blocked };
-      if (hideLockRef.current) {
+      if (hideLockRef.current !== null) {
         const error = localFailure(
           'Messages are already being hidden.',
           'HIDE_IN_PROGRESS',
@@ -1638,9 +1782,12 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         );
         return { kind: 'rejected', error };
       }
-      hideLockRef.current = true;
+      const ownershipToken = Symbol('chat-hide');
+      hideLockRef.current = ownershipToken;
+      const ownsAttempt = () => hideLockRef.current === ownershipToken;
       dispatch({ type: 'HIDE_START', resourceKey });
       const controller = registerController();
+      mutationControllersRef.current.add(controller);
       const requestVersion = stateRef.current.version;
       try {
         const result = await hideChatMessages(
@@ -1648,7 +1795,11 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           messageIds,
           controller.signal,
         );
-        if (controller.signal.aborted || !isResourceCurrent(resourceKey)) {
+        if (
+          controller.signal.aborted ||
+          !isResourceCurrent(resourceKey) ||
+          !ownsAttempt()
+        ) {
           return {
             kind: 'rejected',
             error: localFailure('Message hiding was cancelled.', 'HIDE_CANCELLED'),
@@ -1663,14 +1814,22 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         return { kind: 'applied' };
       } catch (caught: unknown) {
         const error = normalizeChatApiError(caught);
-        if (!controller.signal.aborted && isResourceCurrent(resourceKey)) {
+        if (
+          !controller.signal.aborted &&
+          isResourceCurrent(resourceKey) &&
+          ownsAttempt()
+        ) {
           applyAuthoritativeFailure(error);
         }
         return { kind: 'rejected', error };
       } finally {
-        hideLockRef.current = false;
+        const stillOwnsAttempt = ownsAttempt();
+        if (stillOwnsAttempt) {
+          hideLockRef.current = null;
+        }
+        mutationControllersRef.current.delete(controller);
         releaseController(controller);
-        if (isResourceCurrent(resourceKey)) {
+        if (stillOwnsAttempt && isResourceCurrent(resourceKey)) {
           dispatch({ type: 'HIDE_END', resourceKey, requestVersion });
         }
       }

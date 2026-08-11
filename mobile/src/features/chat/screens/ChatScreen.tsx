@@ -141,6 +141,7 @@ export function ChatScreen() {
   }, [chat.roomError, chat.tripStatus]);
 
   const subscriptionRejected = chat.subscriptionStatus === 'rejected';
+  const roomResourceKey = `${chat.currentUserId ?? 'no-session'}:${tripId ?? 'no-trip'}`;
   const actionsEnabled = !chat.isReadOnly;
   const readOnlyMessage = subscriptionRejected
     ? 'Realtime is unavailable for this room. Chat actions are disabled.'
@@ -241,6 +242,7 @@ export function ChatScreen() {
   const bottomAccessory = (
     <View>
       <ChatComposer
+        key={`composer:${roomResourceKey}`}
         disabled={!actionsEnabled}
         hidden={!actionsEnabled}
         onSubmit={submitMessage}
@@ -305,7 +307,7 @@ export function ChatScreen() {
           </StatusNotice>
         ) : null}
         <ChatMessageList
-          key={tripId}
+          key={roomResourceKey}
           messages={chat.messages}
           currentUserId={chat.currentUserId}
           pendingClientIds={chat.pendingClientIds}

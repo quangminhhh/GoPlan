@@ -819,6 +819,451 @@ describe('useTripChat', () => {
     expect(mockListChatHistory).toHaveBeenCalledTimes(1);
   });
 
+  it('restarts subscription and catch-up after a transient access error without clearing history', async () => {
+    const anchor = message();
+    const missed = message({
+      id: '99999999-9999-4999-8999-999999999999',
+      content: 'Recovered by catch-up',
+      change_sequence: 2,
+    });
+    const transientState = {
+      ...readyTripDetail(),
+      detail: null,
+      status: 'error' as const,
+      error: {
+        kind: 'network' as const,
+        message: 'Temporary trip-detail failure.',
+        status: 404,
+      },
+    };
+    let tripState: ReturnType<typeof readyTripDetail> | typeof transientState =
+      readyTripDetail();
+    mockUseTripDetail.mockImplementation(() => tripState);
+    mockListChatHistory.mockResolvedValue({
+      results: [anchor],
+      next_cursor: null,
+    });
+    mockGapFillChatMessages
+      .mockResolvedValueOnce({ results: [], has_more: false })
+      .mockResolvedValueOnce({ results: [missed], has_more: false });
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.messages).toEqual([anchor]));
+    const blur = await enterFocus();
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+    await waitFor(() => expect(mockGapFillChatMessages).toHaveBeenCalledTimes(1));
+
+    tripState = transientState;
+    await view.rerender({});
+    await waitFor(() => expect(view.result.current.accessStatus).toBe('error'));
+    expect(view.result.current.messages).toEqual([]);
+    expect(view.result.current.subscriptionStatus).toBe('inactive');
+    expect(
+      mockSendRealtime.mock.calls.filter(
+        ([command]) => command.type === 'chat.unsubscribe',
+      ),
+    ).toHaveLength(1);
+
+    tripState = readyTripDetail();
+    await view.rerender({});
+    await waitFor(() =>
+      expect(
+        mockSendRealtime.mock.calls.filter(
+          ([command]) => command.type === 'chat.subscribe',
+        ),
+      ).toHaveLength(2),
+    );
+    await waitFor(() => expect(view.result.current.messages).toEqual([anchor]));
+    expect(mockListChatHistory).toHaveBeenCalledTimes(1);
+    expect(view.result.current.subscriptionStatus).toBe('subscribing');
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+    await waitFor(() => expect(mockGapFillChatMessages).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(view.result.current.messages.map((item) => item.id)).toEqual([
+        anchor.id,
+        missed.id,
+      ]),
+    );
+    await act(async () => blur());
+  });
+
+  it('atomically suspends in-flight chat work while preserving retryable content and confirmed history', async () => {
+    const reactionRow = message();
+    const deleteRow = message({
+      id: '77777777-7777-4777-8777-777777777777',
+      content: 'Delete pending',
+    });
+    const hideRow = message({
+      id: '88888888-8888-4888-8888-888888888888',
+      content: 'Hide pending',
+    });
+    const transientState = {
+      ...readyTripDetail(),
+      detail: null,
+      status: 'error' as const,
+      error: {
+        kind: 'network' as const,
+        message: 'Trip authority is temporarily unknown.',
+        status: 404,
+      },
+    };
+    let tripState: ReturnType<typeof readyTripDetail> | typeof transientState =
+      readyTripDetail();
+    const pendingGap = deferred<{
+      results: readonly ChatMessage[];
+      has_more: boolean;
+    }>();
+    const pendingOlder = deferred<{
+      results: readonly ChatMessage[];
+      next_cursor: string | null;
+    }>();
+    const pendingSend = deferred<Awaited<ReturnType<typeof sendChatMessage>>>();
+    const pendingReaction = deferred<
+      Awaited<ReturnType<typeof addChatReaction>>
+    >();
+    const pendingDelete = deferred<
+      Awaited<ReturnType<typeof deleteChatMessage>>
+    >();
+    const pendingHide = deferred<Awaited<ReturnType<typeof hideChatMessages>>>();
+    mockUseTripDetail.mockImplementation(() => tripState);
+    mockListChatHistory
+      .mockResolvedValueOnce({
+        results: [reactionRow, deleteRow, hideRow],
+        next_cursor: 'older-page',
+      })
+      .mockReturnValueOnce(pendingOlder.promise);
+    mockGapFillChatMessages.mockReturnValueOnce(pendingGap.promise);
+    mockSendChatMessage
+      .mockRejectedValueOnce(new Error('offline before suspension'))
+      .mockReturnValueOnce(pendingSend.promise);
+    mockAddChatReaction.mockReturnValueOnce(pendingReaction.promise);
+    mockDeleteChatMessage.mockReturnValueOnce(pendingDelete.promise);
+    mockHideChatMessages.mockReturnValueOnce(pendingHide.promise);
+
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.messages).toHaveLength(3));
+    const priorFailure = await captureInAct(() =>
+      view.result.current.sendMessage('Already failed before suspension'),
+    );
+    if (priorFailure.kind !== 'failed') {
+      throw new Error('Expected a pre-existing retryable failed send.');
+    }
+    const priorFailedClientId = priorFailure.clientMessageId;
+    expect(view.result.current.failedByClientId.get(priorFailedClientId)).toEqual(
+      networkFailure,
+    );
+    await enterFocus();
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+    await waitFor(() => expect(view.result.current.isGapFilling).toBe(true));
+
+    let sendOutcome!: Promise<ChatSendOutcome>;
+    let reactionOutcome!: Promise<ChatMutationOutcome>;
+    let deleteOutcome!: Promise<ChatMutationOutcome>;
+    let hideOutcome!: Promise<ChatMutationOutcome>;
+    await act(async () => {
+      void view.result.current.loadOlder();
+      sendOutcome = view.result.current.sendMessage('Retry me after recovery');
+      reactionOutcome = view.result.current.toggleReaction(reactionRow.id, '👍');
+      deleteOutcome = view.result.current.deleteMessage(
+        deleteRow.id,
+        'for_everyone',
+      );
+      hideOutcome = view.result.current.hideMessagesForMe([hideRow.id]);
+      await Promise.resolve();
+    });
+    const clientMessageId = mockSendChatMessage.mock.calls[1]?.[1]
+      .clientMessageId;
+    if (clientMessageId === undefined) {
+      throw new Error('Expected an active send client id.');
+    }
+    expect(view.result.current.isLoadingOlder).toBe(true);
+    expect(view.result.current.pendingReactionMessageIds.has(reactionRow.id)).toBe(
+      true,
+    );
+    expect(view.result.current.pendingDeleteMessageIds.has(deleteRow.id)).toBe(
+      true,
+    );
+    expect(view.result.current.isHidingMessages).toBe(true);
+
+    tripState = transientState;
+    await view.rerender({});
+    await waitFor(() => expect(view.result.current.accessStatus).toBe('error'));
+    await waitFor(() => expect(view.result.current.isLoadingOlder).toBe(false));
+    expect(view.result.current.isGapFilling).toBe(false);
+    expect(view.result.current.isUpdating).toBe(false);
+    expect(view.result.current.pendingReactionMessageIds.size).toBe(0);
+    expect(view.result.current.pendingDeleteMessageIds.size).toBe(0);
+    expect(view.result.current.isHidingMessages).toBe(false);
+    expect(view.result.current.failedClientIds.has(clientMessageId)).toBe(true);
+    expect(view.result.current.failedByClientId.get(clientMessageId)).toMatchObject({
+      errorCode: 'CHAT_ACCESS_UNCERTAIN',
+    });
+    expect(view.result.current.failedByClientId.get(priorFailedClientId)).toEqual(
+      networkFailure,
+    );
+    expect(view.result.current.mutationError).toMatchObject({
+      error: { errorCode: 'CHAT_MUTATION_INTERRUPTED' },
+    });
+    expect(view.result.current.messages).toEqual([]);
+
+    await act(async () => {
+      pendingGap.resolve({ results: [], has_more: false });
+      pendingOlder.resolve({ results: [], next_cursor: 'older-page' });
+      pendingSend.resolve({
+        disposition: 'created',
+        message: message({
+          id: '99999999-9999-4999-8999-999999999999',
+          content: 'Retry me after recovery',
+          client_message_id: clientMessageId,
+        }),
+      });
+      pendingReaction.resolve({
+        reactions: [{ emoji: '👍', count: 1, reacted_by_ids: [USER_ID] }],
+        change_sequence: 2,
+        updated_at: '2026-08-09T10:01:00.000Z',
+      });
+      pendingDelete.resolve({
+        mode: 'for_everyone',
+        message: {
+          ...deleteRow,
+          content: '',
+          change_sequence: 2,
+          is_deleted_for_everyone: true,
+          deleted_for_everyone_at: '2026-08-09T10:01:00.000Z',
+          deleted_for_everyone_by_id: USER_ID,
+          reactions: [],
+          action_drafts: [],
+        },
+      });
+      pendingHide.resolve({ hidden_message_ids: [hideRow.id] });
+      await Promise.all([
+        sendOutcome,
+        reactionOutcome,
+        deleteOutcome,
+        hideOutcome,
+      ]);
+    });
+
+    mockListChatHistory.mockResolvedValueOnce({
+      results: [],
+      next_cursor: null,
+    });
+    tripState = readyTripDetail();
+    await view.rerender({});
+    await waitFor(() => expect(view.result.current.accessStatus).toBe('granted'));
+    await waitFor(() => expect(view.result.current.messages).toHaveLength(5));
+    await act(async () => {
+      await view.result.current.loadOlder();
+    });
+    expect(mockListChatHistory).toHaveBeenCalledTimes(3);
+    expect(view.result.current.hasMoreOlder).toBe(false);
+  });
+
+  it('keeps fresh send and reaction lock ownership when aborted operations settle later', async () => {
+    const confirmed = message();
+    const transientState = {
+      ...readyTripDetail(),
+      detail: null,
+      status: 'error' as const,
+      error: {
+        kind: 'network' as const,
+        message: 'Trip authority is temporarily unknown.',
+        status: 404,
+      },
+    };
+    let tripState: ReturnType<typeof readyTripDetail> | typeof transientState =
+      readyTripDetail();
+    const oldSend = deferred<Awaited<ReturnType<typeof sendChatMessage>>>();
+    const freshSend = deferred<Awaited<ReturnType<typeof sendChatMessage>>>();
+    const oldReaction = deferred<
+      Awaited<ReturnType<typeof addChatReaction>>
+    >();
+    const freshReaction = deferred<
+      Awaited<ReturnType<typeof addChatReaction>>
+    >();
+    mockUseTripDetail.mockImplementation(() => tripState);
+    mockListChatHistory.mockResolvedValue({
+      results: [confirmed],
+      next_cursor: null,
+    });
+    mockSendChatMessage
+      .mockReturnValueOnce(oldSend.promise)
+      .mockReturnValueOnce(freshSend.promise);
+    mockAddChatReaction
+      .mockReturnValueOnce(oldReaction.promise)
+      .mockReturnValueOnce(freshReaction.promise);
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.messages).toHaveLength(1));
+
+    let oldSendOutcome!: Promise<ChatSendOutcome>;
+    let oldReactionOutcome!: Promise<ChatMutationOutcome>;
+    await act(async () => {
+      oldSendOutcome = view.result.current.sendMessage('Retry same CID');
+      oldReactionOutcome = view.result.current.toggleReaction(confirmed.id, '👍');
+      await Promise.resolve();
+    });
+    const clientMessageId = mockSendChatMessage.mock.calls[0]?.[1]
+      .clientMessageId;
+    if (clientMessageId === undefined) {
+      throw new Error('Expected an active send client id.');
+    }
+
+    tripState = transientState;
+    await view.rerender({});
+    await waitFor(() =>
+      expect(view.result.current.failedByClientId.get(clientMessageId)).toMatchObject({
+        errorCode: 'CHAT_ACCESS_UNCERTAIN',
+      }),
+    );
+    tripState = readyTripDetail();
+    await view.rerender({});
+    await waitFor(() => expect(view.result.current.accessStatus).toBe('granted'));
+
+    let freshSendOutcome!: Promise<ChatSendOutcome>;
+    let freshReactionOutcome!: Promise<ChatMutationOutcome>;
+    await act(async () => {
+      freshSendOutcome = view.result.current.retryPending(clientMessageId);
+      freshReactionOutcome = view.result.current.toggleReaction(confirmed.id, '👍');
+      await Promise.resolve();
+    });
+    expect(mockSendChatMessage).toHaveBeenCalledTimes(2);
+    expect(mockSendChatMessage.mock.calls[1]?.[1].clientMessageId).toBe(
+      clientMessageId,
+    );
+    expect(mockAddChatReaction).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      oldSend.resolve({
+        disposition: 'created',
+        message: message({
+          id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          content: 'Retry same CID',
+          client_message_id: clientMessageId,
+        }),
+      });
+      oldReaction.resolve({
+        reactions: [{ emoji: '👍', count: 1, reacted_by_ids: [USER_ID] }],
+        change_sequence: 2,
+        updated_at: '2026-08-09T10:01:00.000Z',
+      });
+      await Promise.all([oldSendOutcome, oldReactionOutcome]);
+    });
+
+    const duplicateSend = await captureInAct(() =>
+      view.result.current.retryPending(clientMessageId),
+    );
+    const duplicateReaction = await captureInAct(() =>
+      view.result.current.toggleReaction(confirmed.id, '👍'),
+    );
+    expect(duplicateSend).toMatchObject({
+      kind: 'failed',
+      error: { errorCode: 'SEND_IN_PROGRESS' },
+    });
+    expect(duplicateReaction).toMatchObject({
+      kind: 'rejected',
+      error: { errorCode: 'REACTION_IN_PROGRESS' },
+    });
+    expect(mockSendChatMessage).toHaveBeenCalledTimes(2);
+    expect(mockAddChatReaction).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      freshSend.resolve({
+        disposition: 'replayed',
+        message: message({
+          id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          content: 'Retry same CID',
+          client_message_id: clientMessageId,
+        }),
+      });
+      freshReaction.resolve({
+        reactions: [{ emoji: '👍', count: 1, reacted_by_ids: [USER_ID] }],
+        change_sequence: 2,
+        updated_at: '2026-08-09T10:02:00.000Z',
+      });
+      await expect(freshSendOutcome).resolves.toMatchObject({
+        kind: 'replayed',
+        clientMessageId,
+      });
+      await expect(freshReactionOutcome).resolves.toEqual({ kind: 'applied' });
+    });
+    expect(view.result.current.failedClientIds.has(clientMessageId)).toBe(false);
+    expect(view.result.current.pendingClientIds.has(clientMessageId)).toBe(false);
+  });
+
+  it.each(['TRIP_NOT_FOUND', 'FORBIDDEN'] as const)(
+    'keeps exact trip-detail access loss %s authoritative and kicked',
+    async (errorCode) => {
+      mockUseTripDetail.mockReturnValue({
+        ...readyTripDetail(),
+        detail: null,
+        status: 'error',
+        error: {
+          kind: 'message',
+          message: 'Access is gone.',
+          status: errorCode === 'FORBIDDEN' ? 403 : 404,
+          errorCode,
+        },
+      });
+
+      const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+      await waitFor(() => expect(view.result.current.accessStatus).toBe('denied'));
+      expect(view.result.current.roomStatus).toBe('kicked');
+      expect(view.result.current.messages).toEqual([]);
+      expect(mockListChatHistory).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['TRIP_NOT_FOUND', 'FORBIDDEN'] as const)(
+    'does not revive an exact %s kick after a stale ACTIVE trip snapshot',
+    async (errorCode) => {
+      const deniedTripState = {
+        ...readyTripDetail(),
+        detail: null,
+        status: 'error' as const,
+        error: {
+          kind: 'message' as const,
+          message: `Exact ${errorCode} detail.`,
+          status: errorCode === 'FORBIDDEN' ? 403 : 404,
+          errorCode,
+        },
+      };
+      let tripState:
+        | ReturnType<typeof readyTripDetail>
+        | typeof deniedTripState = readyTripDetail();
+      mockUseTripDetail.mockImplementation(() => tripState);
+
+      const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+      await waitFor(() => expect(view.result.current.roomStatus).toBe('ready'));
+      const blur = await enterFocus();
+      expect(
+        mockSendRealtime.mock.calls.filter(
+          ([command]) => command.type === 'chat.subscribe',
+        ),
+      ).toHaveLength(1);
+
+      tripState = deniedTripState;
+      await view.rerender({});
+      await waitFor(() => expect(view.result.current.roomStatus).toBe('kicked'));
+      expect(view.result.current.roomError).toEqual({
+        errorCode,
+        detail: `Exact ${errorCode} detail.`,
+      });
+
+      tripState = readyTripDetail();
+      mockRealtimeSnapshot = { status: 'connected', connectionEpoch: 2 };
+      await view.rerender({});
+      await act(async () => Promise.resolve());
+
+      expect(view.result.current.roomStatus).toBe('kicked');
+      expect(
+        mockSendRealtime.mock.calls.filter(
+          ([command]) => command.type === 'chat.subscribe',
+        ),
+      ).toHaveLength(1);
+      expect(mockListChatHistory).toHaveBeenCalledTimes(1);
+      await act(async () => blur());
+    },
+  );
+
   it('makes blur cleanup idempotent and never subscribes a reconnect while blurred', async () => {
     const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
     await waitFor(() => expect(view.result.current.roomStatus).toBe('ready'));
@@ -1326,6 +1771,38 @@ describe('useTripChat', () => {
     });
     expect(view.result.current.isReadOnly).toBe(true);
     expect(view.result.current.messages).toHaveLength(1);
+  });
+
+  it('preserves a websocket terminal notice when pending initial history later succeeds', async () => {
+    const initialPage = deferred<{
+      results: readonly ChatMessage[];
+      next_cursor: null;
+    }>();
+    mockListChatHistory.mockReturnValueOnce(initialPage.promise);
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(mockListChatHistory).toHaveBeenCalledTimes(1));
+
+    await emitRealtime({
+      type: 'chat.error',
+      trip_id: TRIP_ID,
+      error_code: 'TRIP_TERMINAL',
+      detail: 'This trip ended while history was loading.',
+    });
+    expect(view.result.current.roomError).toEqual({
+      errorCode: 'TRIP_TERMINAL',
+      detail: 'This trip ended while history was loading.',
+    });
+
+    await act(async () => {
+      initialPage.resolve({ results: [message()], next_cursor: null });
+      await initialPage.promise;
+    });
+    await waitFor(() => expect(view.result.current.roomStatus).toBe('ready'));
+    expect(view.result.current.roomError).toEqual({
+      errorCode: 'TRIP_TERMINAL',
+      detail: 'This trip ended while history was loading.',
+    });
+    expect(view.result.current.isReadOnly).toBe(true);
   });
 
   it('clears optimistic mutation state when trip detail becomes terminal', async () => {
