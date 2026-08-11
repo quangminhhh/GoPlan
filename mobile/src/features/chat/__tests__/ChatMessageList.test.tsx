@@ -1,5 +1,8 @@
 import { act, fireEvent, render, screen } from '@testing-library/react-native';
 import { Alert, Text } from 'react-native';
+import { makeDraftFixture } from '../ai/__fixtures__/drafts';
+import { createAIReconciliationCoordinator } from '../ai/reconciliation';
+import { AIReconciliationCoordinatorProvider } from '../ai/reconciliationContext';
 import type { ChatMessage } from '../types';
 import {
   CHAT_HIDE_SELECTION_LIMIT,
@@ -65,6 +68,8 @@ function props(overrides: Record<string, unknown> = {}) {
     isLoadingOlder: false,
     olderLoadError: null,
     actionsEnabled: true,
+    ambiguousAIDraftIds: emptySet,
+    aiTypingInteractionId: null,
     isHidingMessages: false,
     bottomAccessory: <Text>Composer accessory</Text>,
     onLoadOlder: jest.fn(),
@@ -75,6 +80,7 @@ function props(overrides: Record<string, unknown> = {}) {
       applied: true,
       feedback: null,
     }),
+    onApplyAIDraftSnapshot: jest.fn(),
     ...overrides,
   };
 }
@@ -123,6 +129,142 @@ describe('ChatMessageList', () => {
     ]);
     expect(screen.getAllByText('Mai')).toHaveLength(1);
     expect(screen.getAllByLabelText("Mai's profile picture")).toHaveLength(1);
+  });
+
+  it('renders correlated AI typing at the inverted newest-edge header without synthetic message data', async () => {
+    const onlyMessage = message('message-1');
+    const rendered = await render(
+      <ChatMessageList
+        {...props({
+          aiTypingInteractionId: 'interaction-7',
+          messages: [onlyMessage],
+        })}
+      />,
+    );
+
+    const list = screen.getByTestId('chat-message-list');
+    expect(list.props.data).toEqual([onlyMessage]);
+    expect(list.props.ListHeaderComponent).not.toBeNull();
+    expect(screen.getByTestId('goplan-ai-typing-interaction-7')).toBeTruthy();
+    expect(screen.getAllByTestId(/^chat-message-(?!list$)/)).toHaveLength(1);
+
+    await rendered.rerender(
+      <ChatMessageList
+        {...props({ aiTypingInteractionId: null, messages: [onlyMessage] })}
+      />,
+    );
+    expect(screen.queryByTestId('goplan-ai-typing-interaction-7')).toBeNull();
+    expect(screen.getByTestId('chat-message-list').props.data).toEqual([
+      onlyMessage,
+    ]);
+  });
+
+  it('fails every actionable card closed when two messages carry the same draft UUID', async () => {
+    const draft = makeDraftFixture({
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      display: { title: 'First authority', kicker: 'Expense' },
+    });
+    const aiMessage = (id: string, title: string) =>
+      message(id, {
+        trip_id: '11111111-1111-4111-8111-111111111111',
+        sender: {
+          id: null,
+          display_name: 'GoPlanAI',
+          identify_tag: null,
+          avatar_url: null,
+        },
+        sender_kind: 'AI',
+        ai_status: 'SUCCESS',
+        action_drafts: [
+          {
+            ...draft,
+            display: { title, kicker: 'Expense' },
+          },
+        ],
+      });
+
+    await render(
+      <ChatMessageList
+        {...props({
+          messages: [
+            aiMessage('ai-one', 'First authority'),
+            aiMessage('ai-two', 'Conflicting authority'),
+          ],
+          ambiguousAIDraftIds: new Set([draft.id]),
+        })}
+      />,
+    );
+
+    expect(
+      screen.queryAllByTestId(`ai-action-draft-${draft.id}`),
+    ).toHaveLength(0);
+    expect(screen.queryAllByRole('button', { name: 'Confirm' })).toHaveLength(
+      0,
+    );
+    expect(
+      screen.getAllByText(
+        'An AI action draft could not be displayed safely.',
+      ),
+    ).toHaveLength(2);
+  });
+
+  it('does not transfer a stale editor session when duplicate ambiguity later clears to another message', async () => {
+    const draft = makeDraftFixture({
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      status: 'NEEDS_INFO',
+      can_confirm: false,
+      can_edit: true,
+      missing_fields: [
+        { name: 'title', label: 'Title', type: 'text', required: true },
+      ],
+    });
+    const aiMessage = (id: string) =>
+      message(id, {
+        trip_id: '11111111-1111-4111-8111-111111111111',
+        sender: {
+          id: null,
+          display_name: 'GoPlanAI',
+          identify_tag: null,
+          avatar_url: null,
+        },
+        sender_kind: 'AI',
+        ai_status: 'SUCCESS',
+        action_drafts: [draft],
+      });
+    const first = aiMessage('ai-one');
+    const second = aiMessage('ai-two');
+    const coordinator = createAIReconciliationCoordinator({
+      resourceKey: 'user-me:11111111-1111-4111-8111-111111111111',
+      tripId: '11111111-1111-4111-8111-111111111111',
+    });
+    const transcript = (
+      messages: readonly ChatMessage[],
+      ambiguousAIDraftIds: ReadonlySet<string> = emptySet,
+    ) => (
+      <AIReconciliationCoordinatorProvider value={coordinator}>
+        <ChatMessageList
+          {...props({ messages, ambiguousAIDraftIds })}
+        />
+      </AIReconciliationCoordinatorProvider>
+    );
+    const rendered = await render(transcript([first]));
+    await fireEvent.press(screen.getByRole('button', { name: 'Edit draft' }));
+    await fireEvent.changeText(
+      screen.getByLabelText('Title'),
+      'Must not transfer',
+    );
+
+    await rendered.rerender(
+      transcript([first, second], new Set([draft.id])),
+    );
+    expect(screen.queryAllByTestId(`ai-action-draft-${draft.id}`)).toHaveLength(
+      0,
+    );
+    await rendered.rerender(transcript([second]));
+
+    expect(screen.getByTestId(`ai-action-draft-${draft.id}`)).toBeTruthy();
+    expect(screen.queryByTestId('ai-draft-field-editor')).toBeNull();
+    expect(screen.queryByText('Must not transfer')).toBeNull();
   });
 
   it('shows an honest empty state and keeps the composer accessory mounted', async () => {

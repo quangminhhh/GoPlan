@@ -11,6 +11,8 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { colors, spacing, typography } from '@/shared/theme/tokens';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
+import { goPlanAISendFailureMessage } from '../ai/mention';
+import { AIReconciliationCoordinatorProvider } from '../ai/reconciliationContext';
 import { ChatComposer, type ChatComposerSubmitResult } from '../components/ChatComposer';
 import { ChatConnectionBanner } from '../components/ChatConnectionBanner';
 import {
@@ -25,6 +27,7 @@ import type {
 } from '../types';
 
 const CHAT_SAFE_AREA_EDGES = ['left', 'right', 'bottom'] as const;
+const EMPTY_DRAFT_ID_SET: ReadonlySet<string> = new Set();
 export const CHAT_KEYBOARD_BEHAVIOR = Platform.OS === 'ios' ? 'padding' : undefined;
 
 function routeTripId(value: string | string[] | undefined): string | undefined {
@@ -34,12 +37,29 @@ function routeTripId(value: string | string[] | undefined): string | undefined {
 }
 
 function failureMessage(failure: ChatApiFailure): string {
-  const message = failure.message.trim() || 'Something went wrong.';
+  return failureMessageWithDetail(failure, failure.message);
+}
+
+function failureMessageWithDetail(
+  failure: ChatApiFailure,
+  detail: string,
+): string {
+  const message = detail.trim() || 'Something went wrong.';
   if (failure.retryAfterMs === null || failure.retryAfterMs <= 0) {
     return message;
   }
   const seconds = Math.max(1, Math.ceil(failure.retryAfterMs / 1000));
   return `${message} Try again in ${seconds} ${seconds === 1 ? 'second' : 'seconds'}.`;
+}
+
+function composerFailureMessage(
+  content: string,
+  failure: ChatApiFailure,
+): string {
+  return failureMessageWithDetail(
+    failure,
+    goPlanAISendFailureMessage(content, failure),
+  );
 }
 
 function BlockingState({
@@ -141,7 +161,8 @@ export function ChatScreen() {
   }, [chat.roomError, chat.tripStatus]);
 
   const subscriptionRejected = chat.subscriptionStatus === 'rejected';
-  const roomResourceKey = `${chat.currentUserId ?? 'no-session'}:${tripId ?? 'no-trip'}`;
+  const roomResourceKey =
+    chat.aiReconciliationCoordinator?.resourceKey ?? tripId;
   const actionsEnabled = !chat.isReadOnly;
   const readOnlyMessage = subscriptionRejected
     ? 'Realtime is unavailable for this room. Chat actions are disabled.'
@@ -158,7 +179,7 @@ export function ChatScreen() {
       }
       return {
         draftDisposition: 'preserve',
-        feedback: failureMessage(outcome.error),
+        feedback: composerFailureMessage(content, outcome.error),
       };
     },
     [sendMessage],
@@ -306,9 +327,13 @@ export function ChatScreen() {
             {failureMessage(visibleMutationError.error)}
           </StatusNotice>
         ) : null}
-        <ChatMessageList
-          key={roomResourceKey}
-          messages={chat.messages}
+        <AIReconciliationCoordinatorProvider
+          value={chat.aiReconciliationCoordinator ?? null}
+        >
+          <ChatMessageList
+            key={roomResourceKey}
+            messages={chat.messages}
+          ambiguousAIDraftIds={chat.ambiguousAIDraftIds ?? EMPTY_DRAFT_ID_SET}
           currentUserId={chat.currentUserId}
           pendingClientIds={chat.pendingClientIds}
           failedClientIds={chat.failedClientIds}
@@ -321,6 +346,9 @@ export function ChatScreen() {
             chat.olderLoadError ? failureMessage(chat.olderLoadError) : null
           }
           actionsEnabled={actionsEnabled}
+          aiTypingInteractionId={
+            chat.aiTypingState.active?.interactionId ?? null
+          }
           isHidingMessages={chat.isHidingMessages}
           bottomAccessory={bottomAccessory}
           onLoadOlder={loadOlder}
@@ -328,7 +356,9 @@ export function ChatScreen() {
           onToggleReaction={toggleReaction}
           onDeleteMessage={deleteMessage}
           onHideMessagesForMe={hideMessages}
-        />
+            onApplyAIDraftSnapshot={chat.applyAIDraftSnapshot}
+          />
+        </AIReconciliationCoordinatorProvider>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );

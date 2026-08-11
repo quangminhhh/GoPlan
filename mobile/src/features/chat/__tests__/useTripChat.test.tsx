@@ -16,6 +16,10 @@ jest.mock('@/features/trips/hooks/useTripDetail', () => ({
   useTripDetail: (tripId: string | undefined) => mockUseTripDetail(tripId),
 }));
 
+jest.mock('@/features/expenses/expenseEvents', () => ({
+  publishExpenseEvent: jest.fn(),
+}));
+
 const mockSendRealtime = jest.fn();
 const mockSubscribeAll = jest.fn();
 let mockRealtimeSnapshot: RealtimeSnapshot = {
@@ -63,12 +67,18 @@ import {
   type ChatSendOutcome,
 } from '../hooks/useTripChat';
 // eslint-disable-next-line import/first
+import { makeDraftFixture } from '../ai/__fixtures__/drafts';
+// eslint-disable-next-line import/first
+import { aiActionDraftSourceIdentity } from '../ai/drafts';
+// eslint-disable-next-line import/first
 import type { ChatApiFailure, ChatMessage } from '../types';
 // eslint-disable-next-line import/first
 import type {
   RealtimeEnvelope,
   RealtimeSnapshot,
 } from '@/features/realtime/types';
+// eslint-disable-next-line import/first
+import { publishExpenseEvent } from '@/features/expenses/expenseEvents';
 // eslint-disable-next-line import/first
 import { useLayoutEffect } from 'react';
 
@@ -80,6 +90,7 @@ const mockAddChatReaction = jest.mocked(addChatReaction);
 const mockDeleteChatMessage = jest.mocked(deleteChatMessage);
 const mockHideChatMessages = jest.mocked(hideChatMessages);
 const mockNormalizeChatApiError = jest.mocked(normalizeChatApiError);
+const mockPublishExpenseEvent = jest.mocked(publishExpenseEvent);
 
 const TRIP_ID = 'a1111111-b111-4111-8111-c11111111111';
 const USER_ID = '22222222-2222-4222-8222-222222222222';
@@ -128,6 +139,24 @@ function message(overrides: Partial<ChatMessage> = {}): ChatMessage {
     action_drafts: [],
     ...overrides,
   };
+}
+
+function aiDraftMessage(
+  draft = makeDraftFixture(),
+  overrides: Partial<ChatMessage> = {},
+): ChatMessage {
+  return message({
+    sender_kind: 'AI',
+    ai_status: 'SUCCESS',
+    sender: {
+      id: null,
+      display_name: 'GoPlanAI',
+      identify_tag: null,
+      avatar_url: null,
+    },
+    action_drafts: [draft],
+    ...overrides,
+  });
 }
 
 interface Deferred<T> {
@@ -258,6 +287,7 @@ describe('useTripChat', () => {
       has_more: false,
     });
     mockNormalizeChatApiError.mockReturnValue(networkFailure);
+    mockPublishExpenseEvent.mockResolvedValue(undefined);
   });
 
   it.each([undefined, 'not-a-uuid'])(
@@ -345,6 +375,628 @@ describe('useTripChat', () => {
       type: 'chat.unsubscribe',
       trip_id: TRIP_ID,
     });
+  });
+
+  it('correlates AI typing only inside the current focused acknowledged subscription', async () => {
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.roomStatus).toBe('ready'));
+
+    await emitRealtime({
+      type: 'chat.ai_typing_started',
+      trip_id: TRIP_ID,
+      interaction_id: 'before-focus',
+      requested_by_user_id: USER_ID,
+    });
+    expect(view.result.current.aiTypingState.active).toBeNull();
+
+    const blur = await enterFocus();
+    await emitRealtime({
+      type: 'chat.ai_typing_started',
+      trip_id: TRIP_ID,
+      interaction_id: 'before-ack',
+      requested_by_user_id: USER_ID,
+    });
+    expect(view.result.current.aiTypingState.active).toBeNull();
+
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+    await emitRealtime({
+      type: 'chat.ai_typing_started',
+      trip_id: TRIP_ID,
+      interaction_id: 'interaction-old',
+      requested_by_user_id: USER_ID,
+    });
+    await emitRealtime({
+      type: 'chat.ai_typing_started',
+      trip_id: TRIP_ID,
+      interaction_id: 'interaction-current',
+      requested_by_user_id: null,
+    });
+    await emitRealtime({
+      type: 'chat.ai_typing_stopped',
+      trip_id: TRIP_ID,
+      interaction_id: 'interaction-old',
+    });
+
+    expect(view.result.current.aiTypingState.active).toMatchObject({
+      interactionId: 'interaction-current',
+      requestedByUserId: null,
+    });
+
+    await act(async () => blur());
+    expect(view.result.current.aiTypingState.active).toBeNull();
+    await emitRealtime({
+      type: 'chat.ai_typing_stopped',
+      trip_id: TRIP_ID,
+      interaction_id: 'interaction-current',
+    });
+    expect(view.result.current.aiTypingState.active).toBeNull();
+  });
+
+  it('uses the 120-second AI typing fallback only as a disposable visual timer', async () => {
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.roomStatus).toBe('ready'));
+    const blur = await enterFocus();
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+
+    jest.useFakeTimers();
+    try {
+      await emitRealtime({
+        type: 'chat.ai_typing_started',
+        trip_id: TRIP_ID,
+        interaction_id: 'interaction-timeout',
+        requested_by_user_id: USER_ID,
+      });
+      expect(view.result.current.aiTypingState.active?.interactionId).toBe(
+        'interaction-timeout',
+      );
+
+      await act(async () => {
+        jest.advanceTimersByTime(120_000);
+      });
+      expect(view.result.current.aiTypingState.active).toBeNull();
+      expect(mockSendRealtime).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'chat.ai_typing_stopped' }),
+      );
+
+      await emitRealtime({
+        type: 'chat.ai_typing_started',
+        trip_id: TRIP_ID,
+        interaction_id: 'interaction-dispose',
+        requested_by_user_id: USER_ID,
+      });
+      await act(async () => blur());
+      expect(view.result.current.aiTypingState.active).toBeNull();
+      await act(async () => {
+        jest.advanceTimersByTime(120_000);
+      });
+      expect(view.result.current.aiTypingState.active).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('clears AI typing on unsubscribe, connection epoch change, kick, and resource switch', async () => {
+    const tripB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    mockUseTripDetail.mockImplementation((id: string) => readyTripDetail(id));
+    const view = await renderHook(
+      ({ id }: { id: string }) => useTripChat({ tripId: id }),
+      { initialProps: { id: TRIP_ID } },
+    );
+    await waitFor(() => expect(view.result.current.roomStatus).toBe('ready'));
+    await enterFocus();
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+
+    const start = async (interactionId: string) => {
+      await emitRealtime({
+        type: 'chat.ai_typing_started',
+        trip_id: TRIP_ID,
+        interaction_id: interactionId,
+        requested_by_user_id: USER_ID,
+      });
+      expect(view.result.current.aiTypingState.active?.interactionId).toBe(
+        interactionId,
+      );
+    };
+
+    await start('before-unsubscribe');
+    await emitRealtime({ type: 'chat.unsubscribed', trip_id: TRIP_ID });
+    expect(view.result.current.aiTypingState.active).toBeNull();
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+
+    await start('before-reconnect');
+    mockRealtimeSnapshot = { status: 'reconnecting', connectionEpoch: 1 };
+    await view.rerender({ id: TRIP_ID });
+    expect(view.result.current.aiTypingState.active).toBeNull();
+
+    mockRealtimeSnapshot = { status: 'connected', connectionEpoch: 2 };
+    await view.rerender({ id: TRIP_ID });
+    await waitFor(() =>
+      expect(mockSendRealtime).toHaveBeenLastCalledWith({
+        type: 'chat.subscribe',
+        trip_id: TRIP_ID,
+      }),
+    );
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+    await start('before-kick');
+    await emitRealtime({ type: 'chat.kicked', trip_id: TRIP_ID });
+    expect(view.result.current.aiTypingState.active).toBeNull();
+
+    await view.rerender({ id: tripB });
+    expect(view.result.current.aiTypingState.active).toBeNull();
+  });
+
+  it('exposes a stable resource-guarded AI draft snapshot projection', async () => {
+    const tripB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const source = makeDraftFixture();
+    const projected = makeDraftFixture({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+    });
+    const aiRow = message({
+      sender_kind: 'AI',
+      ai_status: 'SUCCESS',
+      sender: {
+        id: null,
+        display_name: 'GoPlanAI',
+        identify_tag: null,
+        avatar_url: null,
+      },
+      action_drafts: [source],
+      change_sequence: 10,
+    });
+    mockUseTripDetail.mockImplementation((id: string) => readyTripDetail(id));
+    mockListChatHistory
+      .mockResolvedValueOnce({ results: [aiRow], next_cursor: null })
+      .mockResolvedValueOnce({ results: [], next_cursor: null });
+    const view = await renderHook(
+      ({ id }: { id: string }) => useTripChat({ tripId: id }),
+      { initialProps: { id: TRIP_ID } },
+    );
+    await waitFor(() => expect(view.result.current.messages).toHaveLength(1));
+    const callback = view.result.current.applyAIDraftSnapshot;
+
+    await act(async () => {
+      callback({
+        messageId: aiRow.id,
+        draftId: source.id,
+        expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+        draft: projected,
+      });
+    });
+    expect(view.result.current.messages[0]).toMatchObject({
+      change_sequence: 10,
+      action_drafts: [projected],
+    });
+    expect(view.result.current.applyAIDraftSnapshot).toBe(callback);
+
+    await view.rerender({ id: tripB });
+    await act(async () => {
+      callback({
+        messageId: aiRow.id,
+        draftId: source.id,
+        expectedSourceIdentity: aiActionDraftSourceIdentity(projected),
+        draft: source,
+      });
+    });
+    expect(view.result.current.messages).toEqual([]);
+  });
+
+  it('reconciles an offscreen websocket CONFIRMED transition without a mounted draft card', async () => {
+    const source = makeDraftFixture();
+    const confirmed = makeDraftFixture({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      can_cancel: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+      result: { expense_id: 'expense-offscreen' },
+    });
+    const aiRow = aiDraftMessage(source, { change_sequence: 10 });
+    mockListChatHistory.mockResolvedValue({
+      results: [aiRow],
+      next_cursor: null,
+    });
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.messages).toHaveLength(1));
+
+    await emitRealtime({
+      type: 'chat.message',
+      trip_id: TRIP_ID,
+      message: {
+        ...aiRow,
+        action_drafts: [confirmed],
+        change_sequence: 11,
+      },
+    });
+    await waitFor(() => expect(mockPublishExpenseEvent).toHaveBeenCalledTimes(1));
+    expect(mockPublishExpenseEvent).toHaveBeenCalledWith({
+      type: 'expensesChanged',
+      tripId: TRIP_ID,
+    });
+  });
+
+  it('retains an offscreen reconciliation failure across a reconnect acknowledgement', async () => {
+    const source = makeDraftFixture();
+    const confirmed = makeDraftFixture({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      can_cancel: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+      result: { expense_id: 'expense-reconnect-failure' },
+    });
+    const aiRow = aiDraftMessage(source, { change_sequence: 10 });
+    mockListChatHistory.mockResolvedValue({
+      results: [aiRow],
+      next_cursor: null,
+    });
+    mockPublishExpenseEvent.mockRejectedValueOnce(
+      new Error('Expense refresh publisher failed.'),
+    );
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.messages).toHaveLength(1));
+    await enterFocus();
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+
+    await emitRealtime({
+      type: 'chat.message',
+      trip_id: TRIP_ID,
+      message: {
+        ...aiRow,
+        action_drafts: [confirmed],
+        change_sequence: 11,
+      },
+    });
+    await waitFor(() =>
+      expect(view.result.current.roomError).toMatchObject({
+        errorCode: 'AI_RECONCILIATION_FAILED',
+      }),
+    );
+
+    mockRealtimeSnapshot = { status: 'connected', connectionEpoch: 2 };
+    await view.rerender({});
+    await waitFor(() =>
+      expect(
+        mockSendRealtime.mock.calls.filter(
+          ([command]) => command.type === 'chat.subscribe',
+        ),
+      ).toHaveLength(2),
+    );
+    await emitRealtime({
+      type: 'chat.error',
+      trip_id: TRIP_ID,
+      error_code: 'SUBSCRIPTION_LIMIT_REACHED',
+      detail: 'The reconnect subscription was rejected.',
+    });
+    expect(view.result.current.roomError).toEqual({
+      errorCode: 'SUBSCRIPTION_LIMIT_REACHED',
+      detail: 'The reconnect subscription was rejected.',
+    });
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+
+    expect(view.result.current.roomError).toMatchObject({
+      errorCode: 'AI_RECONCILIATION_FAILED',
+    });
+    expect(mockPublishExpenseEvent).toHaveBeenCalledTimes(1);
+
+    await emitRealtime({
+      type: 'chat.error',
+      trip_id: TRIP_ID,
+      error_code: 'TRIP_TERMINAL',
+      detail: 'This trip has ended.',
+    });
+    expect(view.result.current.roomError).toEqual({
+      errorCode: 'TRIP_TERMINAL',
+      detail: 'This trip has ended.',
+    });
+
+    mockRealtimeSnapshot = { status: 'connected', connectionEpoch: 3 };
+    await view.rerender({});
+    await waitFor(() =>
+      expect(
+        mockSendRealtime.mock.calls.filter(
+          ([command]) => command.type === 'chat.subscribe',
+        ),
+      ).toHaveLength(3),
+    );
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+    expect(view.result.current.roomError).toEqual({
+      errorCode: 'TRIP_TERMINAL',
+      detail: 'This trip has ended.',
+    });
+  });
+
+  it('seeds initially CONFIRMED history without publishing reconciliation', async () => {
+    const confirmed = makeDraftFixture({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      can_cancel: false,
+      result: { expense_id: 'expense-history' },
+    });
+    mockListChatHistory.mockResolvedValue({
+      results: [aiDraftMessage(confirmed)],
+      next_cursor: null,
+    });
+
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.roomStatus).toBe('ready'));
+    expect(mockPublishExpenseEvent).not.toHaveBeenCalled();
+  });
+
+  it('shares one reconciliation claim between a local HTTP snapshot and websocket confirmation', async () => {
+    const source = makeDraftFixture();
+    const confirmed = makeDraftFixture({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      can_cancel: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+      result: { expense_id: 'expense-shared' },
+    });
+    const aiRow = aiDraftMessage(source, { change_sequence: 10 });
+    mockListChatHistory.mockResolvedValue({
+      results: [aiRow],
+      next_cursor: null,
+    });
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.messages).toHaveLength(1));
+
+    await act(async () => {
+      await view.result.current.applyAIDraftSnapshot({
+        messageId: aiRow.id,
+        draftId: source.id,
+        expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+        draft: confirmed,
+      });
+      realtimeListener?.({
+        type: 'chat.message',
+        trip_id: TRIP_ID,
+        message: {
+          ...aiRow,
+          action_drafts: [confirmed],
+          change_sequence: 11,
+        },
+      });
+      await Promise.resolve();
+    });
+
+    expect(mockPublishExpenseEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it('reconciles a CONFIRMED transition accepted through changed-message catch-up', async () => {
+    const source = makeDraftFixture();
+    const confirmed = makeDraftFixture({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      can_cancel: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+      result: { expense_id: 'expense-catch-up' },
+    });
+    const aiRow = aiDraftMessage(source, { change_sequence: 10 });
+    mockListChatHistory.mockResolvedValue({
+      results: [aiRow],
+      next_cursor: null,
+    });
+    mockGapFillChatMessages.mockResolvedValueOnce({
+      results: [],
+      has_more: false,
+    });
+    mockSyncChangedChatMessages.mockResolvedValueOnce({
+      results: [
+        {
+          ...aiRow,
+          action_drafts: [confirmed],
+          change_sequence: 11,
+        },
+      ],
+      has_more: false,
+    });
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.messages).toHaveLength(1));
+    await enterFocus();
+    await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
+
+    await waitFor(() => expect(mockPublishExpenseEvent).toHaveBeenCalledTimes(1));
+  });
+
+  it('reconciles a CONFIRMED initial response that overtakes a live READY row while history is pending', async () => {
+    const source = makeDraftFixture();
+    const confirmed = makeDraftFixture({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      can_cancel: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+      result: { expense_id: 'expense-init-overlap' },
+    });
+    const readyRow = aiDraftMessage(source, { change_sequence: 10 });
+    const initialPage = deferred<{
+      results: readonly ChatMessage[];
+      next_cursor: null;
+    }>();
+    mockListChatHistory.mockReturnValueOnce(initialPage.promise);
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(mockListChatHistory).toHaveBeenCalledTimes(1));
+    await emitRealtime({
+      type: 'chat.message',
+      trip_id: TRIP_ID,
+      message: readyRow,
+    });
+
+    await act(async () => {
+      initialPage.resolve({
+        results: [
+          {
+            ...readyRow,
+            action_drafts: [confirmed],
+            change_sequence: 11,
+          },
+        ],
+        next_cursor: null,
+      });
+      await initialPage.promise;
+    });
+
+    await waitFor(() => expect(view.result.current.roomStatus).toBe('ready'));
+    await waitFor(() => expect(mockPublishExpenseEvent).toHaveBeenCalledTimes(1));
+  });
+
+  it('reconciles a CONFIRMED older page that overtakes a live READY row while pagination is pending', async () => {
+    const source = makeDraftFixture();
+    const confirmed = makeDraftFixture({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      can_cancel: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+      result: { expense_id: 'expense-older-overlap' },
+    });
+    const anchor = message({
+      id: '44444444-4444-4444-8444-444444444444',
+      change_sequence: 20,
+    });
+    const readyRow = aiDraftMessage(source, {
+      id: '55555555-5555-4555-8555-555555555555',
+      change_sequence: 10,
+      created_at: '2026-08-09T09:00:00.000Z',
+      updated_at: '2026-08-09T09:00:00.000Z',
+    });
+    const olderPage = deferred<{
+      results: readonly ChatMessage[];
+      next_cursor: null;
+    }>();
+    mockListChatHistory
+      .mockResolvedValueOnce({ results: [anchor], next_cursor: 'older-page' })
+      .mockReturnValueOnce(olderPage.promise);
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.hasMoreOlder).toBe(true));
+
+    let loadPromise!: Promise<void>;
+    await act(async () => {
+      loadPromise = view.result.current.loadOlder();
+      await Promise.resolve();
+    });
+    await emitRealtime({
+      type: 'chat.message',
+      trip_id: TRIP_ID,
+      message: readyRow,
+    });
+    await act(async () => {
+      olderPage.resolve({
+        results: [
+          {
+            ...readyRow,
+            action_drafts: [confirmed],
+            change_sequence: 11,
+          },
+        ],
+        next_cursor: null,
+      });
+      await loadPromise;
+    });
+
+    await waitFor(() => expect(mockPublishExpenseEvent).toHaveBeenCalledTimes(1));
+  });
+
+  it('does not reparse existing AI drafts for ordinary user UPSERT or PATCH_KNOWN rows', async () => {
+    let draftPropertyReads = 0;
+    const trackedDraft = new Proxy(makeDraftFixture(), {
+      get(target, property, receiver) {
+        draftPropertyReads += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    mockListChatHistory.mockResolvedValue({
+      results: [aiDraftMessage(trackedDraft)],
+      next_cursor: null,
+    });
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.roomStatus).toBe('ready'));
+    const readsAfterSeed = draftPropertyReads;
+    const userRow = message({
+      id: '66666666-6666-4666-8666-666666666666',
+      change_sequence: 30,
+    });
+
+    await emitRealtime({
+      type: 'chat.message',
+      trip_id: TRIP_ID,
+      message: userRow,
+    });
+    await emitRealtime({
+      type: 'chat.message_deleted',
+      trip_id: TRIP_ID,
+      message: {
+        ...userRow,
+        content: '',
+        is_deleted_for_everyone: true,
+        change_sequence: 31,
+      },
+    });
+
+    expect(draftPropertyReads).toBe(readsAfterSeed);
+  });
+
+  it('fails closed when a confirmed transition still has a duplicate draft id elsewhere in the room', async () => {
+    const source = makeDraftFixture();
+    const confirmed = makeDraftFixture({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      can_cancel: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+      result: { expense_id: 'must-not-publish-duplicate' },
+    });
+    const first = aiDraftMessage(source, { change_sequence: 10 });
+    const duplicate = aiDraftMessage(source, {
+      id: '77777777-7777-4777-8777-777777777777',
+      change_sequence: 9,
+    });
+    mockListChatHistory.mockResolvedValue({
+      results: [first, duplicate],
+      next_cursor: null,
+    });
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.messages).toHaveLength(2));
+    expect(view.result.current.ambiguousAIDraftIds.has(source.id)).toBe(true);
+
+    await emitRealtime({
+      type: 'chat.message',
+      trip_id: TRIP_ID,
+      message: {
+        ...first,
+        action_drafts: [confirmed],
+        change_sequence: 11,
+      },
+    });
+
+    expect(mockPublishExpenseEvent).not.toHaveBeenCalled();
+    expect(view.result.current.ambiguousAIDraftIds.has(source.id)).toBe(true);
+  });
+
+  it('trims only outer message whitespace before sending while preserving internal spacing', async () => {
+    const rawContent = '  @goplanai Keep  internal\nspacing  ';
+    mockSendChatMessage.mockImplementationOnce(async (_tripId, input) => ({
+      disposition: 'created',
+      message: message({
+        client_message_id: input.clientMessageId,
+        content: '@GoPlanAI Keep internal spacing',
+      }),
+    }));
+    const view = await renderHook(() => useTripChat({ tripId: TRIP_ID }));
+    await waitFor(() => expect(view.result.current.roomStatus).toBe('ready'));
+
+    const outcome = await captureInAct(() =>
+      view.result.current.sendMessage(rawContent),
+    );
+    expect(outcome.kind).toBe('created');
+    expect(mockSendChatMessage.mock.calls[0]?.[1].content).toBe(
+      '@goplanai Keep  internal\nspacing',
+    );
+
+    const empty = await captureInAct(() =>
+      view.result.current.sendMessage(' \n '),
+    );
+    expect(empty).toMatchObject({
+      kind: 'blocked',
+      error: { errorCode: 'INVALID_CONTENT' },
+    });
+    expect(mockSendChatMessage).toHaveBeenCalledTimes(1);
   });
 
   it('waits for subscribe acknowledgement and captures update cursor before gap-fill', async () => {
@@ -819,7 +1471,7 @@ describe('useTripChat', () => {
     expect(mockListChatHistory).toHaveBeenCalledTimes(1);
   });
 
-  it('restarts subscription and catch-up after a transient access error without clearing history', async () => {
+  it('restarts subscription, catch-up, and AI typing after a transient access error without clearing history', async () => {
     const anchor = message();
     const missed = message({
       id: '99999999-9999-4999-8999-999999999999',
@@ -851,11 +1503,23 @@ describe('useTripChat', () => {
     const blur = await enterFocus();
     await emitRealtime({ type: 'chat.subscribed', trip_id: TRIP_ID });
     await waitFor(() => expect(mockGapFillChatMessages).toHaveBeenCalledTimes(1));
+    await emitRealtime({
+      type: 'chat.ai_typing_started',
+      trip_id: TRIP_ID,
+      interaction_id: 'before-transient-error',
+      requested_by_user_id: USER_ID,
+    });
+    expect(view.result.current.aiTypingState.active?.interactionId).toBe(
+      'before-transient-error',
+    );
 
     tripState = transientState;
     await view.rerender({});
     await waitFor(() => expect(view.result.current.accessStatus).toBe('error'));
+    // The transcript is hidden while authority is unknown, but the reducer
+    // history must survive and reappear without another first-page load.
     expect(view.result.current.messages).toEqual([]);
+    expect(view.result.current.aiTypingState.active).toBeNull();
     expect(view.result.current.subscriptionStatus).toBe('inactive');
     expect(
       mockSendRealtime.mock.calls.filter(
@@ -882,6 +1546,15 @@ describe('useTripChat', () => {
         anchor.id,
         missed.id,
       ]),
+    );
+    await emitRealtime({
+      type: 'chat.ai_typing_started',
+      trip_id: TRIP_ID,
+      interaction_id: 'after-transient-error',
+      requested_by_user_id: USER_ID,
+    });
+    expect(view.result.current.aiTypingState.active?.interactionId).toBe(
+      'after-transient-error',
     );
     await act(async () => blur());
   });

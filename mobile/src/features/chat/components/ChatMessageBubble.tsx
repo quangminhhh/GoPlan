@@ -11,6 +11,17 @@ import {
 } from 'react-native';
 import { UserAvatar } from '@/features/auth/components/UserAvatar';
 import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
+import { AIActionDraftCardController } from '../ai/components/AIActionDraftCardController';
+import {
+  GoPlanAIMentionMessageText,
+} from '../ai/components/AIMention';
+import { AIMessageContent } from '../ai/components/AIMessageContent';
+import {
+  aiActionDraftSourceIdentity,
+  parseAIActionDraft,
+  type AIActionDraft,
+} from '../ai/drafts';
+import { parseGoPlanAIMention } from '../ai/mention';
 import type {
   AllowedReactionEmoji,
   ChatApiFailure,
@@ -28,6 +39,19 @@ const accessibleTimeFormatter = new Intl.DateTimeFormat(undefined, {
   timeStyle: 'short',
 });
 
+const EMPTY_DRAFT_ID_SET: ReadonlySet<string> = new Set();
+
+export interface ApplyMessageAIDraftSnapshotInput {
+  readonly messageId: string;
+  readonly draftId: string;
+  readonly expectedSourceIdentity: string;
+  readonly draft: AIActionDraft;
+}
+
+export type ApplyMessageAIDraftSnapshot = (
+  input: ApplyMessageAIDraftSnapshotInput,
+) => Promise<void>;
+
 interface ChatMessageBubbleProps {
   message: ChatMessage;
   currentUserId: string;
@@ -41,12 +65,14 @@ interface ChatMessageBubbleProps {
   deleting: boolean;
   reactionBusy: boolean;
   actionsEnabled: boolean;
+  ambiguousAIDraftIds?: ReadonlySet<string>;
   selectionMode: boolean;
   selected: boolean;
   onOpenActions: (messageId: string) => void;
   onToggleSelection: (messageId: string) => void;
   onRetry: (clientMessageId: string) => void;
   onToggleReaction: (messageId: string, emoji: AllowedReactionEmoji) => void;
+  onApplyAIDraftSnapshot: ApplyMessageAIDraftSnapshot;
 }
 
 function senderLabel(message: ChatMessage): string {
@@ -75,7 +101,9 @@ function messageAccessibilityLabel(
   const sender = isOwn ? 'You' : senderLabel(message);
   const content = message.is_deleted_for_everyone
     ? 'Message removed for everyone'
-    : message.content || 'Message with no text';
+    : message.sender_kind === 'AI' && message.ai_status === 'ERROR'
+      ? `GoPlanAI could not complete this request. ${message.content || 'No error detail was provided.'}`
+      : message.content || 'Message with no text';
   const time = formatMessageTime(message.created_at, true);
   const delivery = failed
     ? 'Not sent'
@@ -124,6 +152,47 @@ function SenderAvatar({ message }: { message: ChatMessage }) {
   );
 }
 
+interface AIDraftCardAdapterProps {
+  readonly draft: AIActionDraft;
+  readonly interactionDisabled: boolean;
+  readonly messageId: string;
+  readonly tripId: string;
+  readonly onApplyAIDraftSnapshot: ApplyMessageAIDraftSnapshot;
+}
+
+const AIDraftCardAdapter = memo(function AIDraftCardAdapter({
+  draft,
+  interactionDisabled,
+  messageId,
+  tripId,
+  onApplyAIDraftSnapshot,
+}: AIDraftCardAdapterProps) {
+  const expectedSourceIdentity = useMemo(
+    () => aiActionDraftSourceIdentity(draft),
+    [draft],
+  );
+  const applySnapshot = useCallback(
+    (nextDraft: AIActionDraft) =>
+      onApplyAIDraftSnapshot({
+        messageId,
+        draftId: draft.id,
+        expectedSourceIdentity,
+        draft: nextDraft,
+      }),
+    [draft.id, expectedSourceIdentity, messageId, onApplyAIDraftSnapshot],
+  );
+
+  return (
+    <AIActionDraftCardController
+      draft={draft}
+      interactionDisabled={interactionDisabled}
+      onDraftChanged={applySnapshot}
+      tripId={tripId}
+    />
+  );
+});
+AIDraftCardAdapter.displayName = 'AIDraftCardAdapter';
+
 function ChatMessageBubbleComponent({
   message,
   currentUserId,
@@ -137,18 +206,61 @@ function ChatMessageBubbleComponent({
   deleting,
   reactionBusy,
   actionsEnabled,
+  ambiguousAIDraftIds = EMPTY_DRAFT_ID_SET,
   selectionMode,
   selected,
   onOpenActions,
   onToggleSelection,
   onRetry,
   onToggleReaction,
+  onApplyAIDraftSnapshot,
 }: ChatMessageBubbleProps) {
   const canSelect = !pending && !failed && !deleting;
   const canOpenActions = actionsEnabled && canSelect && !selectionMode;
   const canRetry = Boolean(actionsEnabled && failed && message.client_message_id);
   const time = formatMessageTime(message.created_at);
   const label = senderLabel(message);
+  const userHasAIMention = useMemo(
+    () =>
+      message.sender_kind === 'USER' &&
+      parseGoPlanAIMention(message.content).hasMention,
+    [message.content, message.sender_kind],
+  );
+  const parsedDrafts = useMemo(() => {
+    if (
+      message.sender_kind !== 'AI' ||
+      message.is_deleted_for_everyone
+    ) {
+      return { drafts: [] as readonly AIActionDraft[], malformedCount: 0 };
+    }
+    const parsedCandidates = message.action_drafts.map(parseAIActionDraft);
+    const idCounts = new Map<string, number>();
+    for (const parsed of parsedCandidates) {
+      if (parsed !== null) {
+        idCounts.set(parsed.id, (idCounts.get(parsed.id) ?? 0) + 1);
+      }
+    }
+    const drafts: AIActionDraft[] = [];
+    let malformedCount = 0;
+    for (const parsed of parsedCandidates) {
+      if (parsed === null) {
+        malformedCount += 1;
+      } else if (
+        (idCounts.get(parsed.id) ?? 0) !== 1 ||
+        ambiguousAIDraftIds.has(parsed.id)
+      ) {
+        malformedCount += 1;
+      } else {
+        drafts.push(parsed);
+      }
+    }
+    return { drafts, malformedCount };
+  }, [
+    ambiguousAIDraftIds,
+    message.action_drafts,
+    message.is_deleted_for_everyone,
+    message.sender_kind,
+  ]);
   const accessibilityActions = useMemo<AccessibilityActionInfo[]>(() => {
     if (selectionMode && canSelect) {
       return [
@@ -203,6 +315,28 @@ function ChatMessageBubbleComponent({
     [openActions, retry, toggleSelection],
   );
 
+  const content = message.sender_kind === 'AI' ? (
+    <View style={styles.aiContent}>
+      {message.ai_status === 'ERROR' ? (
+        <Text
+          accessibilityLiveRegion="polite"
+          accessibilityRole="alert"
+          style={styles.aiErrorText}
+          testID={`chat-ai-error-${message.id}`}
+        >
+          GoPlanAI could not complete this request.
+        </Text>
+      ) : null}
+      <AIMessageContent content={message.content} />
+    </View>
+  ) : userHasAIMention ? (
+    <GoPlanAIMentionMessageText content={message.content} inverse={isOwn} />
+  ) : (
+    <Text style={[styles.messageText, isOwn ? styles.ownMessageText : null]}>
+      {message.content}
+    </Text>
+  );
+
   const bubble = (
     <Pressable
       accessible
@@ -238,12 +372,35 @@ function ChatMessageBubbleComponent({
       {message.is_deleted_for_everyone ? (
         <Text style={styles.tombstoneText}>Message removed for everyone</Text>
       ) : (
-        <Text style={[styles.messageText, isOwn ? styles.ownMessageText : null]}>
-          {message.content}
-        </Text>
+        content
       )}
     </Pressable>
   );
+
+  const actionDraftCards =
+    parsedDrafts.drafts.length > 0 || parsedDrafts.malformedCount > 0 ? (
+      <View style={styles.actionDrafts} testID={`chat-ai-drafts-${message.id}`}>
+        {parsedDrafts.drafts.map((draft) => (
+          <AIDraftCardAdapter
+            draft={draft}
+            interactionDisabled={!actionsEnabled || selectionMode}
+            key={draft.id}
+            messageId={message.id}
+            onApplyAIDraftSnapshot={onApplyAIDraftSnapshot}
+            tripId={message.trip_id}
+          />
+        ))}
+        {parsedDrafts.malformedCount > 0 ? (
+          <Text
+            accessibilityRole="alert"
+            style={styles.malformedDraftText}
+            testID={`chat-ai-draft-malformed-${message.id}`}
+          >
+            An AI action draft could not be displayed safely.
+          </Text>
+        ) : null}
+      </View>
+    ) : null;
 
   const meta = showMeta || pending || failed || deleting ? (
     <View style={[styles.metaRow, isOwn ? styles.metaRowOwn : null]}>
@@ -296,6 +453,7 @@ function ChatMessageBubbleComponent({
       <View style={[styles.row, styles.ownRow, selected ? styles.selectedRow : null]}>
         <View style={[styles.messageColumn, styles.ownColumn]}>
           {bubble}
+          {actionDraftCards}
           {reactions}
           {meta}
         </View>
@@ -308,7 +466,13 @@ function ChatMessageBubbleComponent({
     <View style={[styles.row, styles.otherRow, selected ? styles.selectedRow : null]}>
       {selectionMode && canSelect ? <SelectionIndicator selected={selected} /> : null}
       <View style={styles.avatarGutter}>{showAvatar ? <SenderAvatar message={message} /> : null}</View>
-      <View style={[styles.messageColumn, styles.otherColumn]}>
+      <View
+        style={[
+          styles.messageColumn,
+          styles.otherColumn,
+          message.sender_kind === 'AI' ? styles.aiColumn : null,
+        ]}
+      >
         {showSender ? (
           <View style={styles.senderRow}>
             <Text style={[styles.senderName, message.sender_kind === 'AI' ? styles.aiSender : null]}>
@@ -320,6 +484,7 @@ function ChatMessageBubbleComponent({
           </View>
         ) : null}
         {bubble}
+        {actionDraftCards}
         {reactions}
         {meta}
       </View>
@@ -351,6 +516,7 @@ const styles = StyleSheet.create({
   messageColumn: { minWidth: 0, gap: spacing.xs },
   ownColumn: { maxWidth: '82%', alignItems: 'flex-end' },
   otherColumn: { maxWidth: '82%', alignItems: 'flex-start' },
+  aiColumn: { maxWidth: '100%', flex: 1, alignItems: 'stretch' },
   avatarGutter: { width: 32, minHeight: 32, justifyContent: 'flex-end' },
   aiAvatar: {
     width: 32,
@@ -400,6 +566,13 @@ const styles = StyleSheet.create({
   pressed: { opacity: 0.58 },
   messageText: { ...typography.body, color: colors.text },
   ownMessageText: { color: colors.background },
+  aiContent: { minWidth: 0, gap: spacing.sm },
+  aiErrorText: { ...typography.label, color: colors.danger },
+  actionDrafts: { width: '100%', minWidth: 0, gap: spacing.sm },
+  malformedDraftText: {
+    ...typography.caption,
+    color: colors.danger,
+  },
   tombstoneText: { ...typography.caption, color: colors.textMuted, fontStyle: 'italic' },
   metaRow: {
     minHeight: 20,

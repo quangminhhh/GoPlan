@@ -18,6 +18,8 @@ import {
   View,
 } from 'react-native';
 import { colors, spacing, typography } from '@/shared/theme/tokens';
+import { AITypingIndicator } from '../ai/components/AITypingIndicator';
+import { useRoomAIActionDraftControllerSessionStore } from '../ai/reconciliationContext';
 import type {
   AllowedReactionEmoji,
   ChatApiFailure,
@@ -25,7 +27,10 @@ import type {
   DeleteChatMessageMode,
 } from '../types';
 import { ChatMessageActionsModal } from './ChatMessageActionsModal';
-import { ChatMessageBubble } from './ChatMessageBubble';
+import {
+  ChatMessageBubble,
+  type ApplyMessageAIDraftSnapshot,
+} from './ChatMessageBubble';
 import { ChatSelectionToolbar } from './ChatSelectionToolbar';
 
 const MESSAGE_GROUP_WINDOW_MS = 5 * 60 * 1000;
@@ -66,6 +71,8 @@ interface ChatMessageListProps {
   isLoadingOlder: boolean;
   olderLoadError: string | null;
   actionsEnabled: boolean;
+  ambiguousAIDraftIds: ReadonlySet<string>;
+  aiTypingInteractionId: string | null;
   isHidingMessages: boolean;
   bottomAccessory: ReactNode;
   onLoadOlder: () => void;
@@ -73,6 +80,7 @@ interface ChatMessageListProps {
   onToggleReaction: (messageId: string, emoji: AllowedReactionEmoji) => void;
   onDeleteMessage: (messageId: string, mode: DeleteChatMessageMode) => void;
   onHideMessagesForMe: (messageIds: readonly string[]) => Promise<ChatListMutationResult>;
+  onApplyAIDraftSnapshot: ApplyMessageAIDraftSnapshot;
 }
 
 function chatMessageKey(message: ChatMessage): string {
@@ -194,6 +202,8 @@ export function ChatMessageList({
   isLoadingOlder,
   olderLoadError,
   actionsEnabled,
+  ambiguousAIDraftIds,
+  aiTypingInteractionId,
   isHidingMessages,
   bottomAccessory,
   onLoadOlder,
@@ -201,7 +211,10 @@ export function ChatMessageList({
   onToggleReaction,
   onDeleteMessage,
   onHideMessagesForMe,
+  onApplyAIDraftSnapshot,
 }: ChatMessageListProps) {
+  const aiControllerSessionStore =
+    useRoomAIActionDraftControllerSessionStore();
   const nowMs = useDeleteDeadlineClock(messages);
   const userInteractedRef = useRef(false);
   const actionsEnabledRef = useRef(actionsEnabled);
@@ -212,6 +225,12 @@ export function ChatMessageList({
   );
   const [selectionFeedback, setSelectionFeedback] = useState<string | null>(null);
   const newestFirstMessages = useMemo(() => [...messages].reverse(), [messages]);
+  useLayoutEffect(() => {
+    if (aiControllerSessionStore === null) {
+      return;
+    }
+    aiControllerSessionStore.setAmbiguousDraftIds(ambiguousAIDraftIds);
+  }, [aiControllerSessionStore, ambiguousAIDraftIds]);
   const visibleMessageIds = useMemo(
     () => new Set(messages.map((message) => message.id)),
     [messages],
@@ -240,6 +259,15 @@ export function ChatMessageList({
     ? pendingReactionMessageIds.has(activeMessage.id) ||
       pendingDeleteMessageIds.has(activeMessage.id)
     : false;
+  const typingHeader = useMemo(
+    () =>
+      aiTypingInteractionId === null ? null : (
+        <View style={styles.typingHeader}>
+          <AITypingIndicator interactionId={aiTypingInteractionId} />
+        </View>
+      ),
+    [aiTypingInteractionId],
+  );
 
   useLayoutEffect(() => {
     actionsEnabledRef.current = actionsEnabled;
@@ -364,23 +392,27 @@ export function ChatMessageList({
           deleting={pendingDeleteMessageIds.has(item.id)}
           reactionBusy={pendingReactionMessageIds.has(item.id)}
           actionsEnabled={actionsEnabled}
+          ambiguousAIDraftIds={ambiguousAIDraftIds}
           selectionMode={selectionMode}
           selected={visibleSelectedIds.has(item.id)}
           onOpenActions={openActions}
           onToggleSelection={toggleSelection}
           onRetry={onRetry}
           onToggleReaction={onToggleReaction}
+          onApplyAIDraftSnapshot={onApplyAIDraftSnapshot}
         />
       );
     },
     [
       actionsEnabled,
+      ambiguousAIDraftIds,
       currentUserId,
       failedClientIds,
       failedByClientId,
       newestFirstMessages,
       onRetry,
       onToggleReaction,
+      onApplyAIDraftSnapshot,
       openActions,
       pendingClientIds,
       pendingDeleteMessageIds,
@@ -453,6 +485,7 @@ export function ChatMessageList({
           newestFirstMessages.length === 0 ? styles.emptyContent : styles.listContent
         }
         ListEmptyComponent={<EmptyChatState />}
+        ListHeaderComponent={typingHeader}
         ListFooterComponent={paginationFooter}
         testID="chat-message-list"
       />
@@ -499,6 +532,10 @@ const styles = StyleSheet.create({
   shell: { flex: 1, backgroundColor: colors.surface },
   listContent: { paddingVertical: spacing.sm },
   emptyContent: { flexGrow: 1, justifyContent: 'center' },
+  typingHeader: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.xs,
+  },
   emptyState: {
     flex: 1,
     alignItems: 'center',

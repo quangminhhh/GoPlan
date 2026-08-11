@@ -12,6 +12,11 @@ import {
   transcriptReducer,
   type TranscriptState,
 } from '../application/transcriptReducer';
+import { makeDraftFixture, makeRawDraftFixture } from '../ai/__fixtures__/drafts';
+import {
+  aiActionDraftSourceIdentity,
+  type AIActionDraft,
+} from '../ai/drafts';
 import type {
   ChatApiFailure,
   ChatMessage,
@@ -99,6 +104,33 @@ function initialWith(messages: readonly ChatMessage[]): TranscriptState {
   });
 }
 
+function aiDraft(
+  overrides: Readonly<Record<string, unknown>> = {},
+): AIActionDraft {
+  return makeDraftFixture(overrides);
+}
+
+function aiMessage(
+  drafts: readonly Readonly<Record<string, unknown>>[],
+  changeSequence = 10,
+  overrides: Partial<ChatMessage> = {},
+): ChatMessage {
+  return message('ai-message', {
+    sender: {
+      id: null,
+      display_name: 'GoPlanAI',
+      identify_tag: null,
+      avatar_url: null,
+    },
+    sender_kind: 'AI',
+    ai_status: 'SUCCESS',
+    content: 'AI response',
+    change_sequence: changeSequence,
+    action_drafts: drafts,
+    ...overrides,
+  });
+}
+
 describe('transcriptReducer', () => {
   it('creates isolated immutable collections and resource-scopes every action', () => {
     const first = createTranscriptState(RESOURCE_KEY);
@@ -121,6 +153,250 @@ describe('transcriptReducer', () => {
       messages: [message('server-1')],
     });
     expect(ignored).toBe(first);
+  });
+
+  it('projects a guarded AI draft snapshot without changing the authoritative row or opaque siblings', () => {
+    const source = aiDraft({ future_source_value: { nested: true } });
+    const sibling = makeRawDraftFixture({
+      id: '33333333-3333-4333-8333-333333333333',
+      action_type: 'future.action',
+      future_sibling_value: ['keep', 7],
+    });
+    const malformed = { id: source.id, future_malformed_value: true };
+    const initialized = initialWith([
+      aiMessage([source, sibling, malformed]),
+    ]);
+    const projected = aiDraft({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+      future_projection_value: { preserved: true },
+    });
+    const after = transcriptReducer(initialized, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: projected,
+    });
+
+    expect(after.confirmed.get('ai-message')?.change_sequence).toBe(10);
+    expect(after.confirmed.get('ai-message')?.action_drafts[0]).toBe(source);
+    const effective = selectMessageById(after, 'ai-message');
+    expect(effective?.action_drafts[0]).toBe(projected);
+    expect(effective?.action_drafts[1]).toBe(sibling);
+    expect(effective?.action_drafts[2]).toBe(malformed);
+
+    const wrongResource = transcriptReducer(after, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: 'trip-2:member-1',
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(projected),
+      draft: source,
+    });
+    const staleSource = transcriptReducer(after, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: source,
+    });
+    expect(wrongResource).toBe(after);
+    expect(staleSource).toBe(after);
+  });
+
+  it('supports chained local AI draft projections and retains them across partial reaction pushes', () => {
+    const source = aiDraft();
+    const second = aiDraft({
+      summary: 'Edited once',
+      updated_at: '2026-08-09T10:01:00.000Z',
+    });
+    const third = aiDraft({
+      summary: 'Edited twice',
+      updated_at: '2026-08-09T10:02:00.000Z',
+    });
+    let state = initialWith([aiMessage([source])]);
+    state = transcriptReducer(state, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: second,
+    });
+    state = transcriptReducer(state, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(second),
+      draft: third,
+    });
+    state = transcriptReducer(state, {
+      type: 'REACTION_PATCH',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      reactions: [reaction('👍', ['member-1'])],
+      changeSequence: 11,
+      updatedAt: '2026-08-09T10:03:00.000Z',
+    });
+
+    expect(selectMessageById(state, 'ai-message')?.action_drafts[0]).toBe(
+      third,
+    );
+    expect(state.confirmed.get('ai-message')).toMatchObject({
+      change_sequence: 11,
+      action_drafts: [source],
+    });
+    expect(
+      state.aiDraftOverlays
+        .get('ai-message')
+        ?.get(source.id)?.priorSourceIdentities,
+    ).toEqual(
+      new Set([
+        aiActionDraftSourceIdentity(source),
+        aiActionDraftSourceIdentity(second),
+      ]),
+    );
+  });
+
+  it('retains an AI projection for higher old-chain snapshots and clears it when the full row catches up', () => {
+    const source = aiDraft();
+    const second = aiDraft({
+      summary: 'Edited once',
+      updated_at: '2026-08-09T10:01:00.000Z',
+    });
+    const projected = aiDraft({
+      summary: 'Edited twice',
+      updated_at: '2026-08-09T10:02:00.000Z',
+    });
+    let state = initialWith([aiMessage([source])]);
+    state = transcriptReducer(state, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: second,
+    });
+    state = transcriptReducer(state, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(second),
+      draft: projected,
+    });
+    state = transcriptReducer(state, {
+      type: 'UPSERT',
+      resourceKey: RESOURCE_KEY,
+      messages: [aiMessage([second], 12)],
+    });
+
+    expect(selectMessageById(state, 'ai-message')?.action_drafts[0]).toBe(
+      projected,
+    );
+    expect(state.aiDraftOverlays.has('ai-message')).toBe(true);
+
+    state = transcriptReducer(state, {
+      type: 'UPSERT',
+      resourceKey: RESOURCE_KEY,
+      messages: [aiMessage([projected], 13)],
+    });
+    expect(state.aiDraftOverlays.has('ai-message')).toBe(false);
+    expect(selectMessageById(state, 'ai-message')?.action_drafts[0]).toBe(
+      projected,
+    );
+    expect(state.confirmed.get('ai-message')?.change_sequence).toBe(13);
+  });
+
+  it.each([
+    {
+      label: 'a concurrent valid draft',
+      incoming: aiMessage([
+        aiDraft({
+          summary: 'Concurrent server update',
+          updated_at: '2026-08-09T10:09:00.000Z',
+        }),
+      ], 11),
+    },
+    { label: 'a missing draft', incoming: aiMessage([], 11) },
+    {
+      label: 'a malformed draft',
+      incoming: aiMessage([
+        makeRawDraftFixture({ status: 'EXECUTED' }),
+      ], 11),
+    },
+    {
+      label: 'a tombstone',
+      incoming: aiMessage([aiDraft()], 11, {
+        is_deleted_for_everyone: true,
+      }),
+    },
+  ])('lets $label clear a stale local AI projection', ({ incoming }) => {
+    const source = aiDraft();
+    const projected = aiDraft({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+    });
+    let state = initialWith([aiMessage([source])]);
+    state = transcriptReducer(state, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: projected,
+    });
+    state = transcriptReducer(state, {
+      type: 'UPSERT',
+      resourceKey: RESOURCE_KEY,
+      messages: [incoming],
+    });
+
+    expect(state.aiDraftOverlays.has('ai-message')).toBe(false);
+    expect(selectMessageById(state, 'ai-message')?.action_drafts).toEqual(
+      incoming.action_drafts,
+    );
+  });
+
+  it('clears AI projections on hide, kick, and reset', () => {
+    const source = aiDraft();
+    const projected = aiDraft({
+      updated_at: '2026-08-09T10:01:00.000Z',
+    });
+    const initialized = initialWith([aiMessage([source])]);
+    const withProjection = transcriptReducer(initialized, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: projected,
+    });
+
+    const hidden = transcriptReducer(withProjection, {
+      type: 'HIDE_MESSAGES',
+      resourceKey: RESOURCE_KEY,
+      messageIds: ['ai-message'],
+      requestVersion: withProjection.version,
+    });
+    const kicked = transcriptReducer(withProjection, {
+      type: 'KICKED',
+      resourceKey: RESOURCE_KEY,
+    });
+    const reset = transcriptReducer(withProjection, {
+      type: 'RESET',
+      resourceKey: 'trip-2:member-1',
+    });
+
+    expect(hidden.aiDraftOverlays.size).toBe(0);
+    expect(kicked.aiDraftOverlays.size).toBe(0);
+    expect(reset.aiDraftOverlays.size).toBe(0);
   });
 
   it('merges an initial page with one shared mutation version without mutating the prior maps', () => {

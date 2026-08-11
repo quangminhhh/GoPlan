@@ -28,6 +28,17 @@ import {
   sendChatMessage,
   syncChangedChatMessages,
 } from '../api';
+import { parseAIActionDraft, type AIActionDraft } from '../ai/drafts';
+import {
+  createAIReconciliationCoordinator,
+  type AIReconciliationCoordinator,
+} from '../ai/reconciliation';
+import {
+  createAITypingVisualController,
+  EMPTY_AI_TYPING_STATE,
+  type AITypingState,
+  type AITypingVisualController,
+} from '../ai/typingState';
 import {
   createTranscriptState,
   hasConfirmedClientId,
@@ -39,6 +50,7 @@ import {
   selectTranscriptMessages,
   transcriptReducer,
   type ChatRoomStatus,
+  type TranscriptState,
   type TranscriptAction,
 } from '../application/transcriptReducer';
 import { canonicalizeChatTripId } from '../contracts';
@@ -61,6 +73,13 @@ const CHAT_MUTATION_INTERRUPTED_ERROR_CODE = 'CHAT_MUTATION_INTERRUPTED';
 const ACCESS_LOST_ERROR_CODES = new Set(['TRIP_NOT_FOUND', 'FORBIDDEN']);
 const EMPTY_ID_SET: ReadonlySet<string> = new Set();
 const EMPTY_FAILURE_MAP: ReadonlyMap<string, ChatApiFailure> = new Map();
+const AI_TYPING_TIMER_SCHEDULER = {
+  set: (callback: () => void, delayMs: number): unknown =>
+    globalThis.setTimeout(callback, delayMs),
+  clear: (handle: unknown): void => {
+    globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>);
+  },
+};
 
 type ChatCurrentUser = Pick<
   AuthUser,
@@ -80,6 +99,11 @@ export type ChatRoomViewStatus = Exclude<ChatRoomStatus, 'idle'>;
 export interface ChatRoomError {
   readonly errorCode: string;
   readonly detail: string;
+}
+
+interface ResourceScopedChatRoomError {
+  readonly resourceKey: string;
+  readonly error: ChatRoomError;
 }
 
 export type ChatSendOutcome =
@@ -114,6 +138,13 @@ export interface UseTripChatOptions {
   readonly tripId: string | undefined;
 }
 
+export interface ApplyAIDraftSnapshotInput {
+  readonly messageId: string;
+  readonly draftId: string;
+  readonly expectedSourceIdentity: string;
+  readonly draft: AIActionDraft;
+}
+
 export interface UseTripChatResult {
   readonly currentUserId: string | null;
   readonly tripStatus: TripStatus | null;
@@ -136,8 +167,11 @@ export interface UseTripChatResult {
   readonly isHidingMessages: boolean;
   readonly isReadOnly: boolean;
   readonly mutationError: ChatMutationError | null;
+  readonly aiTypingState: AITypingState;
   readonly connectionStatus: RealtimeStatus;
   readonly connectionEpoch: number;
+  readonly aiReconciliationCoordinator: AIReconciliationCoordinator;
+  readonly ambiguousAIDraftIds: ReadonlySet<string>;
   readonly retryInitialLoad: () => Promise<void>;
   readonly loadOlder: () => Promise<void>;
   readonly sendMessage: (content: string) => Promise<ChatSendOutcome>;
@@ -153,6 +187,9 @@ export interface UseTripChatResult {
   readonly hideMessagesForMe: (
     messageIds: readonly string[],
   ) => Promise<ChatMutationOutcome>;
+  readonly applyAIDraftSnapshot: (
+    input: ApplyAIDraftSnapshotInput,
+  ) => Promise<void>;
 }
 
 interface CatchUpRun {
@@ -171,6 +208,25 @@ interface LiveReactionProof {
 interface LiveDeleteProof {
   readonly message: ChatMessage;
 }
+
+interface ActiveAITypingVisualController {
+  readonly controller: AITypingVisualController;
+  readonly resourceKey: string;
+  readonly focusGeneration: number;
+  readonly connectionEpoch: number;
+}
+
+interface AITypingPresentation {
+  readonly state: AITypingState;
+  readonly resourceKey: string | null;
+  readonly connectionEpoch: number | null;
+}
+
+const EMPTY_AI_TYPING_PRESENTATION: AITypingPresentation = {
+  state: EMPTY_AI_TYPING_STATE,
+  resourceKey: null,
+  connectionEpoch: null,
+};
 
 function localFailure(
   message: string,
@@ -212,6 +268,157 @@ function compareMessages(a: ChatMessage, b: ChatMessage): number {
     return a.created_at < b.created_at ? -1 : 1;
   }
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+interface AIDraftObservationIndex {
+  readonly resourceKey: string;
+  readonly byMessageId: Map<string, readonly AIActionDraft[]>;
+  readonly byDraftId: Map<
+    string,
+    Map<string, readonly AIActionDraft[]>
+  >;
+  readonly ambiguousDraftIds: Set<string>;
+  readonly ambiguitySnapshots: Map<'current', ReadonlySet<string>>;
+}
+
+interface AIDraftObservationChange {
+  readonly previousByDraftId: ReadonlyMap<
+    string,
+    readonly AIActionDraft[]
+  >;
+  readonly nextByDraftId: ReadonlyMap<
+    string,
+    readonly AIActionDraft[]
+  >;
+}
+
+function effectiveAIDraftsForMessage(
+  state: TranscriptState,
+  messageId: string,
+): readonly AIActionDraft[] {
+  const message = selectMessageById(state, messageId);
+  if (
+    message === null ||
+    message.sender_kind !== 'AI' ||
+    message.is_deleted_for_everyone ||
+    message.action_drafts.length === 0
+  ) {
+    return [];
+  }
+  const drafts: AIActionDraft[] = [];
+  for (const candidate of message.action_drafts) {
+    const parsed = parseAIActionDraft(candidate);
+    if (parsed !== null) {
+      drafts.push(parsed);
+    }
+  }
+  return drafts;
+}
+
+function indexedDraftOccurrences(
+  index: AIDraftObservationIndex,
+  draftId: string,
+): readonly AIActionDraft[] {
+  const occurrencesByMessage = index.byDraftId.get(draftId);
+  return occurrencesByMessage === undefined
+    ? []
+    : [...occurrencesByMessage.values()].flat();
+}
+
+function updateAIDraftObservationIndex(
+  index: AIDraftObservationIndex,
+  nextState: TranscriptState,
+  messageIds: readonly string[],
+): AIDraftObservationChange {
+  const affectedMessageIds = [...new Set(messageIds)];
+  const nextDraftsByMessage = new Map<string, readonly AIActionDraft[]>();
+  const affectedDraftIds = new Set<string>();
+  for (const messageId of affectedMessageIds) {
+    for (const draft of index.byMessageId.get(messageId) ?? []) {
+      affectedDraftIds.add(draft.id);
+    }
+    const nextDrafts = effectiveAIDraftsForMessage(nextState, messageId);
+    nextDraftsByMessage.set(messageId, nextDrafts);
+    for (const draft of nextDrafts) {
+      affectedDraftIds.add(draft.id);
+    }
+  }
+
+  const previousByDraftId = new Map<
+    string,
+    readonly AIActionDraft[]
+  >();
+  for (const draftId of affectedDraftIds) {
+    previousByDraftId.set(
+      draftId,
+      [...indexedDraftOccurrences(index, draftId)],
+    );
+  }
+
+  for (const messageId of affectedMessageIds) {
+    const priorDraftIds = new Set(
+      (index.byMessageId.get(messageId) ?? []).map((draft) => draft.id),
+    );
+    for (const draftId of priorDraftIds) {
+      const occurrencesByMessage = index.byDraftId.get(draftId);
+      occurrencesByMessage?.delete(messageId);
+      if (occurrencesByMessage?.size === 0) {
+        index.byDraftId.delete(draftId);
+      }
+    }
+    index.byMessageId.delete(messageId);
+  }
+
+  for (const [messageId, drafts] of nextDraftsByMessage) {
+    if (drafts.length === 0) {
+      continue;
+    }
+    index.byMessageId.set(messageId, drafts);
+    const draftsById = new Map<string, AIActionDraft[]>();
+    for (const draft of drafts) {
+      const occurrences = draftsById.get(draft.id) ?? [];
+      occurrences.push(draft);
+      draftsById.set(draft.id, occurrences);
+    }
+    for (const [draftId, occurrences] of draftsById) {
+      const occurrencesByMessage =
+        index.byDraftId.get(draftId) ??
+        new Map<string, readonly AIActionDraft[]>();
+      occurrencesByMessage.set(messageId, occurrences);
+      index.byDraftId.set(draftId, occurrencesByMessage);
+    }
+  }
+
+  const nextByDraftId = new Map<
+    string,
+    readonly AIActionDraft[]
+  >();
+  for (const draftId of affectedDraftIds) {
+    nextByDraftId.set(
+      draftId,
+      [...indexedDraftOccurrences(index, draftId)],
+    );
+  }
+  let ambiguityChanged = false;
+  for (const [draftId, occurrences] of nextByDraftId) {
+    const isAmbiguous = occurrences.length > 1;
+    if (index.ambiguousDraftIds.has(draftId) === isAmbiguous) {
+      continue;
+    }
+    ambiguityChanged = true;
+    if (isAmbiguous) {
+      index.ambiguousDraftIds.add(draftId);
+    } else {
+      index.ambiguousDraftIds.delete(draftId);
+    }
+  }
+  if (ambiguityChanged) {
+    index.ambiguitySnapshots.set(
+      'current',
+      new Set(index.ambiguousDraftIds),
+    );
+  }
+  return { previousByDraftId, nextByDraftId };
 }
 
 function latestChangeCursorFromMessages(
@@ -355,6 +562,10 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     useState<ChatSubscriptionStatus>('inactive');
   const [currentRoomError, setCurrentRoomError] =
     useState<ChatRoomError | null>(null);
+  const [aiReconciliationError, setAIReconciliationError] =
+    useState<ResourceScopedChatRoomError | null>(null);
+  const [aiTypingPresentation, setAITypingPresentation] =
+    useState<AITypingPresentation>(EMPTY_AI_TYPING_PRESENTATION);
   const clearNonterminalRoomError = useCallback(() => {
     setCurrentRoomError((current) =>
       current?.errorCode === TERMINAL_ERROR_CODE ? current : null,
@@ -403,16 +614,135 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
   const liveDeleteProofsRef = useRef(new Map<string, LiveDeleteProof>());
   const deleteLocksRef = useRef(new Map<string, symbol>());
   const hideLockRef = useRef<symbol | null>(null);
+  const aiTypingControllerRef =
+    useRef<ActiveAITypingVisualController | null>(null);
+  const aiTypingDisposalGenerationRef = useRef(0);
+  const aiReconciliationCoordinator = useMemo(
+    () => createAIReconciliationCoordinator({ resourceKey, tripId }),
+    [resourceKey, tripId],
+  );
+  const aiDraftObservationIndex = useMemo<AIDraftObservationIndex>(
+    () => ({
+      resourceKey,
+      byMessageId: new Map(),
+      byDraftId: new Map(),
+      ambiguousDraftIds: new Set(),
+      ambiguitySnapshots: new Map([['current', EMPTY_ID_SET]]),
+    }),
+    [resourceKey],
+  );
 
   const dispatch = useCallback(
     (action: TranscriptAction) => {
       // Async reconciliation can dispatch several causally ordered results
       // before React publishes a render. Keep a write-through reducer mirror
       // so every later request captures the exact post-action version.
-      stateRef.current = transcriptReducer(stateRef.current, action);
+      const previousState = stateRef.current;
+      const nextState = transcriptReducer(previousState, action);
+      let reconciliation = Promise.resolve();
+      let observationMode: 'seed-new' | 'transition' | 'silent' | null = null;
+      let affectedMessageIds: readonly string[] = [];
+      switch (action.type) {
+        case 'INIT_RESOLVED':
+        case 'OLDER_RESOLVED':
+          observationMode = 'seed-new';
+          affectedMessageIds = action.messages.map((message) => message.id);
+          break;
+        case 'UPSERT':
+        case 'PATCH_KNOWN':
+          observationMode = 'transition';
+          affectedMessageIds = action.messages.map((message) => message.id);
+          break;
+        case 'AI_DRAFT_LOCAL_SNAPSHOT':
+          observationMode = 'transition';
+          affectedMessageIds = [action.messageId];
+          break;
+        case 'HIDE_MESSAGES':
+          observationMode = 'silent';
+          affectedMessageIds = action.messageIds;
+          break;
+        case 'DELETE_SUCCESS':
+          observationMode = 'silent';
+          affectedMessageIds = [action.message.id];
+          break;
+        case 'RESET':
+        case 'KICKED':
+          aiDraftObservationIndex.byMessageId.clear();
+          aiDraftObservationIndex.byDraftId.clear();
+          aiDraftObservationIndex.ambiguousDraftIds.clear();
+          aiDraftObservationIndex.ambiguitySnapshots.set(
+            'current',
+            EMPTY_ID_SET,
+          );
+          break;
+      }
+
+      if (
+        nextState !== previousState &&
+        observationMode !== null &&
+        affectedMessageIds.length > 0
+      ) {
+        const { previousByDraftId, nextByDraftId } =
+          updateAIDraftObservationIndex(
+            aiDraftObservationIndex,
+            nextState,
+            affectedMessageIds,
+          );
+        const claims: Promise<unknown>[] = [];
+        for (const [draftId, nextOccurrences] of nextByDraftId) {
+          if (
+            observationMode === 'silent' ||
+            nextOccurrences.length !== 1 ||
+            nextOccurrences[0].status !== 'CONFIRMED'
+          ) {
+            continue;
+          }
+          const previousOccurrences = previousByDraftId.get(draftId) ?? [];
+          if (previousOccurrences.length > 1) {
+            continue;
+          }
+          const nextDraft = nextOccurrences[0];
+          const previousDraft = previousOccurrences[0] ?? null;
+          if (previousDraft?.status === 'CONFIRMED') {
+            aiReconciliationCoordinator.seedConfirmedDrafts([nextDraft]);
+            continue;
+          }
+          if (observationMode === 'seed-new' && previousDraft === null) {
+            aiReconciliationCoordinator.seedConfirmedDrafts([nextDraft]);
+            continue;
+          }
+          claims.push(
+            aiReconciliationCoordinator.reconcile({
+              previousStatus: previousDraft?.status ?? null,
+              draft: nextDraft,
+            }),
+          );
+        }
+        reconciliation = Promise.all(claims).then(() => undefined);
+        if (claims.length > 0) {
+          void reconciliation.catch(() => {
+            if (activeResourceKeyRef.current === resourceKey) {
+              setAIReconciliationError({
+                resourceKey,
+                error: roomError(
+                  'AI_RECONCILIATION_FAILED',
+                  'The AI action was confirmed, but another trip screen could not refresh automatically.',
+                ),
+              });
+            }
+          });
+        }
+      }
+      stateRef.current = nextState;
       reactDispatch(action);
+      return reconciliation;
     },
-    [reactDispatch],
+    [
+      aiDraftObservationIndex,
+      aiReconciliationCoordinator,
+      reactDispatch,
+      resourceKey,
+    ],
   );
 
   useLayoutEffect(() => {
@@ -425,6 +755,111 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     (expectedResourceKey: string) =>
       activeResourceKeyRef.current === expectedResourceKey,
     [],
+  );
+
+  const disposeAITypingVisual = useCallback(() => {
+    const disposalGeneration = aiTypingDisposalGenerationRef.current + 1;
+    aiTypingDisposalGenerationRef.current = disposalGeneration;
+    const active = aiTypingControllerRef.current;
+    aiTypingControllerRef.current = null;
+    active?.controller.dispose();
+    queueMicrotask(() => {
+      if (
+        aiTypingDisposalGenerationRef.current !== disposalGeneration ||
+        aiTypingControllerRef.current !== null
+      ) {
+        return;
+      }
+      setAITypingPresentation((current) =>
+        current === EMPTY_AI_TYPING_PRESENTATION ||
+        (current.state.active === null && current.resourceKey === null)
+          ? current
+          : EMPTY_AI_TYPING_PRESENTATION,
+      );
+    });
+  }, []);
+
+  const ensureAITypingVisual = useCallback(
+    (connectionEpoch: number) => {
+      const focusGeneration = focusGenerationRef.current;
+      const current = aiTypingControllerRef.current;
+      if (
+        current !== null &&
+        current.resourceKey === resourceKey &&
+        current.focusGeneration === focusGeneration &&
+        current.connectionEpoch === connectionEpoch
+      ) {
+        return current.controller;
+      }
+
+      disposeAITypingVisual();
+      let controller: AITypingVisualController;
+      controller = createAITypingVisualController({
+        scheduler: AI_TYPING_TIMER_SCHEDULER,
+        now: () => Date.now(),
+        onChange: (next) => {
+          const active = aiTypingControllerRef.current;
+          const snapshot = snapshotRef.current;
+          if (
+            active?.controller !== controller ||
+            active.resourceKey !== resourceKey ||
+            active.focusGeneration !== focusGeneration ||
+            active.connectionEpoch !== connectionEpoch ||
+            activeResourceKeyRef.current !== resourceKey ||
+            focusGenerationRef.current !== focusGeneration ||
+            !focusedRef.current ||
+            !accessGrantedRef.current ||
+            kickedRef.current ||
+            snapshot.status !== 'connected' ||
+            snapshot.connectionEpoch !== connectionEpoch ||
+            ackedEpochRef.current !== connectionEpoch
+          ) {
+            return;
+          }
+          setAITypingPresentation({
+            state: next,
+            resourceKey,
+            connectionEpoch,
+          });
+        },
+      });
+      aiTypingControllerRef.current = {
+        controller,
+        resourceKey,
+        focusGeneration,
+        connectionEpoch,
+      };
+      aiTypingDisposalGenerationRef.current += 1;
+      setAITypingPresentation({
+        state: EMPTY_AI_TYPING_STATE,
+        resourceKey,
+        connectionEpoch,
+      });
+      return controller;
+    },
+    [disposeAITypingVisual, resourceKey],
+  );
+
+  const applyAIDraftSnapshot = useCallback(
+    (input: ApplyAIDraftSnapshotInput): Promise<void> => {
+      if (
+        !isResourceCurrent(resourceKey) ||
+        stateRef.current.resourceKey !== resourceKey ||
+        !accessGrantedRef.current ||
+        kickedRef.current
+      ) {
+        return Promise.resolve();
+      }
+      return dispatch({
+        type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+        resourceKey,
+        messageId: input.messageId,
+        draftId: input.draftId,
+        expectedSourceIdentity: input.expectedSourceIdentity,
+        draft: input.draft,
+      });
+    },
+    [dispatch, isResourceCurrent, resourceKey],
   );
 
   const registerController = useCallback(() => {
@@ -476,6 +911,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     }
     abortAllRequests();
     invalidateMutationOwnership();
+    disposeAITypingVisual();
     sentEpochRef.current = null;
     ackedEpochRef.current = null;
     rejectedEpochRef.current = null;
@@ -498,6 +934,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
   }, [
     abortAllRequests,
     dispatch,
+    disposeAITypingVisual,
     invalidateMutationOwnership,
     realtime,
     resourceKey,
@@ -510,11 +947,18 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       focusGenerationRef.current += 1;
       abortAllRequests();
       invalidateMutationOwnership();
+      disposeAITypingVisual();
       setSubscriptionStatus('inactive');
       setCurrentRoomError(roomError(errorCode, detail));
       dispatch({ type: 'KICKED', resourceKey });
     },
-    [abortAllRequests, dispatch, invalidateMutationOwnership, resourceKey],
+    [
+      abortAllRequests,
+      dispatch,
+      disposeAITypingVisual,
+      invalidateMutationOwnership,
+      resourceKey,
+    ],
   );
 
   const applyAuthoritativeFailure = useCallback(
@@ -544,6 +988,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
   useEffect(() => {
     let cancelled = false;
     invalidateMutationOwnership();
+    disposeAITypingVisual();
     kickedRef.current = false;
     sentEpochRef.current = null;
     ackedEpochRef.current = null;
@@ -553,6 +998,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     queueMicrotask(() => {
       if (!cancelled) {
         setCurrentRoomError(null);
+        setAIReconciliationError(null);
       }
     });
     return () => {
@@ -560,8 +1006,15 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       focusGenerationRef.current += 1;
       abortAllRequests();
       invalidateMutationOwnership();
+      disposeAITypingVisual();
     };
-  }, [abortAllRequests, dispatch, invalidateMutationOwnership, resourceKey]);
+  }, [
+    abortAllRequests,
+    dispatch,
+    disposeAITypingVisual,
+    invalidateMutationOwnership,
+    resourceKey,
+  ]);
 
   const loadInitialHistory = useCallback(async () => {
     if (
@@ -911,6 +1364,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     useCallback(() => {
       focusedRef.current = true;
       focusGenerationRef.current += 1;
+      disposeAITypingVisual();
       setSubscriptionStatus(
         snapshotRef.current.status === 'connected' ? 'subscribing' : 'waiting',
       );
@@ -919,6 +1373,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       return () => {
         focusedRef.current = false;
         focusGenerationRef.current += 1;
+        disposeAITypingVisual();
         const activeCatchUp = catchUpRunRef.current;
         activeCatchUp?.controller.abort();
         if (activeCatchUp !== null && catchUpRunRef.current === activeCatchUp) {
@@ -944,11 +1399,29 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         catchUpRequestedEpochRef.current = null;
         setSubscriptionStatus('inactive');
       };
-    }, [attemptSubscribe, dispatch, isResourceCurrent, realtime, tripId]),
+    }, [
+      attemptSubscribe,
+      dispatch,
+      disposeAITypingVisual,
+      isResourceCurrent,
+      realtime,
+      tripId,
+    ]),
   );
 
   useEffect(() => {
     const activeCatchUp = catchUpRunRef.current;
+    const activeTyping = aiTypingControllerRef.current;
+    if (
+      activeTyping !== null &&
+      (realtimeSnapshot.status !== 'connected' ||
+        activeTyping.connectionEpoch !== realtimeSnapshot.connectionEpoch ||
+        activeTyping.resourceKey !== resourceKey ||
+        !focusedRef.current ||
+        !accessGranted)
+    ) {
+      disposeAITypingVisual();
+    }
     if (
       activeCatchUp !== null &&
       (realtimeSnapshot.status !== 'connected' ||
@@ -981,6 +1454,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     accessGranted,
     attemptSubscribe,
     dispatch,
+    disposeAITypingVisual,
     realtimeSnapshot,
     resourceKey,
   ]);
@@ -1026,6 +1500,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           catchUpRequestedEpochRef.current = snapshot.connectionEpoch;
           setSubscriptionStatus('subscribed');
           clearNonterminalRoomError();
+          ensureAITypingVisual(snapshot.connectionEpoch);
           if (stateRef.current.roomStatus === 'ready') {
             void runCatchUp(snapshot.connectionEpoch);
           }
@@ -1045,6 +1520,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           }
           ackedEpochRef.current = null;
           catchUpRequestedEpochRef.current = null;
+          disposeAITypingVisual();
           if (focusedRef.current && !rejectedCurrentAttempt) {
             if (sentEpochRef.current === snapshot.connectionEpoch) {
               setSubscriptionStatus('subscribing');
@@ -1141,9 +1617,43 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           }
           return;
         }
-        case 'chat.ai_typing_started':
-        case 'chat.ai_typing_stopped':
+        case 'chat.ai_typing_started': {
+          const active = aiTypingControllerRef.current;
+          const snapshot = snapshotRef.current;
+          if (
+            active === null ||
+            active.resourceKey !== resourceKey ||
+            active.focusGeneration !== focusGenerationRef.current ||
+            !focusedRef.current ||
+            snapshot.status !== 'connected' ||
+            active.connectionEpoch !== snapshot.connectionEpoch ||
+            ackedEpochRef.current !== snapshot.connectionEpoch
+          ) {
+            return;
+          }
+          active.controller.start(
+            event.interaction_id,
+            event.requested_by_user_id,
+          );
           return;
+        }
+        case 'chat.ai_typing_stopped': {
+          const active = aiTypingControllerRef.current;
+          const snapshot = snapshotRef.current;
+          if (
+            active === null ||
+            active.resourceKey !== resourceKey ||
+            active.focusGeneration !== focusGenerationRef.current ||
+            !focusedRef.current ||
+            snapshot.status !== 'connected' ||
+            active.connectionEpoch !== snapshot.connectionEpoch ||
+            ackedEpochRef.current !== snapshot.connectionEpoch
+          ) {
+            return;
+          }
+          active.controller.stop(event.interaction_id);
+          return;
+        }
       }
     });
   }, [
@@ -1151,6 +1661,8 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     attemptSubscribe,
     clearNonterminalRoomError,
     dispatch,
+    disposeAITypingVisual,
+    ensureAITypingVisual,
     invalidateMutationOwnership,
     isResourceCurrent,
     kickRoom,
@@ -1874,6 +2386,10 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         state.roomError.message,
       )
     : null;
+  const visibleAIReconciliationError =
+    aiReconciliationError?.resourceKey === resourceKey
+      ? aiReconciliationError.error
+      : null;
   const visibleSubscriptionStatus: ChatSubscriptionStatus =
     !visibleState
       ? 'inactive'
@@ -1882,6 +2398,14 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       : realtimeSnapshot.status === 'connected'
         ? subscriptionStatus
         : 'waiting';
+  const visibleAITypingState =
+    securityAllowsTranscript &&
+    visibleSubscriptionStatus === 'subscribed' &&
+    realtimeSnapshot.status === 'connected' &&
+    aiTypingPresentation.resourceKey === resourceKey &&
+    aiTypingPresentation.connectionEpoch === realtimeSnapshot.connectionEpoch
+      ? aiTypingPresentation.state
+      : EMPTY_AI_TYPING_STATE;
 
   return {
     currentUserId: ownerUserId,
@@ -1897,7 +2421,10 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
             : state.roomStatus,
     subscriptionStatus: visibleSubscriptionStatus,
     roomError:
-      accessError ?? (visibleState ? currentRoomError : null) ?? transcriptRoomError,
+      accessError ??
+      (visibleState ? currentRoomError : null) ??
+      visibleAIReconciliationError ??
+      transcriptRoomError,
     messages,
     pendingClientIds: visibleState ? state.pendingClientIds : EMPTY_ID_SET,
     failedClientIds: visibleState ? state.failedClientIds : EMPTY_ID_SET,
@@ -1916,8 +2443,14 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     isHidingMessages: visibleState && state.isHidingMessages,
     isReadOnly: readOnly,
     mutationError: visibleState ? state.mutationError : null,
+    aiTypingState: visibleAITypingState,
     connectionStatus: realtimeSnapshot.status,
     connectionEpoch: realtimeSnapshot.connectionEpoch,
+    aiReconciliationCoordinator,
+    ambiguousAIDraftIds: visibleState
+      ? (aiDraftObservationIndex.ambiguitySnapshots.get('current') ??
+        EMPTY_ID_SET)
+      : EMPTY_ID_SET,
     retryInitialLoad,
     loadOlder,
     sendMessage,
@@ -1925,5 +2458,6 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     toggleReaction,
     deleteMessage,
     hideMessagesForMe,
+    applyAIDraftSnapshot,
   };
 }

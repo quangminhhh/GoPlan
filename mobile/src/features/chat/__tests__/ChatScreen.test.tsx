@@ -1,4 +1,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react-native';
+import { makeDraftFixture } from '../ai/__fixtures__/drafts';
+import { aiActionDraftSourceIdentity } from '../ai/drafts';
+import { createAIReconciliationCoordinator } from '../ai/reconciliation';
 import type { ChatApiFailure, ChatMessage } from '../types';
 import { CHAT_KEYBOARD_BEHAVIOR, ChatScreen } from '../screens/ChatScreen';
 
@@ -13,6 +16,20 @@ jest.mock('../hooks/useTripChat', () => ({
 }), { virtual: true });
 jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
 jest.mock('@/features/auth/components/UserAvatar', () => ({ UserAvatar: () => null }));
+jest.mock('../ai/api', () => {
+  const actual = jest.requireActual<typeof import('../ai/api')>('../ai/api');
+  return {
+    ...actual,
+    getAIActionDraft: jest.fn(),
+    cancelAIActionDraft: jest.fn(),
+  };
+});
+
+// eslint-disable-next-line import/first
+import { cancelAIActionDraft, getAIActionDraft } from '../ai/api';
+
+const mockGetAIActionDraft = jest.mocked(getAIActionDraft);
+const mockCancelAIActionDraft = jest.mocked(cancelAIActionDraft);
 
 const emptySet = new Set<string>();
 const emptyMap = new Map<string, ChatApiFailure>();
@@ -80,6 +97,7 @@ function chatResult(overrides: Record<string, unknown> = {}) {
     pendingDeleteMessageIds: emptySet,
     isHidingMessages: false,
     mutationError: null,
+    aiTypingState: { active: null },
     currentUserId: 'user-me',
     tripStatus: 'PLANNING',
     accessStatus: 'granted',
@@ -96,6 +114,7 @@ function chatResult(overrides: Record<string, unknown> = {}) {
     toggleReaction: jest.fn().mockResolvedValue({ kind: 'applied' }),
     deleteMessage: jest.fn().mockResolvedValue({ kind: 'applied' }),
     hideMessagesForMe: jest.fn().mockResolvedValue({ kind: 'applied' }),
+    applyAIDraftSnapshot: jest.fn(),
     ...overrides,
   };
 }
@@ -104,6 +123,8 @@ describe('ChatScreen', () => {
   beforeEach(() => {
     mockParams = { tripId: 'trip-1' };
     mockUseTripChat.mockReset();
+    mockGetAIActionDraft.mockReset();
+    mockCancelAIActionDraft.mockReset();
     mockUseTripChat.mockReturnValue(chatResult());
   });
 
@@ -249,9 +270,17 @@ describe('ChatScreen', () => {
     expect(tripASend).not.toHaveBeenCalled();
   });
 
-  it('resets the composer when the signed-in user changes inside the same trip', async () => {
+  it('resets the composer when the signed-in user resource changes inside the same trip', async () => {
+    const coordinatorA = createAIReconciliationCoordinator({
+      resourceKey: 'user-a:trip-1',
+      tripId: 'trip-1',
+    });
+    const coordinatorB = createAIReconciliationCoordinator({
+      resourceKey: 'user-b:trip-1',
+      tripId: 'trip-1',
+    });
     mockUseTripChat.mockReturnValue(
-      chatResult({ currentUserId: 'user-a' }),
+      chatResult({ aiReconciliationCoordinator: coordinatorA }),
     );
     const view = await render(<ChatScreen />);
     await fireEvent.changeText(
@@ -260,11 +289,10 @@ describe('ChatScreen', () => {
     );
 
     mockUseTripChat.mockReturnValue(
-      chatResult({ currentUserId: 'user-b' }),
+      chatResult({ aiReconciliationCoordinator: coordinatorB }),
     );
     await view.rerender(<ChatScreen />);
 
-    expect(mockUseTripChat).toHaveBeenLastCalledWith({ tripId: 'trip-1' });
     expect(screen.getByLabelText('Message').props.value).toBe('');
   });
 
@@ -376,6 +404,152 @@ describe('ChatScreen', () => {
     expect(screen.getByTestId('chat-composer-feedback')).toHaveTextContent(
       'Too many messages. Try again in 3 seconds.',
     );
+  });
+
+  it('maps only an AI-mention 429 to the explicit 20-per-hour quota and keeps Retry-After', async () => {
+    const sendMessage = jest.fn().mockResolvedValue({
+      kind: 'blocked',
+      error: failure('Generic throttle detail.', {
+        errorCode: 'THROTTLED',
+        status: 429,
+        retryAfterMs: 2500,
+      }),
+    });
+    mockUseTripChat.mockReturnValue(chatResult({ sendMessage }));
+    await render(<ChatScreen />);
+
+    const input = screen.getByLabelText('Message');
+    await fireEvent.changeText(input, '  @goplanai Keep my AI prompt  ');
+    await fireEvent.press(screen.getByLabelText('Send message'));
+    await act(async () => undefined);
+
+    expect(input.props.value).toBe('  @goplanai Keep my AI prompt  ');
+    expect(screen.getByTestId('chat-composer-feedback')).toHaveTextContent(
+      'GoPlanAI allows 20 prompts per hour. Your prompt was not sent; try again later. Try again in 3 seconds.',
+    );
+  });
+
+  it('does not call the chat send path for a bare GoPlanAI mention', async () => {
+    const sendMessage = jest.fn().mockResolvedValue({
+      kind: 'created',
+      clientMessageId: 'client-ai-bare',
+    });
+    mockUseTripChat.mockReturnValue(chatResult({ sendMessage }));
+    await render(<ChatScreen />);
+
+    await fireEvent.changeText(
+      screen.getByLabelText('Message'),
+      '@GoPlanAI   ',
+    );
+    await fireEvent.press(screen.getByLabelText('Send message'));
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(screen.getByTestId('goplan-ai-prompt-hint')).toBeTruthy();
+  });
+
+  it.each([
+    ['AI_BUSY', 409, 'The current GoPlanAI interaction is still active.'],
+    ['INVALID_AI_PROMPT', 400, 'Please include a concrete AI prompt.'],
+  ])(
+    'preserves backend detail and the local composer draft for %s',
+    async (errorCode, status, detail) => {
+      const sendMessage = jest.fn().mockResolvedValue({
+        kind: 'blocked',
+        error: failure(detail, { errorCode, status }),
+      });
+      mockUseTripChat.mockReturnValue(chatResult({ sendMessage }));
+      await render(<ChatScreen />);
+
+      const input = screen.getByLabelText('Message');
+      const localDraft = '  @GoPlanAI Preserve this draft  ';
+      await fireEvent.changeText(input, localDraft);
+      await fireEvent.press(screen.getByLabelText('Send message'));
+      await act(async () => undefined);
+
+      expect(input.props.value).toBe(localDraft);
+      expect(screen.getByTestId('chat-composer-feedback')).toHaveTextContent(
+        detail,
+      );
+    },
+  );
+
+  it('passes the correlated AI typing interaction to the transcript header', async () => {
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        aiTypingState: {
+          active: {
+            interactionId: 'interaction-screen',
+            requestedByUserId: 'user-me',
+            startedAtMs: 1,
+            visualExpiresAtMs: 120_001,
+          },
+        },
+      }),
+    );
+    await render(<ChatScreen />);
+
+    expect(
+      screen.getByTestId('goplan-ai-typing-interaction-screen'),
+    ).toBeTruthy();
+  });
+
+  it('plumbs a draft HTTP snapshot back through the resource-guarded hook callback', async () => {
+    const tripId = '11111111-1111-4111-8111-111111111111';
+    const source = makeDraftFixture();
+    const cancelled = makeDraftFixture({
+      status: 'CANCELLED',
+      can_confirm: false,
+      can_cancel: false,
+      updated_at: '2026-08-10T00:01:00.000Z',
+    });
+    const applyAIDraftSnapshot = jest.fn();
+    mockParams = { tripId };
+    mockGetAIActionDraft.mockResolvedValue({ draft: source });
+    mockCancelAIActionDraft.mockResolvedValue({ draft: cancelled });
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        applyAIDraftSnapshot,
+        messages: [
+          {
+            ...message('ai-message', 'Review this proposal.'),
+            trip_id: tripId,
+            sender: {
+              id: null,
+              display_name: 'GoPlanAI',
+              identify_tag: null,
+              avatar_url: null,
+            },
+            sender_kind: 'AI',
+            ai_status: 'SUCCESS',
+            action_drafts: [source],
+          },
+        ],
+      }),
+    );
+    await render(<ChatScreen />);
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Cancel' }));
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Cancel this draft' }),
+    );
+    await act(async () => undefined);
+
+    expect(mockGetAIActionDraft).toHaveBeenCalledWith(
+      tripId,
+      source.id,
+      expect.any(AbortSignal),
+    );
+    expect(mockCancelAIActionDraft).toHaveBeenCalledWith(
+      tripId,
+      source.id,
+      expect.any(AbortSignal),
+    );
+    expect(applyAIDraftSnapshot).toHaveBeenCalledWith({
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: cancelled,
+    });
   });
 
   it('surfaces catch-up, mutation, and older-page failures without hiding history', async () => {

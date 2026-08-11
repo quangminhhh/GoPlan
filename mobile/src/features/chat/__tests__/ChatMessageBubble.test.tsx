@@ -1,4 +1,10 @@
-import { fireEvent, render, screen } from '@testing-library/react-native';
+import {
+  fireEvent,
+  render,
+  screen,
+  within,
+} from '@testing-library/react-native';
+import { makeDraftFixture } from '../ai/__fixtures__/drafts';
 import type { ChatMessage } from '../types';
 import { ChatMessageBubble } from '../components/ChatMessageBubble';
 
@@ -65,6 +71,7 @@ function props(overrides: Record<string, unknown> = {}) {
     onToggleSelection: jest.fn(),
     onRetry: jest.fn(),
     onToggleReaction: jest.fn(),
+    onApplyAIDraftSnapshot: jest.fn(),
     ...overrides,
   };
 }
@@ -139,6 +146,145 @@ describe('ChatMessageBubble', () => {
     expect(screen.getByText('Here is a simple answer.')).toBeTruthy();
     expect(screen.queryByText('MUST STAY HIDDEN')).toBeNull();
     expect(screen.queryByText('42')).toBeNull();
+  });
+
+  it('preserves ordinary user whitespace and tokenizes only a parsed GoPlanAI mention', async () => {
+    const ordinaryContent = '  Keep   ordinary\nwhitespace  ';
+    const rendered = await render(
+      <ChatMessageBubble
+        {...props({ message: message({ content: ordinaryContent }) })}
+      />,
+    );
+
+    expect(screen.getByText(ordinaryContent)).toBeTruthy();
+    expect(screen.queryByLabelText('GoPlanAI mention')).toBeNull();
+
+    await rendered.rerender(
+      <ChatMessageBubble
+        {...props({
+          message: message({ content: 'Please ask @goplanai about day 2' }),
+        })}
+      />,
+    );
+    expect(screen.getByLabelText('GoPlanAI mention')).toBeTruthy();
+  });
+
+  it('renders AI error content inertly and includes failure in the parent accessibility label', async () => {
+    await render(
+      <ChatMessageBubble
+        {...props({
+          message: message({
+            sender: {
+              id: null,
+              display_name: 'GoPlanAI',
+              identify_tag: null,
+              avatar_url: null,
+            },
+            sender_kind: 'AI',
+            ai_status: 'ERROR',
+            content:
+              '<script>mutateTrip()</script> [Open](https://evil.example)',
+          }),
+        })}
+      />,
+    );
+
+    const bubble = screen.getByTestId('chat-message-message-1');
+    expect(bubble.props.accessibilityLabel).toContain(
+      'GoPlanAI could not complete this request.',
+    );
+    expect(screen.getByTestId('chat-ai-error-message-1').props.accessibilityRole).toBe(
+      'alert',
+    );
+    const aiContent = within(screen.getByTestId('goplan-ai-message-content'));
+    expect(aiContent.getByText(/mutateTrip/)).toBeTruthy();
+    expect(aiContent.queryByRole('link')).toBeNull();
+    expect(aiContent.queryByRole('button')).toBeNull();
+  });
+
+  it('renders only unambiguous valid AI drafts outside the message Pressable and fails every duplicate id closed', async () => {
+    const known = makeDraftFixture();
+    const unknown = makeDraftFixture({
+      id: '33333333-3333-4333-8333-333333333333',
+      action_type: 'future.teleport.create',
+      display: { title: 'Teleport', kicker: 'Future' },
+    });
+    const duplicate = makeDraftFixture({
+      ...unknown,
+      summary: 'Duplicate security action',
+    });
+    await render(
+      <ChatMessageBubble
+        {...props({
+          message: message({
+            trip_id: '11111111-1111-4111-8111-111111111111',
+            sender: {
+              id: null,
+              display_name: 'GoPlanAI',
+              identify_tag: null,
+              avatar_url: null,
+            },
+            sender_kind: 'AI',
+            ai_status: 'SUCCESS',
+            action_drafts: [
+              known,
+              unknown,
+              duplicate,
+              { ...known, status: 'EXECUTED' },
+            ],
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId(`ai-action-draft-${known.id}`)).toBeTruthy();
+    expect(screen.queryByTestId(`ai-action-draft-${unknown.id}`)).toBeNull();
+    expect(screen.getAllByRole('button', { name: 'Confirm' })).toHaveLength(1);
+    expect(screen.queryByTestId('ai-generic-draft-details')).toBeNull();
+    expect(screen.getByTestId('chat-ai-draft-malformed-message-1')).toHaveTextContent(
+      'An AI action draft could not be displayed safely.',
+    );
+    const messagePressable = screen.getByTestId('chat-message-message-1');
+    expect(
+      within(messagePressable).queryByTestId(
+        `ai-action-draft-${known.id}`,
+      ),
+    ).toBeNull();
+  });
+
+  it('keeps draft cards visible but disables their controls in read-only and selection modes', async () => {
+    const draft = makeDraftFixture();
+    const ai = message({
+      trip_id: '11111111-1111-4111-8111-111111111111',
+      sender_kind: 'AI',
+      ai_status: 'SUCCESS',
+      action_drafts: [draft],
+    });
+    const rendered = await render(
+      <ChatMessageBubble
+        {...props({ actionsEnabled: false, message: ai })}
+      />,
+    );
+
+    for (const label of ['Cancel', 'Confirm']) {
+      expect(
+        screen.getByRole('button', { name: label }).props.accessibilityState
+          .disabled,
+      ).toBe(true);
+    }
+
+    await rendered.rerender(
+      <ChatMessageBubble
+        {...props({ actionsEnabled: true, message: ai, selectionMode: true })}
+      />,
+    );
+    expect(screen.getByTestId(`ai-action-draft-${draft.id}`)).toBeTruthy();
+    for (const label of ['Cancel', 'Confirm']) {
+      expect(
+        screen.getByRole('button', { name: label }).props.accessibilityState
+          .disabled,
+      ).toBe(true);
+    }
   });
 
   it('preserves nullable deleted-user identity without rendering null as text', async () => {

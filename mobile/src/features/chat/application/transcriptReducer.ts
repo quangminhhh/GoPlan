@@ -3,6 +3,11 @@ import type {
   ChatMessage,
   ReactionSummary,
 } from '../types';
+import {
+  aiActionDraftSourceIdentity,
+  parseAIActionDraft,
+  type AIActionDraft,
+} from '../ai/drafts';
 
 export type ChatRoomStatus = 'idle' | 'loading' | 'ready' | 'error' | 'kicked';
 
@@ -20,6 +25,13 @@ export interface TranscriptReactionOverlay {
 export interface TranscriptMutationError {
   readonly messageId: string | null;
   readonly error: ChatApiFailure;
+}
+
+export interface TranscriptAIDraftOverlay {
+  readonly draft: AIActionDraft;
+  readonly projectedIdentity: string;
+  readonly priorSourceIdentities: ReadonlySet<string>;
+  readonly lastAuthoritativeSequence: number;
 }
 
 export interface TranscriptState {
@@ -49,6 +61,15 @@ export interface TranscriptState {
   readonly reactionOverlays: ReadonlyMap<
     string,
     TranscriptReactionOverlay
+  >;
+  /**
+   * Immediate HTTP draft projections. Full chat rows remain authoritative and
+   * retain their server-authored change_sequence; this overlay is reconciled
+   * separately when a newer full row arrives.
+   */
+  readonly aiDraftOverlays: ReadonlyMap<
+    string,
+    ReadonlyMap<string, TranscriptAIDraftOverlay>
   >;
   readonly hasMoreOlder: boolean;
   readonly nextOlderCursor: string | null;
@@ -104,6 +125,13 @@ export type TranscriptAction =
       readonly messages: readonly ChatMessage[];
       /** Required for REST data; omitted only for a live authoritative push. */
       readonly requestVersion?: number;
+    })
+  | (ResourceScopedAction & {
+      readonly type: 'AI_DRAFT_LOCAL_SNAPSHOT';
+      readonly messageId: string;
+      readonly draftId: string;
+      readonly expectedSourceIdentity: string;
+      readonly draft: AIActionDraft;
     })
   | (ResourceScopedAction & {
       readonly type: 'REACTION_PATCH';
@@ -227,6 +255,7 @@ export function createTranscriptState(resourceKey: string): TranscriptState {
     hidden: new Set(),
     reactionBase: new Map(),
     reactionOverlays: new Map(),
+    aiDraftOverlays: new Map(),
     hasMoreOlder: false,
     nextOlderCursor: null,
     isLoadingOlder: false,
@@ -242,6 +271,47 @@ export function createTranscriptState(resourceKey: string): TranscriptState {
 }
 
 type MergeMode = 'upsert' | 'patch-known';
+
+function parsedDraftById(
+  message: ChatMessage,
+  draftId: string,
+): AIActionDraft | null {
+  for (const candidate of message.action_drafts) {
+    const parsed = parseAIActionDraft(candidate);
+    if (parsed?.id === draftId) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function reconcileAIDraftOverlaysForFullMessage(
+  overlays: ReadonlyMap<string, TranscriptAIDraftOverlay>,
+  message: ChatMessage,
+): ReadonlyMap<string, TranscriptAIDraftOverlay> | null {
+  if (message.is_deleted_for_everyone) {
+    return null;
+  }
+
+  const next = new Map<string, TranscriptAIDraftOverlay>();
+  for (const [draftId, overlay] of overlays) {
+    const incomingDraft = parsedDraftById(message, draftId);
+    if (incomingDraft === null) {
+      continue;
+    }
+    const incomingIdentity = aiActionDraftSourceIdentity(incomingDraft);
+    if (incomingIdentity === overlay.projectedIdentity) {
+      continue;
+    }
+    if (overlay.priorSourceIdentities.has(incomingIdentity)) {
+      next.set(draftId, {
+        ...overlay,
+        lastAuthoritativeSequence: message.change_sequence,
+      });
+    }
+  }
+  return next.size > 0 ? next : null;
+}
 
 function mergeMessages(
   state: TranscriptState,
@@ -287,6 +357,7 @@ function mergeMessages(
   const failedByClientId = new Map(state.failedByClientId);
   const reactionBase = new Map(state.reactionBase);
   const reactionOverlays = new Map(state.reactionOverlays);
+  const aiDraftOverlays = new Map(state.aiDraftOverlays);
   const pendingReactionMessageIds = new Set(
     state.pendingReactionMessageIds,
   );
@@ -303,6 +374,19 @@ function mergeMessages(
     if (message.is_deleted_for_everyone) {
       reactionOverlays.delete(message.id);
       pendingReactionMessageIds.delete(message.id);
+    }
+
+    const messageDraftOverlays = aiDraftOverlays.get(message.id);
+    if (messageDraftOverlays !== undefined) {
+      const reconciled = reconcileAIDraftOverlaysForFullMessage(
+        messageDraftOverlays,
+        message,
+      );
+      if (reconciled === null) {
+        aiDraftOverlays.delete(message.id);
+      } else {
+        aiDraftOverlays.set(message.id, reconciled);
+      }
     }
 
     const cid = message.client_message_id;
@@ -329,6 +413,7 @@ function mergeMessages(
     failedByClientId,
     reactionBase,
     reactionOverlays,
+    aiDraftOverlays,
     pendingReactionMessageIds,
   };
 }
@@ -528,6 +613,54 @@ export function transcriptReducer(
         action.requestVersion,
       );
 
+    case 'AI_DRAFT_LOCAL_SNAPSHOT': {
+      const message = state.confirmed.get(action.messageId);
+      if (
+        message === undefined ||
+        message.sender_kind !== 'AI' ||
+        message.is_deleted_for_everyone ||
+        state.hidden.has(action.messageId) ||
+        action.draft.id !== action.draftId
+      ) {
+        return state;
+      }
+
+      const messageOverlays = state.aiDraftOverlays.get(action.messageId);
+      const currentOverlay = messageOverlays?.get(action.draftId);
+      const currentDraft =
+        currentOverlay?.draft ?? parsedDraftById(message, action.draftId);
+      if (
+        currentDraft === null ||
+        aiActionDraftSourceIdentity(currentDraft) !==
+          action.expectedSourceIdentity
+      ) {
+        return state;
+      }
+
+      const nextVersion = state.version + 1;
+      const priorSourceIdentities = new Set(
+        currentOverlay?.priorSourceIdentities ?? [],
+      );
+      priorSourceIdentities.add(action.expectedSourceIdentity);
+      const nextMessageOverlays = new Map(messageOverlays ?? []);
+      nextMessageOverlays.set(action.draftId, {
+        draft: action.draft,
+        projectedIdentity: aiActionDraftSourceIdentity(action.draft),
+        priorSourceIdentities,
+        lastAuthoritativeSequence: message.change_sequence,
+      });
+      const aiDraftOverlays = new Map(state.aiDraftOverlays);
+      aiDraftOverlays.set(action.messageId, nextMessageOverlays);
+      const messageVersions = new Map(state.messageVersions);
+      messageVersions.set(action.messageId, nextVersion);
+      return {
+        ...state,
+        version: nextVersion,
+        messageVersions,
+        aiDraftOverlays,
+      };
+    }
+
     case 'REACTION_PATCH': {
       const message = state.confirmed.get(action.messageId);
       if (
@@ -674,6 +807,7 @@ export function transcriptReducer(
       const hidden = new Set(state.hidden);
       const reactionBase = new Map(state.reactionBase);
       const reactionOverlays = new Map(state.reactionOverlays);
+      const aiDraftOverlays = new Map(state.aiDraftOverlays);
       const pendingReactionMessageIds = new Set(
         state.pendingReactionMessageIds,
       );
@@ -687,6 +821,7 @@ export function transcriptReducer(
         reactionLiveVersions.delete(messageId);
         reactionBase.delete(messageId);
         reactionOverlays.delete(messageId);
+        aiDraftOverlays.delete(messageId);
         pendingReactionMessageIds.delete(messageId);
         pendingDeleteMessageIds.delete(messageId);
 
@@ -717,6 +852,7 @@ export function transcriptReducer(
         hidden,
         reactionBase,
         reactionOverlays,
+        aiDraftOverlays,
         pendingReactionMessageIds,
         pendingDeleteMessageIds,
         mutationError: null,
@@ -910,6 +1046,7 @@ export function transcriptReducer(
       const reactionLiveVersions = new Map(state.reactionLiveVersions);
       const reactionBase = new Map(state.reactionBase);
       const reactionOverlays = new Map(state.reactionOverlays);
+      const aiDraftOverlays = new Map(state.aiDraftOverlays);
       const pendingReactionMessageIds = new Set(
         state.pendingReactionMessageIds,
       );
@@ -927,6 +1064,9 @@ export function transcriptReducer(
       reactionLiveVersions.delete(message.id);
       reactionBase.set(message.id, authoritative.reactions);
       reactionOverlays.delete(message.id);
+      if (authoritative.is_deleted_for_everyone) {
+        aiDraftOverlays.delete(message.id);
+      }
       pendingReactionMessageIds.delete(message.id);
       pendingDeleteMessageIds.delete(message.id);
 
@@ -939,6 +1079,7 @@ export function transcriptReducer(
         reactionLiveVersions,
         reactionBase,
         reactionOverlays,
+        aiDraftOverlays,
         pendingReactionMessageIds,
         pendingDeleteMessageIds,
         mutationError: null,
@@ -1013,6 +1154,42 @@ function withEffectiveReactions(
   return message;
 }
 
+function withEffectiveAIDrafts(
+  state: TranscriptState,
+  message: ChatMessage,
+): ChatMessage {
+  const overlays = state.aiDraftOverlays.get(message.id);
+  if (
+    overlays === undefined ||
+    overlays.size === 0 ||
+    message.is_deleted_for_everyone
+  ) {
+    return message;
+  }
+
+  let changed = false;
+  const actionDrafts = message.action_drafts.map((candidate) => {
+    const parsed = parseAIActionDraft(candidate);
+    if (parsed === null) {
+      return candidate;
+    }
+    const overlay = overlays.get(parsed.id);
+    if (overlay === undefined) {
+      return candidate;
+    }
+    changed = true;
+    return overlay.draft;
+  });
+  return changed ? { ...message, action_drafts: actionDrafts } : message;
+}
+
+function withEffectiveMessage(
+  state: TranscriptState,
+  message: ChatMessage,
+): ChatMessage {
+  return withEffectiveAIDrafts(state, withEffectiveReactions(state, message));
+}
+
 /** Confirmed and optimistic messages ordered by `(created_at, id)` ascending. */
 export function selectTranscriptMessages(
   state: TranscriptState,
@@ -1024,7 +1201,7 @@ export function selectTranscriptMessages(
     if (state.hidden.has(message.id)) {
       continue;
     }
-    messages.push(withEffectiveReactions(state, message));
+    messages.push(withEffectiveMessage(state, message));
     if (message.client_message_id !== null) {
       confirmedClientIds.add(message.client_message_id);
     }
@@ -1049,7 +1226,7 @@ export function selectMessageById(
 ): ChatMessage | null {
   const confirmed = state.confirmed.get(id);
   if (confirmed !== undefined && !state.hidden.has(id)) {
-    return withEffectiveReactions(state, confirmed);
+    return withEffectiveMessage(state, confirmed);
   }
   for (const message of state.pending.values()) {
     if (message.id === id && !state.hidden.has(id)) {
