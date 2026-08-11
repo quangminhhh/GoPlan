@@ -4,7 +4,6 @@ import { isAIRecord, type AIActionDraft } from '../../drafts';
 import {
   displayMetaRows,
   readAIText,
-  safeAIValueText,
   type AIDisplayMetaRow,
 } from '../../presentation';
 import { DetailRows } from './shared';
@@ -28,6 +27,9 @@ const ASSIGNEE_LABELS: Readonly<Record<string, string>> = {
 };
 
 function activityPreview(draft: AIActionDraft): Readonly<Record<string, unknown>> {
+  if (isAIRecord(draft.preview.resolved_data)) {
+    return draft.preview.resolved_data;
+  }
   return isAIRecord(draft.preview.data) ? draft.preview.data : draft.preview;
 }
 
@@ -63,6 +65,13 @@ function timeText(source: Readonly<Record<string, unknown>>): string | null {
 }
 
 function locationText(source: Readonly<Record<string, unknown>>): string | null {
+  const locationMode = firstText([source], ['location_mode']);
+  if (locationMode === 'STRUCTURED') {
+    const structuredPlace = source.place;
+    return isAIRecord(structuredPlace)
+      ? firstText([structuredPlace], ['title', 'address'])
+      : null;
+  }
   const direct = firstText([source], ['location_label', 'location']);
   if (direct !== null) {
     return direct;
@@ -87,17 +96,23 @@ export function TimelineDraftDetails({ draft }: { readonly draft: AIActionDraft 
   const activity = activityPreview(draft);
   const sources = [activity, draft.preview];
   const rows: AIDisplayMetaRow[] = [];
-  append(rows, 'Section', firstText(sources, ['section_label', 'section_title', 'section_id']));
+  append(rows, 'Section', firstText(sources, ['section_label', 'section_title']));
   append(rows, 'Date', firstText(sources, ['section_date', 'date']));
   append(rows, 'Time', timeText(activity));
+  const customType = firstText([activity], ['custom_type_label']);
   const systemType = firstText([activity], ['system_type']);
   append(
     rows,
     'Type',
-    systemType === null ? null : (SYSTEM_TYPE_LABELS[systemType] ?? systemType),
+    customType ?? (
+      systemType === null ? null : (SYSTEM_TYPE_LABELS[systemType] ?? systemType)
+    ),
   );
   append(rows, 'Location', locationText(activity));
-  const assignee = firstText([activity], ['assignee_name', 'assignee_scope']);
+  const assignee = firstText(
+    [activity],
+    ['assignee_label', 'assignee_name', 'assignee_scope'],
+  );
   append(
     rows,
     'Assignee',
@@ -107,14 +122,18 @@ export function TimelineDraftDetails({ draft }: { readonly draft: AIActionDraft 
     append(rows, meta.label, meta.value);
   }
   const title = firstText([activity, draft.display], ['title']);
+  const externalLink = readAIText(activity, 'external_link');
+  const hasExternalLinkMeta = rows.some(
+    (row) => row.label === 'External link',
+  );
 
   return (
     <View style={styles.container} testID="ai-timeline-draft-details">
       {title !== null ? <Text style={styles.title}>{title}</Text> : null}
       <DetailRows rows={rows} />
-      {activity.external_link !== undefined ? (
+      {externalLink !== null && !hasExternalLinkMeta ? (
         <Text style={styles.inertLink}>
-          Link (text only): {safeAIValueText(activity.external_link)}
+          Link (text only): {externalLink}
         </Text>
       ) : null}
     </View>

@@ -11,6 +11,7 @@ import {
 import {
   ActivityIndicator,
   FlatList,
+  Keyboard,
   type ListRenderItemInfo,
   Pressable,
   StyleSheet,
@@ -278,6 +279,11 @@ export function ChatMessageList({
     userInteractedRef.current = true;
   }, []);
 
+  const beginTranscriptDrag = useCallback(() => {
+    markUserInteraction();
+    Keyboard.dismiss();
+  }, [markUserInteraction]);
+
   const loadOlderFromScroll = useCallback(() => {
     if (userInteractedRef.current && hasMoreOlder && !isLoadingOlder) {
       onLoadOlder();
@@ -472,13 +478,13 @@ export function ChatMessageList({
         inverted
         initialNumToRender={20}
         keyExtractor={chatMessageKey}
-        keyboardDismissMode="interactive"
+        keyboardDismissMode="on-drag"
         keyboardShouldPersistTaps="handled"
         maintainVisibleContentPosition={MAINTAIN_VISIBLE_CONTENT_POSITION}
         onEndReached={loadOlderFromScroll}
         onEndReachedThreshold={0.25}
         onMomentumScrollBegin={markUserInteraction}
-        onScrollBeginDrag={markUserInteraction}
+        onScrollBeginDrag={beginTranscriptDrag}
         renderItem={renderMessage}
         contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={

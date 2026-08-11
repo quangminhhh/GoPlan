@@ -1,14 +1,20 @@
 import { useLocalSearchParams } from 'expo-router';
-import { useCallback, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  KeyboardAvoidingView,
+  Dimensions,
+  Keyboard,
   Platform,
   Pressable,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
+  type KeyboardEvent,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import {
+  SafeAreaView,
+  useSafeAreaInsets,
+} from 'react-native-safe-area-context';
 import { colors, spacing, typography } from '@/shared/theme/tokens';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 import { goPlanAISendFailureMessage } from '../ai/mention';
@@ -28,7 +34,117 @@ import type {
 
 const CHAT_SAFE_AREA_EDGES = ['left', 'right', 'bottom'] as const;
 const EMPTY_DRAFT_ID_SET: ReadonlySet<string> = new Set();
-export const CHAT_KEYBOARD_BEHAVIOR = Platform.OS === 'ios' ? 'padding' : undefined;
+
+export interface ChatKeyboardFrame {
+  readonly height: number;
+  readonly screenY: number;
+}
+
+export function chatKeyboardBottomInset(
+  viewportHeight: number,
+  keyboardFrame: ChatKeyboardFrame | null,
+  safeAreaBottom: number,
+): number {
+  if (
+    !Number.isFinite(viewportHeight) ||
+    viewportHeight <= 0 ||
+    keyboardFrame === null ||
+    !Number.isFinite(keyboardFrame.height) ||
+    keyboardFrame.height <= 0 ||
+    !Number.isFinite(keyboardFrame.screenY) ||
+    keyboardFrame.screenY <= 0
+  ) {
+    return 0;
+  }
+  const safeBottom =
+    Number.isFinite(safeAreaBottom) && safeAreaBottom > 0 ? safeAreaBottom : 0;
+  const overlapEnd = Math.min(
+    viewportHeight,
+    keyboardFrame.screenY + keyboardFrame.height,
+  );
+  const overlapStart = Math.max(0, keyboardFrame.screenY);
+  return Math.max(0, overlapEnd - overlapStart - safeBottom);
+}
+
+export function stableChatKeyboardFrame(
+  current: ChatKeyboardFrame | null,
+  candidate: ChatKeyboardFrame | null | undefined,
+): ChatKeyboardFrame | null {
+  if (candidate === null || candidate === undefined) {
+    return current;
+  }
+  if (!Number.isFinite(candidate.height) || candidate.height <= 0) {
+    return null;
+  }
+  if (!Number.isFinite(candidate.screenY) || candidate.screenY <= 0) {
+    // iOS briefly reports screenY=0 while cross-fading keyboard variants.
+    // Retaining the last stable frame prevents the composer from jumping.
+    return current;
+  }
+  return { height: candidate.height, screenY: candidate.screenY };
+}
+
+function useChatKeyboardBottomInset(): number {
+  const { bottom: safeAreaBottom } = useSafeAreaInsets();
+  const viewport = useWindowDimensions();
+  const [keyboardFrame, setKeyboardFrame] = useState<ChatKeyboardFrame | null>(
+    () =>
+      Platform.OS === 'ios'
+        ? stableChatKeyboardFrame(null, Keyboard.metrics())
+        : null,
+  );
+
+  useEffect(() => {
+    if (Platform.OS !== 'ios') {
+      return undefined;
+    }
+    const viewportSubscription = Dimensions.addEventListener(
+      'change',
+      () => {
+        setKeyboardFrame((current) =>
+          stableChatKeyboardFrame(current, Keyboard.metrics()),
+        );
+      },
+    );
+    return () => viewportSubscription.remove();
+  }, []);
+
+  useEffect(() => {
+    if (Platform.OS !== 'ios') {
+      return undefined;
+    }
+
+    const updateKeyboardFrame = (event: KeyboardEvent): void => {
+      Keyboard.scheduleLayoutAnimation(event);
+      setKeyboardFrame((current) =>
+        stableChatKeyboardFrame(current, event.endCoordinates),
+      );
+    };
+    const hideKeyboard = (event: KeyboardEvent): void => {
+      Keyboard.scheduleLayoutAnimation(event);
+      setKeyboardFrame(null);
+    };
+    const frameSubscription = Keyboard.addListener(
+      'keyboardWillChangeFrame',
+      updateKeyboardFrame,
+    );
+    const hideSubscription = Keyboard.addListener(
+      'keyboardWillHide',
+      hideKeyboard,
+    );
+
+    return () => {
+      frameSubscription.remove();
+      hideSubscription.remove();
+    };
+  }, []);
+
+  return chatKeyboardBottomInset(
+    viewport.height,
+    keyboardFrame,
+    safeAreaBottom,
+  );
+}
 
 function routeTripId(value: string | string[] | undefined): string | undefined {
   const candidate = Array.isArray(value) ? value[0] : value;
@@ -137,6 +253,11 @@ export function ChatScreen() {
   const params = useLocalSearchParams<{ tripId?: string | string[] }>();
   const tripId = routeTripId(params.tripId);
   const chat = useTripChat({ tripId });
+  const keyboardBottomInset = useChatKeyboardBottomInset();
+  const keyboardLayoutStyle = useMemo(
+    () => [styles.fill, { paddingBottom: keyboardBottomInset }],
+    [keyboardBottomInset],
+  );
   const {
     deleteMessage: deleteChatMessage,
     hideMessagesForMe,
@@ -294,9 +415,8 @@ export function ChatScreen() {
       style={styles.safe}
       testID="chat-safe-area"
     >
-      <KeyboardAvoidingView
-        behavior={CHAT_KEYBOARD_BEHAVIOR}
-        style={styles.fill}
+      <View
+        style={keyboardLayoutStyle}
         testID="chat-keyboard-layout"
       >
         <ChatConnectionBanner
@@ -359,7 +479,7 @@ export function ChatScreen() {
             onApplyAIDraftSnapshot={chat.applyAIDraftSnapshot}
           />
         </AIReconciliationCoordinatorProvider>
-      </KeyboardAvoidingView>
+      </View>
     </SafeAreaView>
   );
 }

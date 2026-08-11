@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 from uuid import uuid4
@@ -125,6 +125,44 @@ class ActionExecutorTests(TestCase):
         self.assertEqual(Expense.objects.count(), 1)
         self.assertEqual(confirmed.result["object_type"], "expense")
 
+    def test_confirm_expense_create_rejects_legacy_currency_mismatch(self):
+        draft = self._expense_create_draft()
+        draft.payload = {**draft.payload, "currency_code": "USD"}
+        draft.save(update_fields=["payload", "updated_at"])
+
+        with self.assertRaisesMessage(
+            AIActionDraftNotReadyError,
+            "Draft currency does not match the trip currency.",
+        ):
+            confirm_action_draft(
+                draft_id=draft.id,
+                trip_id=self.trip.id,
+                actor=self.captain,
+            )
+
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertFalse(Expense.objects.exists())
+
+    def test_confirm_expense_create_rejects_legacy_invalid_amount(self):
+        draft = self._expense_create_draft()
+        draft.payload = {**draft.payload, "total_amount": "25.50"}
+        draft.save(update_fields=["payload", "updated_at"])
+
+        with self.assertRaisesMessage(
+            AIActionDraftNotReadyError,
+            "Draft is missing required field: total_amount.",
+        ):
+            confirm_action_draft(
+                draft_id=draft.id,
+                trip_id=self.trip.id,
+                actor=self.captain,
+            )
+
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertFalse(Expense.objects.exists())
+
     def test_confirm_expense_contribution_set_accepts_batch_contributions(self):
         member = create_completed_user(
             "exec-batch-member@example.com",
@@ -180,6 +218,51 @@ class ActionExecutorTests(TestCase):
         self.assertEqual(contributions[member.id], Decimal("600000"))
         self.assertEqual(confirmed.result["object_type"], "expense_contribution_batch")
         self.assertEqual(confirmed.result["updated_count"], 2)
+
+    def test_confirm_contribution_rejects_legacy_decimalfield_overflow(self):
+        expense = create_expense(
+            trip_id=self.trip.id,
+            actor=self.captain,
+            title="Dinner",
+            total_amount=Decimal("1200000"),
+            collector=self.captain,
+        )
+        draft = AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response,
+            requested_by=self.captain,
+            action_type="expense.contribution.set",
+            status=AIActionDraftStatus.READY,
+            required_confirmation=AI_CONFIRMATION_CAPTAIN,
+            payload={
+                "expense_id": str(expense.id),
+                "contributions": [
+                    {
+                        "user_id": str(self.captain.id),
+                        "amount": "1000000000000",
+                    }
+                ],
+            },
+            preview={"summary": "Captain paid"},
+            missing_fields=[],
+            preconditions=self._expense_preconditions(expense),
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+
+        with self.assertRaisesMessage(
+            AIActionDraftNotReadyError,
+            "Draft is missing required field: contributions.",
+        ):
+            confirm_action_draft(
+                draft_id=draft.id,
+                trip_id=self.trip.id,
+                actor=self.captain,
+            )
+
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertFalse(ExpenseContribution.objects.exists())
 
     def test_confirm_expense_contribution_set_accepts_member_contributions_map(self):
         member = create_completed_user(
@@ -671,6 +754,103 @@ class ActionExecutorTests(TestCase):
                 actor=self.captain,
             )
 
+    def test_confirm_rejects_invalid_target_merged_timeline_patch_without_mutation(self):
+        section = self.trip.timeline_sections.order_by("section_date").first()
+        activity = section.activities.create(
+            trip=self.trip,
+            title="Merged clock target",
+            time_mode=TimelineActivityTimeMode.TIME_RANGE,
+            start_time=time(10, 0),
+            end_time=time(11, 0),
+            system_type=TimelineSystemType.SIGHTSEEING,
+        )
+        draft = AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response,
+            requested_by=self.captain,
+            action_type="timeline.activity.update",
+            status=AIActionDraftStatus.READY,
+            required_confirmation=AI_CONFIRMATION_CAPTAIN,
+            payload={
+                "activity_id": str(activity.id),
+                "data": {"end_time": "09:00:00"},
+            },
+            preview={"title": activity.title},
+            missing_fields=[],
+            preconditions={
+                "target": {
+                    "type": "timeline_activity",
+                    "id": str(activity.id),
+                    "updated_at": activity.updated_at.isoformat(),
+                }
+            },
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+        original_trip_sequence = self.trip.chat_change_sequence
+        original_message_sequence = self.response.change_sequence
+
+        with self.assertRaises(AIActionDraftNotReadyError):
+            confirm_action_draft(
+                draft_id=draft.id,
+                trip_id=self.trip.id,
+                actor=self.captain,
+            )
+
+        activity.refresh_from_db()
+        draft.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.response.refresh_from_db()
+        self.assertEqual(activity.start_time, time(10, 0))
+        self.assertEqual(activity.end_time, time(11, 0))
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertEqual(self.trip.chat_change_sequence, original_trip_sequence)
+        self.assertEqual(self.response.change_sequence, original_message_sequence)
+
+    def test_stale_precondition_precedes_invalid_target_merged_timeline_patch(self):
+        section = self.trip.timeline_sections.order_by("section_date").first()
+        activity = section.activities.create(
+            trip=self.trip,
+            title="Stale merged target",
+            time_mode=TimelineActivityTimeMode.TIME_RANGE,
+            start_time=time(10, 0),
+            end_time=time(11, 0),
+            system_type=TimelineSystemType.SIGHTSEEING,
+        )
+        stale_updated_at = activity.updated_at.isoformat()
+        activity.title = "Changed elsewhere"
+        activity.save(update_fields=["title", "updated_at"])
+        draft = AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response,
+            requested_by=self.captain,
+            action_type="timeline.activity.update",
+            status=AIActionDraftStatus.READY,
+            required_confirmation=AI_CONFIRMATION_CAPTAIN,
+            payload={
+                "activity_id": str(activity.id),
+                "data": {"end_time": "09:00:00"},
+            },
+            preview={"title": "Stale merged target"},
+            missing_fields=[],
+            preconditions={
+                "target": {
+                    "type": "timeline_activity",
+                    "id": str(activity.id),
+                    "updated_at": stale_updated_at,
+                }
+            },
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+
+        with self.assertRaises(AIActionDraftStaleError):
+            confirm_action_draft(
+                draft_id=draft.id,
+                trip_id=self.trip.id,
+                actor=self.captain,
+            )
+
     def test_confirm_timeline_activity_create_uses_timeline_service(self):
         section = self.trip.timeline_sections.order_by("section_date").first()
         draft = AIActionDraft.objects.create(
@@ -705,6 +885,118 @@ class ActionExecutorTests(TestCase):
         self.assertEqual(confirmed.status, AIActionDraftStatus.CONFIRMED)
         self.assertEqual(TimelineActivity.objects.count(), 1)
         self.assertEqual(confirmed.result["object_type"], "timeline_activity")
+
+    def test_confirm_timeline_activity_create_rejects_legacy_untrusted_references(self):
+        from trips.models import TimelineCustomType
+
+        section = self.trip.timeline_sections.order_by("section_date").first()
+        other_trip = create_trip(
+            captain=self.captain,
+            name="Executor Foreign Trip",
+            destination="Hue",
+            start_date="2026-08-01",
+            end_date="2026-08-02",
+        )
+        foreign_section = other_trip.timeline_sections.order_by("section_date").first()
+        foreign_custom = TimelineCustomType.objects.create(
+            trip=other_trip,
+            name="Executor foreign custom",
+            normalized_name="executor-foreign-custom",
+            created_by=self.captain,
+        )
+        left_assignee = create_completed_user(
+            "exec-left-assignee@example.com",
+            "execleftassignee",
+            "EXE002",
+        )
+        TripMember.objects.create(
+            trip=self.trip,
+            user=left_assignee,
+            role=TripRole.MEMBER,
+            status=MemberStatus.LEFT,
+        )
+
+        cases = (
+            {
+                "section_id": str(uuid4()),
+                "data": {
+                    "title": "Missing section",
+                    "time_mode": "FLEXIBLE",
+                    "system_type": "SIGHTSEEING",
+                },
+            },
+            {
+                "section_id": str(foreign_section.id),
+                "data": {
+                    "title": "Foreign section",
+                    "time_mode": "FLEXIBLE",
+                    "system_type": "SIGHTSEEING",
+                },
+            },
+            {
+                "section_id": str(section.id),
+                "data": {
+                    "title": "Foreign custom",
+                    "time_mode": "FLEXIBLE",
+                    "custom_type_id": str(foreign_custom.id),
+                },
+            },
+            {
+                "section_id": str(section.id),
+                "data": {
+                    "title": "Inactive assignee",
+                    "time_mode": "FLEXIBLE",
+                    "system_type": "SIGHTSEEING",
+                    "assignee_scope": "USER",
+                    "assignee_user_id": str(left_assignee.id),
+                },
+            },
+        )
+        original_trip_sequence = self.trip.chat_change_sequence
+        original_message_sequence = self.response.change_sequence
+
+        for payload in cases:
+            with self.subTest(title=payload["data"]["title"]):
+                draft = AIActionDraft.objects.create(
+                    trip=self.trip,
+                    interaction=self.interaction,
+                    response_message=self.response,
+                    requested_by=self.captain,
+                    action_type="timeline.activity.create",
+                    status=AIActionDraftStatus.READY,
+                    required_confirmation=AI_CONFIRMATION_CAPTAIN,
+                    payload=payload,
+                    preview={"title": payload["data"]["title"]},
+                    missing_fields=[],
+                    preconditions={},
+                    expires_at=timezone.now() + timedelta(hours=24),
+                )
+
+                with self.assertRaises(AIActionDraftNotReadyError):
+                    confirm_action_draft(
+                        draft_id=draft.id,
+                        trip_id=self.trip.id,
+                        actor=self.captain,
+                    )
+
+                draft.refresh_from_db()
+                self.trip.refresh_from_db()
+                self.response.refresh_from_db()
+                self.assertEqual(draft.status, AIActionDraftStatus.READY)
+                self.assertFalse(
+                    TimelineActivity.objects.filter(
+                        trip=self.trip,
+                        title=payload["data"]["title"],
+                    ).exists()
+                )
+                self.assertEqual(
+                    self.trip.chat_change_sequence,
+                    original_trip_sequence,
+                )
+                self.assertEqual(
+                    self.response.change_sequence,
+                    original_message_sequence,
+                )
 
     def test_confirm_timeline_activity_create_creates_missing_section_date(self):
         trip = create_trip(

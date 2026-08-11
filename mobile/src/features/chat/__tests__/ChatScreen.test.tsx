@@ -1,9 +1,19 @@
 import { act, fireEvent, render, screen } from '@testing-library/react-native';
+import {
+  Dimensions,
+  Keyboard,
+  StyleSheet,
+  type KeyboardEvent,
+} from 'react-native';
 import { makeDraftFixture } from '../ai/__fixtures__/drafts';
 import { aiActionDraftSourceIdentity } from '../ai/drafts';
 import { createAIReconciliationCoordinator } from '../ai/reconciliation';
 import type { ChatApiFailure, ChatMessage } from '../types';
-import { CHAT_KEYBOARD_BEHAVIOR, ChatScreen } from '../screens/ChatScreen';
+import {
+  chatKeyboardBottomInset,
+  ChatScreen,
+  stableChatKeyboardFrame,
+} from '../screens/ChatScreen';
 
 let mockParams: { tripId?: string | string[] } = { tripId: 'trip-1' };
 const mockUseTripChat = jest.fn();
@@ -16,6 +26,15 @@ jest.mock('../hooks/useTripChat', () => ({
 }), { virtual: true });
 jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
 jest.mock('@/features/auth/components/UserAvatar', () => ({ UserAvatar: () => null }));
+jest.mock('react-native-safe-area-context', () => {
+  const actual = jest.requireActual<
+    typeof import('react-native-safe-area-context')
+  >('react-native-safe-area-context');
+  return {
+    ...actual,
+    useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
+  };
+});
 jest.mock('../ai/api', () => {
   const actual = jest.requireActual<typeof import('../ai/api')>('../ai/api');
   return {
@@ -120,6 +139,10 @@ function chatResult(overrides: Record<string, unknown> = {}) {
 }
 
 describe('ChatScreen', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   beforeEach(() => {
     mockParams = { tripId: 'trip-1' };
     mockUseTripChat.mockReset();
@@ -344,7 +367,54 @@ describe('ChatScreen', () => {
     expect(screen.queryByTestId('chat-mutation-error')).toBeNull();
   });
 
-  it('uses native-stack-safe insets and an iOS keyboard-aware layout', async () => {
+  it('calculates the keyboard inset from the viewport intersection', () => {
+    const dockedFrame = { height: 291, screenY: 376 };
+    expect(chatKeyboardBottomInset(667, dockedFrame, 34)).toBe(257);
+    expect(
+      chatKeyboardBottomInset(667, { height: 200, screenY: 300 }, 34),
+    ).toBe(166);
+    expect(
+      chatKeyboardBottomInset(667, { height: 291, screenY: 600 }, 34),
+    ).toBe(33);
+    expect(
+      chatKeyboardBottomInset(667, { height: 291, screenY: 700 }, 34),
+    ).toBe(0);
+    expect(
+      chatKeyboardBottomInset(667, { height: 291, screenY: 0 }, 34),
+    ).toBe(0);
+    expect(chatKeyboardBottomInset(Number.NaN, dockedFrame, 34)).toBe(0);
+  });
+
+  it('retains the last stable keyboard frame during an iOS cross-fade', () => {
+    const current = { height: 291, screenY: 376 };
+    expect(stableChatKeyboardFrame(current, { height: 320, screenY: 0 })).toBe(
+      current,
+    );
+    expect(stableChatKeyboardFrame(current, undefined)).toBe(current);
+    expect(stableChatKeyboardFrame(current, { height: 0, screenY: 667 })).toBeNull();
+    expect(
+      stableChatKeyboardFrame(current, { height: 216, screenY: 451 }),
+    ).toEqual({ height: 216, screenY: 451 });
+  });
+
+  it('uses native-stack-safe insets and follows stable keyboard frame changes', async () => {
+    let onKeyboardFrameChange: ((event: KeyboardEvent) => void) | undefined;
+    let onKeyboardHide: ((event: KeyboardEvent) => void) | undefined;
+    const addKeyboardListener = Keyboard.addListener.bind(Keyboard);
+    const listenerSpy = jest
+      .spyOn(Keyboard, 'addListener')
+      .mockImplementation((eventType, listener) => {
+        if (eventType === 'keyboardWillChangeFrame') {
+          onKeyboardFrameChange = listener;
+        } else if (eventType === 'keyboardWillHide') {
+          onKeyboardHide = listener;
+        }
+        return addKeyboardListener(eventType, listener);
+      });
+    jest.spyOn(Keyboard, 'metrics').mockReturnValue(undefined);
+    jest
+      .spyOn(Keyboard, 'scheduleLayoutAnimation')
+      .mockImplementation(() => undefined);
     await render(<ChatScreen />);
 
     expect(screen.getByTestId('chat-safe-area').props.edges).toEqual({
@@ -353,7 +423,128 @@ describe('ChatScreen', () => {
       right: 'additive',
       bottom: 'additive',
     });
-    expect(CHAT_KEYBOARD_BEHAVIOR).toBe('padding');
+    expect(onKeyboardFrameChange).toBeDefined();
+    expect(onKeyboardHide).toBeDefined();
+
+    const viewportHeight = Dimensions.get('window').height;
+
+    await act(async () => {
+      onKeyboardFrameChange?.({
+        duration: 250,
+        easing: 'keyboard',
+        endCoordinates: {
+          height: 291,
+          screenX: 0,
+          screenY: viewportHeight - 291,
+          width: 375,
+        },
+      });
+    });
+
+    expect(
+      StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+    ).toMatchObject({ flex: 1, paddingBottom: 291 });
+
+    await act(async () => {
+      onKeyboardFrameChange?.({
+        duration: 100,
+        easing: 'keyboard',
+        endCoordinates: {
+          height: 320,
+          screenX: 0,
+          screenY: 0,
+          width: 375,
+        },
+      });
+    });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+    ).toMatchObject({ flex: 1, paddingBottom: 291 });
+
+    await act(async () => {
+      onKeyboardFrameChange?.({
+        duration: 250,
+        easing: 'keyboard',
+        endCoordinates: {
+          height: 216,
+          screenX: 0,
+          screenY: viewportHeight - 216,
+          width: 375,
+        },
+      });
+    });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+    ).toMatchObject({ flex: 1, paddingBottom: 216 });
+
+    await act(async () => {
+      onKeyboardHide?.({
+        duration: 250,
+        easing: 'keyboard',
+        endCoordinates: {
+          height: 0,
+          screenX: 0,
+          screenY: viewportHeight,
+          width: 375,
+        },
+      });
+    });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+    ).toMatchObject({ flex: 1, paddingBottom: 0 });
+    listenerSpy.mockRestore();
+  });
+
+  it('refreshes keyboard metrics after a viewport orientation change', async () => {
+    const originalWindow = Dimensions.get('window');
+    const originalScreen = Dimensions.get('screen');
+    const portrait = { width: 375, height: 667, scale: 2, fontScale: 1 };
+    const landscape = { width: 667, height: 375, scale: 2, fontScale: 1 };
+    let metrics = {
+      height: 291,
+      screenX: 0,
+      screenY: portrait.height - 291,
+      width: portrait.width,
+    };
+    const metricsSpy = jest
+      .spyOn(Keyboard, 'metrics')
+      .mockImplementation(() => metrics);
+    jest
+      .spyOn(Keyboard, 'scheduleLayoutAnimation')
+      .mockImplementation(() => undefined);
+
+    let view: Awaited<ReturnType<typeof render>> | null = null;
+    try {
+      await act(async () => {
+        Dimensions.set({ window: portrait, screen: portrait });
+      });
+      view = await render(<ChatScreen />);
+      expect(
+        StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+      ).toMatchObject({ flex: 1, paddingBottom: 291 });
+
+      metrics = {
+        height: 216,
+        screenX: 0,
+        screenY: landscape.height - 216,
+        width: landscape.width,
+      };
+      await act(async () => {
+        Dimensions.set({ window: landscape, screen: landscape });
+      });
+
+      expect(metricsSpy).toHaveBeenLastCalledWith();
+      expect(
+        StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+      ).toMatchObject({ flex: 1, paddingBottom: 216 });
+    } finally {
+      if (view !== null) {
+        await view.unmount();
+      }
+      await act(async () => {
+        Dimensions.set({ window: originalWindow, screen: originalScreen });
+      });
+    }
   });
 
   it('clears the composer for created and transient-failed outcomes', async () => {

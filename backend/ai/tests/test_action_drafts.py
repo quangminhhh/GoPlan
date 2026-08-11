@@ -641,6 +641,68 @@ class AIActionDraftPatchTests(APITestCase, AIActionDraftModelTests):
             expires_at=expires_at or timezone.now() + timedelta(hours=24),
         )
 
+    def _create_contribution_patch_draft(self, *, missing_field):
+        return AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            requested_by=self.user,
+            action_type="expense.contribution.set",
+            status=AIActionDraftStatus.NEEDS_INFO,
+            required_confirmation=AI_CONFIRMATION_CAPTAIN,
+            payload={"expense_id": str(uuid4())},
+            preview={"title": "Record contribution"},
+            missing_fields=[
+                {"name": missing_field, "label": "Contribution amount"}
+            ],
+            preconditions={},
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+
+    def _assert_field_validation_patch_preserves_snapshot(
+        self,
+        *,
+        draft,
+        patch_payload,
+        expected_field_errors,
+        push_chat_message,
+    ):
+        self.client.force_authenticate(self.user)
+        original_payload = draft.payload
+        draft_updated_at = draft.updated_at
+        message_updated_at = self.response_message.updated_at
+        original_trip_sequence = self.trip.chat_change_sequence
+        original_message_sequence = self.response_message.change_sequence
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.patch(
+                f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                {"payload": patch_payload},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error_code"], "FIELD_VALIDATION_FAILED")
+        self.assertEqual(response.data["field_errors"], expected_field_errors)
+        self.assertEqual(
+            response.data["draft"]["status"],
+            AIActionDraftStatus.NEEDS_INFO,
+        )
+        draft.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(draft.payload, original_payload)
+        self.assertEqual(draft.updated_at, draft_updated_at)
+        self.assertEqual(self.response_message.updated_at, message_updated_at)
+        self.assertEqual(
+            self.response_message.change_sequence,
+            original_message_sequence,
+        )
+        self.assertEqual(self.trip.chat_change_sequence, original_trip_sequence)
+        self.assertEqual(callbacks, [])
+        push_chat_message.assert_not_called()
+
     def _assert_patch_request_is_a_true_noop(
         self,
         *,
@@ -886,6 +948,315 @@ class AIActionDraftPatchTests(APITestCase, AIActionDraftModelTests):
         self.assertEqual(response.data["draft"]["preview"]["total_amount"], "500000")
         self.assertEqual(draft.missing_fields, [])
 
+    @patch("ai.chat_changes.push_chat_message")
+    def test_currency_change_patch_restamps_ready_expense_and_confirms(
+        self,
+        push_chat_message,
+    ):
+        from ai.agent.executor import confirm_action_draft
+        from expenses.models import Expense
+        from trips.models import Trip
+
+        draft = create_action_draft(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            action_type="expense.create",
+            payload={
+                "title": "Lunch",
+                "currency_code": "VND",
+            },
+        )
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(draft.payload["currency_code"], "VND")
+        self.assertNotIn("hero", draft.display)
+        Trip.objects.filter(pk=self.trip.pk).update(currency_code="USD")
+        self.client.force_authenticate(self.user)
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.patch(
+                f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                {"payload": {"total_amount": "25.50"}},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.data), {"draft"})
+        self.assertEqual(response.data["draft"]["status"], AIActionDraftStatus.READY)
+        self.assertEqual(response.data["draft"]["preview"]["currency_code"], "USD")
+        self.assertEqual(
+            response.data["draft"]["display"]["hero"]["currency"],
+            "USD",
+        )
+        draft.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertEqual(draft.payload["currency_code"], "USD")
+        self.assertEqual(draft.preview["currency_code"], "USD")
+        self.assertEqual(draft.display["hero"]["currency"], "USD")
+        self.assertEqual(self.trip.chat_change_sequence, 1)
+        self.assertEqual(self.response_message.change_sequence, 1)
+        self.assertEqual(len(callbacks), 1)
+        push_chat_message.assert_not_called()
+
+        confirmed = confirm_action_draft(
+            draft_id=draft.id,
+            trip_id=self.trip.id,
+            actor=self.user,
+        )
+        expense = Expense.objects.get(pk=confirmed.result["object_id"])
+        self.assertEqual(confirmed.status, AIActionDraftStatus.CONFIRMED)
+        self.assertEqual(expense.total_amount, Decimal("25.50"))
+        self.assertEqual(expense.currency_code, "USD")
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_currency_change_patch_rejects_amount_invalid_for_current_trip(
+        self,
+        push_chat_message,
+    ):
+        from trips.models import Trip
+
+        self.trip.currency_code = "USD"
+        self.trip.save(update_fields=["currency_code", "updated_at"])
+        draft = create_action_draft(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            action_type="expense.create",
+            payload={"title": "Lunch"},
+        )
+        self.assertEqual(draft.payload["currency_code"], "USD")
+        Trip.objects.filter(pk=self.trip.pk).update(currency_code="VND")
+
+        self._assert_field_validation_patch_preserves_snapshot(
+            draft=draft,
+            patch_payload={"total_amount": "25.50"},
+            expected_field_errors={
+                "total_amount": (
+                    "Amount has too many decimal places for this currency."
+                )
+            },
+            push_chat_message=push_chat_message,
+        )
+        self.assertEqual(draft.payload["currency_code"], "USD")
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_empty_patch_after_currency_change_remains_true_noop(
+        self,
+        push_chat_message,
+    ):
+        from trips.models import Trip
+
+        draft = create_action_draft(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            action_type="expense.create",
+            payload={"title": "Lunch"},
+        )
+        original_display = draft.display
+        self.assertEqual(draft.payload["currency_code"], "VND")
+        Trip.objects.filter(pk=self.trip.pk).update(currency_code="USD")
+
+        self._assert_patch_request_is_a_true_noop(
+            request_data={"payload": {}},
+            draft=draft,
+            push_chat_message=push_chat_message,
+        )
+        self.assertEqual(draft.payload["currency_code"], "VND")
+        self.assertEqual(draft.display, original_display)
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_patch_rejects_fractional_vnd_amount_without_mutating_draft(
+        self,
+        push_chat_message,
+    ):
+        self.assertEqual(self.trip.currency_code, "VND")
+        self.client.force_authenticate(self.user)
+        draft = self._create_patch_draft()
+        original_payload = draft.payload
+        draft_updated_at = draft.updated_at
+        message_updated_at = self.response_message.updated_at
+        original_trip_sequence = self.trip.chat_change_sequence
+        original_message_sequence = self.response_message.change_sequence
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.patch(
+                f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                {"payload": {"total_amount": "25.50"}},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error_code"], "FIELD_VALIDATION_FAILED")
+        self.assertEqual(
+            response.data["field_errors"],
+            {
+                "total_amount": (
+                    "Amount has too many decimal places for this currency."
+                )
+            },
+        )
+        self.assertEqual(
+            response.data["draft"]["status"],
+            AIActionDraftStatus.NEEDS_INFO,
+        )
+        draft.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(draft.payload, original_payload)
+        self.assertEqual(draft.updated_at, draft_updated_at)
+        self.assertEqual(self.response_message.updated_at, message_updated_at)
+        self.assertEqual(
+            self.response_message.change_sequence,
+            original_message_sequence,
+        )
+        self.assertEqual(self.trip.chat_change_sequence, original_trip_sequence)
+        self.assertEqual(callbacks, [])
+        push_chat_message.assert_not_called()
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_patch_rejects_fractional_vnd_for_every_contribution_shape(
+        self,
+        push_chat_message,
+    ):
+        amount_error = "Amount has too many decimal places for this currency."
+        member_id = str(self.user.id)
+        cases = (
+            ("amount", {"amount": "25.50"}, "amount"),
+            ("paid_amount", {"paid_amount": "25.50"}, "paid_amount"),
+            (
+                "contribution_amount",
+                {"contribution_amount": "25.50"},
+                "contribution_amount",
+            ),
+            (
+                "contributions",
+                {
+                    "contributions": [
+                        {"user_id": member_id, "amount": "25.50"}
+                    ]
+                },
+                "contributions.0.amount",
+            ),
+            (
+                "member_contributions",
+                {"member_contributions": {member_id: "25.50"}},
+                f"member_contributions.{member_id}",
+            ),
+            *(
+                (
+                    "member_contributions",
+                    {
+                        "member_contributions": {
+                            member_id: {field: "25.50"}
+                        }
+                    },
+                    f"member_contributions.{member_id}.{field}",
+                )
+                for field in ("amount", "paid_amount", "contribution_amount")
+            ),
+        )
+
+        for missing_field, patch_payload, error_path in cases:
+            with self.subTest(error_path=error_path):
+                draft = self._create_contribution_patch_draft(
+                    missing_field=missing_field,
+                )
+                self._assert_field_validation_patch_preserves_snapshot(
+                    draft=draft,
+                    patch_payload=patch_payload,
+                    expected_field_errors={error_path: amount_error},
+                    push_chat_message=push_chat_message,
+                )
+
+    def test_patch_accepts_max_decimalfield_amount_for_usd(self):
+        self.trip.currency_code = "USD"
+        self.trip.save(update_fields=["currency_code", "updated_at"])
+        self.client.force_authenticate(self.user)
+        draft = self._create_patch_draft()
+
+        response = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            {"payload": {"total_amount": "999999999999.99"}},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertEqual(draft.payload["total_amount"], "999999999999.99")
+        self.assertEqual(draft.missing_fields, [])
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_patch_rejects_decimalfield_overflow_without_mutation(
+        self,
+        push_chat_message,
+    ):
+        self.trip.currency_code = "USD"
+        self.trip.save(update_fields=["currency_code", "updated_at"])
+        draft = self._create_patch_draft()
+
+        self._assert_field_validation_patch_preserves_snapshot(
+            draft=draft,
+            patch_payload={"total_amount": "1000000000000.00"},
+            expected_field_errors={
+                "total_amount": (
+                    "Amount must have no more than 12 digits before the decimal point."
+                )
+            },
+            push_chat_message=push_chat_message,
+        )
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_patch_rejects_contribution_decimalfield_overflow_without_mutation(
+        self,
+        push_chat_message,
+    ):
+        self.trip.currency_code = "USD"
+        self.trip.save(update_fields=["currency_code", "updated_at"])
+        draft = self._create_contribution_patch_draft(
+            missing_field="contributions",
+        )
+
+        self._assert_field_validation_patch_preserves_snapshot(
+            draft=draft,
+            patch_payload={
+                "contributions": [
+                    {
+                        "user_id": str(self.user.id),
+                        "amount": "1000000000000.00",
+                    }
+                ]
+            },
+            expected_field_errors={
+                "contributions.0.amount": (
+                    "Amount must have no more than 12 digits before the decimal point."
+                )
+            },
+            push_chat_message=push_chat_message,
+        )
+
+    def test_patch_accepts_two_decimal_amount_for_usd(self):
+        self.trip.currency_code = "USD"
+        self.trip.save(update_fields=["currency_code", "updated_at"])
+        self.client.force_authenticate(self.user)
+        draft = self._create_patch_draft()
+
+        response = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            {"payload": {"total_amount": "25.50"}},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertEqual(draft.payload["total_amount"], "25.50")
+        self.assertEqual(draft.missing_fields, [])
+
     def test_patch_missing_target_identity_field_is_rejected(self):
         self.client.force_authenticate(self.user)
         draft = AIActionDraft.objects.create(
@@ -1036,6 +1407,138 @@ class AIActionDraftPatchTests(APITestCase, AIActionDraftModelTests):
         self.assertEqual(draft.status, AIActionDraftStatus.READY)
         self.assertEqual(draft.payload["data"]["title"], "Museum")
         self.assertNotIn("title", draft.payload)
+        self.assertEqual(
+            response.data["draft"]["preview"]["data"],
+            {
+                "time_mode": "FLEXIBLE",
+                "system_type": "SIGHTSEEING",
+                "title": "Museum",
+            },
+        )
+        self.assertEqual(
+            response.data["draft"]["preview"]["section_label"],
+            section.label,
+        )
+        self.assertEqual(
+            response.data["draft"]["preview"]["section_date"],
+            section.section_date.isoformat(),
+        )
+        self.assertEqual(
+            response.data["draft"]["preview"]["resolved_data"]["title"],
+            "Museum",
+        )
+
+    def test_patch_timeline_create_rejects_untrusted_trip_scoped_references(self):
+        from trips.models import TimelineCustomType
+
+        self.client.force_authenticate(self.user)
+        section = self.trip.timeline_sections.order_by("section_date").first()
+        other_trip = create_trip(
+            captain=self.user,
+            name="Patch Foreign Trip",
+            destination="Hue",
+            start_date="2026-08-01",
+            end_date="2026-08-02",
+        )
+        foreign_section = other_trip.timeline_sections.order_by("section_date").first()
+        foreign_custom = TimelineCustomType.objects.create(
+            trip=other_trip,
+            name="Foreign patch custom",
+            normalized_name="foreign-patch-custom",
+            created_by=self.user,
+        )
+        left_assignee = create_completed_user(
+            "agent-patch-left@example.com",
+            "agentpatchleft",
+            "AID006",
+        )
+        TripMember.objects.create(
+            trip=self.trip,
+            user=left_assignee,
+            role=TripRole.MEMBER,
+            status=MemberStatus.LEFT,
+        )
+
+        cases = (
+            (
+                "section_id",
+                {
+                    "data": {
+                        "title": "Foreign day",
+                        "time_mode": "FLEXIBLE",
+                        "system_type": "SIGHTSEEING",
+                    }
+                },
+                str(foreign_section.id),
+            ),
+            (
+                "custom_type_id",
+                {
+                    "section_id": str(section.id),
+                    "data": {
+                        "title": "Foreign custom",
+                        "time_mode": "FLEXIBLE",
+                    },
+                },
+                str(foreign_custom.id),
+            ),
+            (
+                "assignee_user_id",
+                {
+                    "section_id": str(section.id),
+                    "data": {
+                        "title": "Inactive assignee",
+                        "time_mode": "FLEXIBLE",
+                        "system_type": "SIGHTSEEING",
+                        "assignee_scope": "USER",
+                    },
+                },
+                str(left_assignee.id),
+            ),
+        )
+
+        for field_name, payload, invalid_value in cases:
+            with self.subTest(field_name=field_name):
+                draft = AIActionDraft.objects.create(
+                    trip=self.trip,
+                    interaction=self.interaction,
+                    response_message=self.response_message,
+                    requested_by=self.user,
+                    action_type="timeline.activity.create",
+                    status=AIActionDraftStatus.NEEDS_INFO,
+                    required_confirmation="CAPTAIN",
+                    payload=payload,
+                    preview={"title": payload.get("data", {}).get("title", "")},
+                    missing_fields=[
+                        {"name": field_name, "label": field_name}
+                    ],
+                    preconditions={},
+                    expires_at=timezone.now() + timedelta(hours=24),
+                )
+                original_payload = draft.payload
+
+                response = self.client.patch(
+                    f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                    {"payload": {field_name: invalid_value}},
+                    format="json",
+                )
+
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(
+                    response.data["error_code"],
+                    "FIELD_VALIDATION_FAILED",
+                )
+                self.assertIn(field_name, response.data["field_errors"])
+                draft.refresh_from_db()
+                self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+                self.assertEqual(draft.payload, original_payload)
+                review_wire = str(
+                    {
+                        "preview": response.data["draft"]["preview"],
+                        "display": response.data["draft"]["display"],
+                    }
+                )
+                self.assertNotIn(invalid_value, review_wire)
 
     def test_patch_timeline_update_missing_data_object_updates_nested_payload(self):
         self.client.force_authenticate(self.user)
@@ -1044,6 +1547,7 @@ class AIActionDraftPatchTests(APITestCase, AIActionDraftModelTests):
             trip=self.trip,
             title="Old Museum",
             time_mode="FLEXIBLE",
+            system_type="SIGHTSEEING",
             position=0,
         )
         draft = AIActionDraft.objects.create(
@@ -1078,6 +1582,22 @@ class AIActionDraftPatchTests(APITestCase, AIActionDraftModelTests):
         self.assertEqual(draft.status, AIActionDraftStatus.READY)
         self.assertEqual(draft.payload["data"], {"title": "Museum"})
         self.assertEqual(response.data["draft"]["preview"]["title"], "Museum")
+        self.assertEqual(
+            response.data["draft"]["preview"]["data"],
+            {"title": "Museum"},
+        )
+        self.assertEqual(
+            response.data["draft"]["preview"]["target_title"],
+            "Old Museum",
+        )
+        self.assertEqual(
+            response.data["draft"]["preview"]["resolved_data"]["title"],
+            "Museum",
+        )
+        self.assertEqual(
+            response.data["draft"]["display"]["meta"][0],
+            {"label": "Target", "value": "Old Museum"},
+        )
 
     def test_assignee_patches_timeline_status_missing_info(self):
         member = create_completed_user(
@@ -1220,6 +1740,64 @@ class AIActionDraftPatchFieldValidationTests(APITestCase, AIActionDraftModelTest
             set(res.data),
             {"detail", "error_code", "field_errors", "draft"},
         )
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_target_merged_validation_rejects_invalid_patch_without_side_effects(
+        self,
+        push_chat_message,
+    ):
+        section = self.trip.timeline_sections.order_by("section_date").first()
+        activity = section.activities.create(
+            trip=self.trip,
+            title="Flexible target",
+            time_mode="FLEXIBLE",
+            system_type="SIGHTSEEING",
+            position=0,
+        )
+        draft = AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            requested_by=self.user,
+            action_type="timeline.activity.update",
+            status=AIActionDraftStatus.NEEDS_INFO,
+            required_confirmation="CAPTAIN",
+            payload={"activity_id": str(activity.id), "data": {}},
+            preview={"title": activity.title},
+            missing_fields=[{"name": "time_mode", "label": "Time mode"}],
+            preconditions={},
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+        original_payload = draft.payload
+        original_updated_at = draft.updated_at
+        original_trip_sequence = self.trip.chat_change_sequence
+        original_message_sequence = self.response_message.change_sequence
+        self.client.force_authenticate(self.user)
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.patch(
+                f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                {"payload": {"time_mode": "TIME_RANGE"}},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error_code"], "FIELD_VALIDATION_FAILED")
+        self.assertIn("start_time", response.data["field_errors"])
+        self.assertIn("end_time", response.data["field_errors"])
+        draft.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(draft.payload, original_payload)
+        self.assertEqual(draft.updated_at, original_updated_at)
+        self.assertEqual(self.trip.chat_change_sequence, original_trip_sequence)
+        self.assertEqual(
+            self.response_message.change_sequence,
+            original_message_sequence,
+        )
+        self.assertEqual(callbacks, [])
+        push_chat_message.assert_not_called()
 
     def test_field_validation_precedes_expiry_without_mutating_snapshot(self):
         draft = self._create_needs_info_activity_draft()
@@ -1402,8 +1980,8 @@ class AIActionDraftPatchFieldValidationTests(APITestCase, AIActionDraftModelTest
         self.assertEqual(res.status_code, 200)
         draft.refresh_from_db()
         self.assertEqual(draft.status, AIActionDraftStatus.READY)
-        self.assertEqual(draft.payload["data"]["start_time"], "08:30")
-        self.assertEqual(draft.payload["data"]["end_time"], "10:00")
+        self.assertEqual(draft.payload["data"]["start_time"], "08:30:00")
+        self.assertEqual(draft.payload["data"]["end_time"], "10:00:00")
         self.assertEqual(draft.missing_fields, [])
 
 

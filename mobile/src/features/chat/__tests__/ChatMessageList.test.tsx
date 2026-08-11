@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from '@testing-library/react-native';
-import { Alert, Text } from 'react-native';
+import { Alert, Keyboard, Text } from 'react-native';
 import { makeDraftFixture } from '../ai/__fixtures__/drafts';
 import { createAIReconciliationCoordinator } from '../ai/reconciliation';
 import { AIReconciliationCoordinatorProvider } from '../ai/reconciliationContext';
@@ -328,6 +328,22 @@ describe('ChatMessageList', () => {
 
     await fireEvent.press(screen.getByLabelText('Load earlier messages'));
     expect(onLoadOlder).toHaveBeenCalledTimes(2);
+  });
+
+  it('dismisses the software keyboard when the transcript starts dragging', async () => {
+    const dismissKeyboard = jest
+      .spyOn(Keyboard, 'dismiss')
+      .mockImplementation(() => undefined);
+    await render(
+      <ChatMessageList
+        {...props({ messages: [message('message-1')] })}
+      />,
+    );
+
+    const list = screen.getByTestId('chat-message-list');
+    expect(list.props.keyboardDismissMode).toBe('on-drag');
+    await fireEvent(list, 'scrollBeginDrag');
+    expect(dismissKeyboard).toHaveBeenCalledTimes(1);
   });
 
   it('shows a single pagination progress state while loading older history', async () => {

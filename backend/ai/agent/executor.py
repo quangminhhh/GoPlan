@@ -22,6 +22,10 @@ from ai.action_types import (
     AI_ACTION_TIMELINE_ACTIVITY_UPDATE,
 )
 from ai.agent.drafts import can_confirm_action_draft
+from ai.agent.timeline_draft_validation import (
+    plan_timeline_create_draft,
+    plan_timeline_update_draft,
+)
 from ai.agent.payload_validation import (
     TIMELINE_ACTIVITY_DATA_FIELDS,
     missing_payload_field_names,
@@ -99,7 +103,7 @@ def _check_object_precondition(*, current_updated_at, expected_updated_at) -> No
         )
 
 
-def _check_preconditions(draft: AIActionDraft) -> None:
+def _check_preconditions(draft: AIActionDraft):
     expected_target = expected_precondition_target(
         action_type=draft.action_type,
         payload=draft.payload,
@@ -135,13 +139,18 @@ def _check_preconditions(draft: AIActionDraft) -> None:
             current_updated_at=expense.updated_at,
             expected_updated_at=expected_updated_at,
         )
-        return
+        return expense
 
     if target_type == "timeline_activity":
         try:
-            activity = TimelineActivity.objects.select_for_update().get(
-                pk=expected_target.target_id,
-                trip_id=draft.trip_id,
+            activity = (
+                TimelineActivity.objects.select_for_update(of=("self",))
+                .select_related("section", "custom_type", "assignee_user")
+                .prefetch_related("reminders")
+                .get(
+                    pk=expected_target.target_id,
+                    trip_id=draft.trip_id,
+                )
             )
         except TimelineActivity.DoesNotExist as exc:
             raise AIActionDraftStaleError("Draft target no longer exists.") from exc
@@ -149,15 +158,24 @@ def _check_preconditions(draft: AIActionDraft) -> None:
             current_updated_at=activity.updated_at,
             expected_updated_at=expected_updated_at,
         )
-        return
+        return activity
 
     raise AIActionDraftStaleError("Draft target precondition is unsupported.")
 
 
 def _validate_action_payload_ready(draft: AIActionDraft) -> None:
+    if draft.action_type == AI_ACTION_EXPENSE_CREATE:
+        payload_currency = str(draft.payload.get("currency_code") or "").upper()
+        trip_currency = str(draft.trip.currency_code).upper()
+        if payload_currency and payload_currency != trip_currency:
+            raise AIActionDraftNotReadyError(
+                "Draft currency does not match the trip currency."
+            )
+
     missing_names = missing_payload_field_names(
         action_type=draft.action_type,
         payload=draft.payload,
+        currency_code=draft.trip.currency_code,
     )
     if missing_names:
         raise AIActionDraftNotReadyError(
@@ -658,18 +676,46 @@ def confirm_action_draft(*, draft_id, trip_id, actor) -> AIActionDraft:
                     locked_trip=locked_trip,
                 )
         else:
+            original_payload = draft.payload
             normalized_payload = _normalized_timeline_activity_payload(
                 action_type=draft.action_type,
                 payload=draft.payload,
             )
-            payload_normalized = normalized_payload != draft.payload
-            if payload_normalized:
+            if normalized_payload != draft.payload:
                 draft.payload = normalized_payload
             _validate_action_payload_ready(draft)
             if not can_confirm_action_draft(draft, viewer=actor):
                 raise AIActionDraftForbiddenError("You cannot confirm this draft.")
 
-            _check_preconditions(draft)
+            locked_target = _check_preconditions(draft)
+            timeline_create_result = plan_timeline_create_draft(
+                action_type=draft.action_type,
+                trip=locked_trip,
+                payload=draft.payload,
+                lock_section=True,
+            )
+            if timeline_create_result.field_errors:
+                first_error = next(
+                    iter(timeline_create_result.field_errors.values())
+                )
+                raise AIActionDraftNotReadyError(first_error)
+            draft.payload = timeline_create_result.payload
+            timeline_result = plan_timeline_update_draft(
+                action_type=draft.action_type,
+                trip=locked_trip,
+                payload=draft.payload,
+                lock_target=False,
+                activity=(
+                    locked_target
+                    if isinstance(locked_target, TimelineActivity)
+                    else None
+                ),
+            )
+            if timeline_result.field_errors:
+                first_error = next(iter(timeline_result.field_errors.values()))
+                raise AIActionDraftNotReadyError(first_error)
+            draft.payload = timeline_result.payload
+            payload_normalized = draft.payload != original_payload
             result = _execute(draft, actor=actor)
             draft.status = AIActionDraftStatus.CONFIRMED
             draft.confirmed_by = actor

@@ -16,6 +16,11 @@ from ai.action_types import (
     AI_ACTION_TIMELINE_ACTIVITY_STATUS_UPDATE,
     AI_ACTION_TIMELINE_ACTIVITY_UPDATE,
 )
+from expenses.services import (
+    ExpenseServiceError,
+    normalize_currency_amount,
+    normalize_non_negative_currency_amount,
+)
 from trips.models import (
     TimelineActivityStatus,
     TimelineActivityTimeMode,
@@ -143,7 +148,49 @@ def _append_once(names: list[str], field: str) -> None:
         names.append(field)
 
 
-def _is_invalid_money_value(value, *, allow_zero: bool = False) -> bool:
+def currency_amount_validation_error(
+    value,
+    *,
+    currency_code: str,
+    allow_zero: bool = False,
+) -> str | None:
+    """Return the expense-domain error for a currency-incompatible amount."""
+    if is_missing_value(value):
+        return None
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return "Enter a valid amount."
+    if not amount.is_finite():
+        return "Enter a valid amount."
+
+    normalize = (
+        normalize_non_negative_currency_amount
+        if allow_zero
+        else normalize_currency_amount
+    )
+    try:
+        normalize(amount, currency_code)
+    except ExpenseServiceError as exc:
+        return str(exc)
+    return None
+
+
+def _is_invalid_money_value(
+    value,
+    *,
+    allow_zero: bool = False,
+    currency_code: str | None = None,
+) -> bool:
+    if currency_code:
+        return (
+            currency_amount_validation_error(
+                value,
+                currency_code=currency_code,
+                allow_zero=allow_zero,
+            )
+            is not None
+        )
     if is_missing_value(value):
         return False
     try:
@@ -161,17 +208,30 @@ def _append_invalid_money_field(
     field: str,
     *,
     allow_zero: bool = False,
+    currency_code: str | None = None,
 ) -> None:
     if field in payload and _is_invalid_money_value(
         payload.get(field),
         allow_zero=allow_zero,
+        currency_code=currency_code,
     ):
         _append_once(names, field)
 
 
-def _append_invalid_contribution_amounts(names: list[str], payload: dict) -> None:
+def _append_invalid_contribution_amounts(
+    names: list[str],
+    payload: dict,
+    *,
+    currency_code: str | None = None,
+) -> None:
     for field in EXPENSE_CONTRIBUTION_AMOUNT_FIELDS:
-        _append_invalid_money_field(names, payload, field, allow_zero=True)
+        _append_invalid_money_field(
+            names,
+            payload,
+            field,
+            allow_zero=True,
+            currency_code=currency_code,
+        )
 
     contributions = payload.get("contributions")
     if isinstance(contributions, list):
@@ -182,6 +242,7 @@ def _append_invalid_contribution_amounts(names: list[str], payload: dict) -> Non
                 _is_invalid_money_value(
                     contribution.get(field),
                     allow_zero=True,
+                    currency_code=currency_code,
                 )
                 for field in EXPENSE_CONTRIBUTION_AMOUNT_FIELDS
                 if field in contribution
@@ -192,13 +253,18 @@ def _append_invalid_contribution_amounts(names: list[str], payload: dict) -> Non
     if isinstance(member_contributions, dict):
         for contribution in member_contributions.values():
             if not isinstance(contribution, dict):
-                if _is_invalid_money_value(contribution, allow_zero=True):
+                if _is_invalid_money_value(
+                    contribution,
+                    allow_zero=True,
+                    currency_code=currency_code,
+                ):
                     _append_once(names, "amount")
                 continue
             if any(
                 _is_invalid_money_value(
                     contribution.get(field),
                     allow_zero=True,
+                    currency_code=currency_code,
                 )
                 for field in EXPENSE_CONTRIBUTION_AMOUNT_FIELDS
                 if field in contribution
@@ -206,35 +272,59 @@ def _append_invalid_contribution_amounts(names: list[str], payload: dict) -> Non
                 _append_once(names, "amount")
 
 
-def _has_valid_contribution_amount(payload: dict) -> bool:
+def _has_valid_contribution_amount(
+    payload: dict,
+    *,
+    currency_code: str | None = None,
+) -> bool:
     for field in EXPENSE_CONTRIBUTION_AMOUNT_FIELDS:
         if field not in payload:
             continue
         value = payload.get(field)
         if is_missing_value(value):
             continue
-        return not _is_invalid_money_value(value, allow_zero=True)
+        return not _is_invalid_money_value(
+            value,
+            allow_zero=True,
+            currency_code=currency_code,
+        )
     return False
 
 
-def _has_valid_member_contribution_amount(value) -> bool:
+def _has_valid_member_contribution_amount(
+    value,
+    *,
+    currency_code: str | None = None,
+) -> bool:
     if isinstance(value, dict):
-        return _has_valid_contribution_amount(value)
+        return _has_valid_contribution_amount(
+            value,
+            currency_code=currency_code,
+        )
     if is_missing_value(value):
         return False
-    return not _is_invalid_money_value(value, allow_zero=True)
+    return not _is_invalid_money_value(
+        value,
+        allow_zero=True,
+        currency_code=currency_code,
+    )
 
 
 def _append_invalid_explicit_contribution_payloads(
     names: list[str],
     payload: dict,
+    *,
+    currency_code: str | None = None,
 ) -> None:
     contributions = payload.get("contributions")
     if isinstance(contributions, list) and contributions:
         has_invalid_item = any(
             not isinstance(contribution, dict)
             or not _has_any_value(contribution, EXPENSE_CONTRIBUTION_USER_FIELDS)
-            or not _has_valid_contribution_amount(contribution)
+            or not _has_valid_contribution_amount(
+                contribution,
+                currency_code=currency_code,
+            )
             for contribution in contributions
         )
         if has_invalid_item:
@@ -244,7 +334,10 @@ def _append_invalid_explicit_contribution_payloads(
     if isinstance(member_contributions, dict) and member_contributions:
         has_invalid_item = any(
             is_missing_value(member_id)
-            or not _has_valid_member_contribution_amount(contribution)
+            or not _has_valid_member_contribution_amount(
+                contribution,
+                currency_code=currency_code,
+            )
             for member_id, contribution in member_contributions.items()
         )
         if has_invalid_item:
@@ -375,6 +468,7 @@ def missing_payload_field_names(
     action_type: str,
     payload: dict,
     provider_missing_names: list[str] | None = None,
+    currency_code: str | None = None,
 ) -> list[str]:
     provider_missing_names = provider_missing_names or []
 
@@ -386,7 +480,12 @@ def missing_payload_field_names(
         )
         _require_field(names, payload, "title")
         _require_field(names, payload, "total_amount")
-        _append_invalid_money_field(names, payload, "total_amount")
+        _append_invalid_money_field(
+            names,
+            payload,
+            "total_amount",
+            currency_code=currency_code,
+        )
         return names
 
     if action_type == AI_ACTION_EXPENSE_UPDATE:
@@ -398,7 +497,12 @@ def missing_payload_field_names(
         _require_field(names, payload, "expense_id")
         if not _has_any_expense_update_field(payload):
             _append_once(names, "title")
-        _append_invalid_money_field(names, payload, "total_amount")
+        _append_invalid_money_field(
+            names,
+            payload,
+            "total_amount",
+            currency_code=currency_code,
+        )
         return names
 
     if action_type == AI_ACTION_EXPENSE_DELETE:
@@ -426,13 +530,21 @@ def missing_payload_field_names(
         _require_field(names, payload, "expense_id")
         has_explicit_contributions = _has_explicit_contributions(payload)
         if has_explicit_contributions:
-            _append_invalid_explicit_contribution_payloads(names, payload)
+            _append_invalid_explicit_contribution_payloads(
+                names,
+                payload,
+                currency_code=currency_code,
+            )
         elif not _should_mark_all_participants_paid(payload):
             if not _has_any_value(payload, EXPENSE_CONTRIBUTION_USER_FIELDS):
                 names.append("user_id")
             if not _has_any_value(payload, EXPENSE_CONTRIBUTION_AMOUNT_FIELDS):
                 names.append("amount")
-        _append_invalid_contribution_amounts(names, payload)
+        _append_invalid_contribution_amounts(
+            names,
+            payload,
+            currency_code=currency_code,
+        )
         return list(dict.fromkeys(names))
 
     if action_type == AI_ACTION_TIMELINE_ACTIVITY_CREATE:

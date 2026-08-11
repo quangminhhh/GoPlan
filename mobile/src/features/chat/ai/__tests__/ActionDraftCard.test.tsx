@@ -3,6 +3,7 @@ import {
   fireEvent,
   render,
   screen,
+  within,
 } from '@testing-library/react-native';
 import { StyleSheet } from 'react-native';
 import { focusAccessibilityNode } from '../accessibilityFocus';
@@ -209,6 +210,240 @@ describe('AI action draft explicit mutation controls', () => {
       screen.getByRole('button', { name: 'Confirm this action' }),
     );
     expect(handlers.onConfirm).toHaveBeenCalledTimes(1);
+  });
+
+  it('restates timeline date, time, and location before explicit confirmation', async () => {
+    await renderCard(
+      makeDraft({
+        action_type: 'timeline.activity.create',
+        display: { title: 'QA sunset walk', kicker: 'Activity' },
+        preview: {
+          section_date: '2026-08-11',
+          data: {
+            title: 'QA sunset walk',
+            start_time: '18:00',
+            end_time: '20:00',
+            location_label: 'Da Nang',
+          },
+        },
+      }),
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Confirm' }));
+    const restatement = screen.getByText(
+      'Create timeline activity “QA sunset walk”. Date: 2026-08-11. Time: 18:00 – 20:00. Location: Da Nang.',
+    );
+    expect(restatement.props.numberOfLines).toBeUndefined();
+    expect(screen.queryByRole('link')).toBeNull();
+  });
+
+  it('restates the authoritative target and resolved end-time-only update', async () => {
+    await renderCard(
+      makeDraft({
+        action_type: 'timeline.activity.update',
+        display: {
+          title: 'Old stop',
+          kicker: 'Update activity',
+          meta: [
+            { label: 'Target', value: 'Old stop' },
+            { label: 'Date', value: 'Day 1 · 2026-08-11' },
+            { label: 'Time', value: '08:00 – 10:00' },
+            { label: 'Location', value: 'Old Quarter' },
+          ],
+        },
+        preview: {
+          activity_id: '33333333-3333-4333-8333-333333333333',
+          data: { end_time: '10:00:00' },
+          target_title: 'Old stop',
+          section_label: 'Day 1',
+          section_date: '2026-08-11',
+          resolved_data: {
+            title: 'Old stop',
+            time_mode: 'TIME_RANGE',
+            start_time: '08:00:00',
+            end_time: '10:00:00',
+            location_label: 'Old Quarter',
+          },
+        },
+      }),
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Confirm' }));
+    expect(
+      screen.getByText(
+        'Update timeline activity “Old stop”. Date: Day 1 · 2026-08-11. Time: 08:00 – 10:00. Location: Old Quarter.',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('restates every allowlisted hidden timeline delta as inert text', async () => {
+    await renderCard(
+      makeDraft({
+        action_type: 'timeline.activity.create',
+        display: {
+          title: 'Hidden detail review',
+          kicker: 'Activity',
+          meta: [
+            { label: 'Date', value: 'Day 1 · 2026-08-11' },
+            { label: 'Time', value: '09:00' },
+            { label: 'Location', value: 'Not set' },
+            { label: 'Custom type', value: 'Photo walk' },
+            { label: 'Assignee', value: 'Lan Nguyen' },
+            { label: 'Booking reference', value: 'BK-42' },
+            { label: 'Contact name', value: 'Lan' },
+            { label: 'Contact phone', value: '+84 123' },
+            { label: 'External link', value: 'https://example.com/booking' },
+            { label: 'Location note', value: 'Use the east entrance' },
+            { label: 'Meeting point', value: 'Hotel lobby' },
+            { label: 'Note', value: 'Bring water' },
+            { label: 'Reminders', value: '1 day before · 30 minutes before' },
+            { label: 'Internal precondition', value: 'must-not-render' },
+          ],
+        },
+        preview: {
+          section_label: 'Day 1',
+          section_date: '2026-08-11',
+          data: { custom_type_id: 'hidden-uuid' },
+          resolved_data: {
+            title: 'Hidden detail review',
+            custom_type_label: 'Photo walk',
+            time_mode: 'AT_TIME',
+            start_time: '09:00:00',
+          },
+        },
+      }),
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Confirm' }));
+    const modal = within(screen.getByTestId('ai-draft-confirm-modal-content'));
+    const restatement = modal.getByText(/Custom type: Photo walk\./);
+    expect(restatement).toBeTruthy();
+    expect(modal.getByText(/Assignee: Lan Nguyen\./)).toBeTruthy();
+    expect(modal.getByText(/Booking reference: BK-42\./)).toBeTruthy();
+    expect(modal.getByText(/Contact name: Lan\./)).toBeTruthy();
+    expect(modal.getByText(/Contact phone: \+84 123\./)).toBeTruthy();
+    expect(
+      modal.getByText(/External link: https:\/\/example\.com\/booking\./),
+    ).toBeTruthy();
+    expect(modal.getByText(/Location note: Use the east entrance\./)).toBeTruthy();
+    expect(modal.getByText(/Meeting point: Hotel lobby\./)).toBeTruthy();
+    expect(modal.getByText(/Note: Bring water\./)).toBeTruthy();
+    expect(
+      modal.getByText(/Reminders: 1 day before · 30 minutes before\./),
+    ).toBeTruthy();
+    expect(modal.queryByText(/must-not-render/)).toBeNull();
+    expect(modal.queryByText(/hidden-uuid/)).toBeNull();
+    expect(modal.queryByRole('link')).toBeNull();
+  });
+
+  it('restates explicit hidden clears while omitting missing deltas', async () => {
+    await renderCard(
+      makeDraft({
+        action_type: 'timeline.activity.update',
+        display: {
+          title: 'Clear hidden details',
+          kicker: 'Update activity',
+          meta: [
+            { label: 'Target', value: 'Clear hidden details' },
+            { label: 'Date', value: 'Day 1 · 2026-08-11' },
+            { label: 'Time', value: 'Flexible' },
+            { label: 'Location', value: 'Not set' },
+            { label: 'Contact name', value: 'Cleared' },
+            { label: 'External link', value: 'Cleared' },
+            { label: 'Note', value: 'Cleared' },
+            { label: 'Reminders', value: 'Cleared' },
+          ],
+        },
+        preview: {
+          target_title: 'Clear hidden details',
+          data: {
+            contact_name: '',
+            external_link: '',
+            note: '',
+            reminder_offsets_minutes: [],
+          },
+          resolved_data: {
+            title: 'Clear hidden details',
+            time_mode: 'FLEXIBLE',
+          },
+        },
+      }),
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Confirm' }));
+    const modal = within(screen.getByTestId('ai-draft-confirm-modal-content'));
+    expect(modal.getByText(/Contact name: Cleared\./)).toBeTruthy();
+    expect(modal.getByText(/External link: Cleared\./)).toBeTruthy();
+    expect(modal.getByText(/Note: Cleared\./)).toBeTruthy();
+    expect(modal.getByText(/Reminders: Cleared\./)).toBeTruthy();
+    expect(modal.queryByText(/Booking reference:/)).toBeNull();
+  });
+
+  it.each([
+    ['preserved', 'Riverside Cafe'],
+    ['cleared', 'Cleared'],
+    ['not set', 'Not set'],
+  ] as const)('restates a %s timeline location explicitly', async (_, location) => {
+    await renderCard(
+      makeDraft({
+        action_type: 'timeline.activity.update',
+        display: {
+          title: 'Cafe stop',
+          kicker: 'Update activity',
+          meta: [
+            { label: 'Target', value: 'Cafe stop' },
+            { label: 'Date', value: 'Day 1 · 2026-08-11' },
+            { label: 'Time', value: 'Flexible' },
+            { label: 'Location', value: location },
+          ],
+        },
+        preview: {
+          data: location === 'Cleared' ? { location_label: '' } : { note: 'Note' },
+          target_title: 'Cafe stop',
+          resolved_data: {
+            title: 'Cafe stop',
+            time_mode: 'FLEXIBLE',
+            location_label:
+              location === 'Riverside Cafe' ? 'Riverside Cafe' : '',
+          },
+        },
+      }),
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Confirm' }));
+    expect(screen.getByText(new RegExp(`Location: ${location}\\.`))).toBeTruthy();
+  });
+
+  it('keeps malformed timeline context inert and does not bypass confirmation', async () => {
+    const handlers = await renderCard(
+      makeDraft({
+        action_type: 'timeline.activity.update',
+        display: {
+          title: 'Safe target',
+          kicker: 'Update activity',
+          meta: [
+            { label: 'Target', value: { href: 'https://malicious.example' } },
+            { label: 'Date', value: ['not', 'trusted'] },
+            { label: 'Time', value: { onPress: 'confirm' } },
+            { label: 'Location', value: null },
+          ],
+        },
+        preview: {
+          target_title: { href: 'https://malicious.example' },
+          resolved_data: {
+            title: { onPress: 'confirm' },
+            start_time: ['08:00'],
+            place: { title: { href: 'https://malicious.example' } },
+          },
+        },
+      }),
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Confirm' }));
+    expect(screen.getByText('Update timeline activity “Safe target”.')).toBeTruthy();
+    expect(screen.queryByRole('link')).toBeNull();
+    expect(screen.queryByText(/malicious\.example/)).toBeNull();
+    expect(handlers.onConfirm).not.toHaveBeenCalled();
   });
 
   it('dismisses the native confirmation review without executing it', async () => {
@@ -607,6 +842,89 @@ describe('specialized draft renderers at narrow width and Dynamic Type', () => {
     expect(screen.getByText('08:30 – 11:45')).toBeTruthy();
     expect(screen.getByText('Sightseeing')).toBeTruthy();
     expect(screen.getByText('Whole group')).toBeTruthy();
+  });
+
+  it('never renders a raw timeline section UUID as user-facing context', async () => {
+    const sectionId = '77777777-7777-4777-8777-777777777777';
+    await renderCard(
+      makeDraft({
+        action_type: 'timeline.activity.create',
+        display: { title: 'Private section reference', kicker: 'Activity' },
+        preview: {
+          section_id: sectionId,
+          resolved_data: {
+            title: 'Private section reference',
+            time_mode: 'FLEXIBLE',
+          },
+        },
+      }),
+    );
+
+    expect(screen.queryByText(sectionId)).toBeNull();
+  });
+
+  it('omits a blank current timeline external link', async () => {
+    await renderCard(
+      makeDraft({
+        action_type: 'timeline.activity.update',
+        display: { title: 'No booking link', kicker: 'Update activity' },
+        preview: {
+          resolved_data: {
+            title: 'No booking link',
+            time_mode: 'FLEXIBLE',
+            external_link: '',
+          },
+        },
+      }),
+    );
+
+    expect(screen.queryByText('External link')).toBeNull();
+    expect(screen.queryByText(/^Link \(text only\):/)).toBeNull();
+  });
+
+  it('renders an explicit external-link clear only through display metadata', async () => {
+    await renderCard(
+      makeDraft({
+        action_type: 'timeline.activity.update',
+        display: {
+          title: 'Clear booking link',
+          kicker: 'Update activity',
+          meta: [{ label: 'External link', value: 'Cleared' }],
+        },
+        preview: {
+          data: { external_link: '' },
+          resolved_data: {
+            title: 'Clear booking link',
+            time_mode: 'FLEXIBLE',
+            external_link: '',
+          },
+        },
+      }),
+    );
+
+    expect(screen.getAllByText('External link')).toHaveLength(1);
+    expect(screen.getAllByText('Cleared')).toHaveLength(1);
+    expect(screen.queryByText(/^Link \(text only\):/)).toBeNull();
+  });
+
+  it('keeps a non-empty external link as unique inert text', async () => {
+    const externalLink = 'https://example.com/reservation';
+    await renderCard(
+      makeDraft({
+        action_type: 'timeline.activity.create',
+        display: { title: 'Booking link', kicker: 'Activity' },
+        preview: {
+          resolved_data: {
+            title: 'Booking link',
+            time_mode: 'FLEXIBLE',
+            external_link: externalLink,
+          },
+        },
+      }),
+    );
+
+    expect(screen.getByText(`Link (text only): ${externalLink}`)).toBeTruthy();
+    expect(screen.queryByRole('link')).toBeNull();
   });
 
   it('renders full expense money/payer/participants/split with scalable wrapping styles', async () => {

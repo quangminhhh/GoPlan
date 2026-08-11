@@ -168,12 +168,163 @@ function amountSuffix(draft: AIActionDraft): string {
   return amount === null ? '' : ` for ${amount.value} ${amount.currency}`;
 }
 
+function timelineActivityPreview(
+  draft: AIActionDraft,
+): Readonly<Record<string, unknown>> {
+  if (isAIRecord(draft.preview.resolved_data)) {
+    return draft.preview.resolved_data;
+  }
+  return isAIRecord(draft.preview.data) ? draft.preview.data : draft.preview;
+}
+
+function timelineDisplayText(
+  draft: AIActionDraft,
+  label: 'Target' | 'Date' | 'Time' | 'Location',
+): string | null {
+  const meta = draft.display.meta;
+  if (!Array.isArray(meta)) {
+    return null;
+  }
+  for (const candidate of meta) {
+    if (
+      !isAIRecord(candidate) ||
+      candidate.label !== label ||
+      typeof candidate.value !== 'string'
+    ) {
+      continue;
+    }
+    const value = candidate.value.trim();
+    if (value.length > 0) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function firstTimelineText(
+  sources: readonly Readonly<Record<string, unknown>>[],
+  keys: readonly string[],
+): string | null {
+  for (const source of sources) {
+    for (const key of keys) {
+      const value = readAIText(source, key);
+      if (value !== null) {
+        return value;
+      }
+    }
+  }
+  return null;
+}
+
+function timelineTimeText(
+  activity: Readonly<Record<string, unknown>>,
+): string | null {
+  const start = firstTimelineText([activity], ['start_time']);
+  const end = firstTimelineText([activity], ['end_time']);
+  if (start !== null) {
+    return end === null ? start : `${start} – ${end}`;
+  }
+  const mode = firstTimelineText([activity], ['time_mode']);
+  if (mode === 'ALL_DAY') {
+    return 'All day';
+  }
+  if (mode === 'FLEXIBLE') {
+    return 'Flexible';
+  }
+  return null;
+}
+
+function timelineLocationText(
+  activity: Readonly<Record<string, unknown>>,
+): string | null {
+  const locationMode = firstTimelineText([activity], ['location_mode']);
+  if (locationMode === 'STRUCTURED') {
+    return isAIRecord(activity.place)
+      ? firstTimelineText([activity.place], ['title', 'address'])
+      : null;
+  }
+  const direct = firstTimelineText(
+    [activity],
+    ['location_label', 'location'],
+  );
+  if (direct !== null) {
+    return direct;
+  }
+  return isAIRecord(activity.place)
+    ? firstTimelineText([activity.place], ['title', 'address'])
+    : null;
+}
+
+const TIMELINE_CONFIRMATION_DETAIL_LABELS = new Set([
+  'Type',
+  'Custom type',
+  'Assignee',
+  'Assigned member',
+  'Booking reference',
+  'Contact name',
+  'Contact phone',
+  'External link',
+  'Location note',
+  'Meeting point',
+  'Note',
+  'Reminders',
+]);
+
+function timelineConfirmationMetaDetails(draft: AIActionDraft): string[] {
+  return displayMetaRows(draft.display)
+    .filter(({ label }) => TIMELINE_CONFIRMATION_DETAIL_LABELS.has(label))
+    .map(({ label, value }) => `${label}: ${value}.`);
+}
+
+function timelineConfirmationDetails(draft: AIActionDraft): string {
+  const activity = timelineActivityPreview(draft);
+  const sectionLabel = firstTimelineText([draft.preview], ['section_label']);
+  const sectionDate = firstTimelineText(
+    [draft.preview],
+    ['section_date', 'date'],
+  );
+  const fallbackDate =
+    sectionLabel !== null && sectionDate !== null
+      ? `${sectionLabel} · ${sectionDate}`
+      : (sectionDate ?? sectionLabel);
+  const date = timelineDisplayText(draft, 'Date') ?? fallbackDate;
+  const time = timelineDisplayText(draft, 'Time') ?? timelineTimeText(activity);
+  const location =
+    timelineDisplayText(draft, 'Location') ?? timelineLocationText(activity);
+  const details = [
+    date === null ? null : `Date: ${date}.`,
+    time === null ? null : `Time: ${time}.`,
+    location === null ? null : `Location: ${location}.`,
+    ...timelineConfirmationMetaDetails(draft),
+  ].filter((detail): detail is string => detail !== null);
+  return details.length === 0 ? '' : ` ${details.join(' ')}`;
+}
+
+function quotedTimelineUpdateTarget(draft: AIActionDraft): string {
+  const target =
+    timelineDisplayText(draft, 'Target') ??
+    firstTimelineText([draft.preview], ['target_title']) ??
+    draftTitle(draft);
+  return `“${target}”`;
+}
+
+function timelineUpdateTitleSuffix(draft: AIActionDraft): string {
+  const target =
+    timelineDisplayText(draft, 'Target') ??
+    firstTimelineText([draft.preview], ['target_title']) ??
+    draftTitle(draft);
+  const resolvedTitle =
+    firstTimelineText([timelineActivityPreview(draft)], ['title']) ??
+    draftTitle(draft);
+  return resolvedTitle === target ? '' : ` to “${resolvedTitle}”`;
+}
+
 export function confirmationRestatement(draft: AIActionDraft): string {
   switch (draft.action_type) {
     case 'timeline.activity.create':
-      return `Create timeline activity ${quotedTitle(draft)}.`;
+      return `Create timeline activity ${quotedTitle(draft)}.${timelineConfirmationDetails(draft)}`;
     case 'timeline.activity.update':
-      return `Update timeline activity ${quotedTitle(draft)} with the reviewed values.`;
+      return `Update timeline activity ${quotedTimelineUpdateTarget(draft)}${timelineUpdateTitleSuffix(draft)}.${timelineConfirmationDetails(draft)}`;
     case 'timeline.activity.delete':
       return `Delete timeline activity ${quotedTitle(draft)} from the shared trip.`;
     case 'timeline.activity.status.update':

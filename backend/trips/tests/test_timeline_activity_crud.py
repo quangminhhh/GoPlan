@@ -358,6 +358,41 @@ class TimelineActivityCrudTests(APITestCase):
 
         self.assertFalse(TimelineActivity.objects.filter(title="Invalid reminder").exists())
 
+    def test_create_planner_is_pure_and_returns_canonical_scoped_references(self):
+        from trips.services import plan_timeline_activity_create
+
+        custom_type = TimelineCustomType.objects.create(
+            trip=self.trip,
+            name="Planner custom",
+            normalized_name="planner-custom",
+        )
+        activity_count = TimelineActivity.objects.filter(trip=self.trip).count()
+
+        plan = plan_timeline_activity_create(
+            trip=self.trip,
+            section_id=str(self.section.id),
+            data={
+                "title": "Pure planner activity",
+                "time_mode": "FLEXIBLE",
+                "custom_type_id": str(custom_type.id),
+                "assignee_user_id": str(self.member.id),
+            },
+        )
+
+        self.assertEqual(plan.section, self.section)
+        self.assertEqual(plan.data["custom_type_id"], str(custom_type.id))
+        self.assertEqual(plan.data["assignee_user_id"], str(self.member.id))
+        self.assertEqual(plan.data["assignee_scope"], "USER")
+        self.assertEqual(plan.final_data["custom_type_label"], "Planner custom")
+        self.assertEqual(
+            plan.final_data["assignee_label"],
+            self.member.display_name,
+        )
+        self.assertEqual(
+            TimelineActivity.objects.filter(trip=self.trip).count(),
+            activity_count,
+        )
+
     # -------- Patch --------
 
     def test_patch_title(self):
@@ -445,6 +480,34 @@ class TimelineActivityCrudTests(APITestCase):
         activity.refresh_from_db()
         self.assertIsNone(activity.start_time)
         self.assertIsNone(activity.end_time)
+
+    def test_patch_planner_is_pure_and_returns_canonical_transition_data(self):
+        from trips.services import plan_timeline_activity_patch
+
+        activity = make_timeline_activity(
+            trip=self.trip,
+            section=self.section,
+            time_mode="TIME_RANGE",
+        )
+        activity.start_time = time(8, 0)
+        activity.end_time = time(10, 0)
+        activity.save(update_fields=["start_time", "end_time"])
+
+        plan = plan_timeline_activity_patch(
+            trip=self.trip,
+            activity=activity,
+            data={"time_mode": "AT_TIME"},
+        )
+
+        self.assertEqual(plan.data["time_mode"], "AT_TIME")
+        self.assertIn("end_time", plan.data)
+        self.assertIsNone(plan.data["end_time"])
+        self.assertEqual(plan.final_time_mode, "AT_TIME")
+        self.assertEqual(plan.final_start_time, time(8, 0))
+        self.assertIsNone(plan.final_end_time)
+        activity.refresh_from_db()
+        self.assertEqual(activity.time_mode, "TIME_RANGE")
+        self.assertEqual(activity.end_time, time(10, 0))
 
     def test_patch_rejects_inactive_custom_type_assignment(self):
         activity = make_timeline_activity(trip=self.trip, section=self.section)

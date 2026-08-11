@@ -4,20 +4,28 @@ from django.db import transaction
 from django.utils import timezone
 
 from ai.action_types import (
+    AI_ACTION_EXPENSE_CREATE,
     AI_ACTION_TIMELINE_ACTIVITY_CREATE,
     AI_ACTION_TIMELINE_ACTIVITY_UPDATE,
 )
-from ai.agent.display import build_display
 from ai.agent.draft_fields import (
     build_missing_fields_for_action,
     normalize_missing_fields,
     normalize_missing_field_names,
 )
+from ai.agent.draft_presentation import build_action_draft_presentation
+from ai.agent.timeline_draft_validation import (
+    plan_timeline_create_draft,
+    plan_timeline_update_draft,
+)
 from ai.agent.drafts import (
     can_cancel_action_draft,
     can_edit_action_draft,
 )
-from ai.agent.draft_validation import validate_action_draft_patch_payload
+from ai.agent.draft_validation import (
+    AIActionDraftFieldValidationError,
+    validate_action_draft_patch_payload,
+)
 from ai.agent.executor import (
     AIActionDraftExpiredError,
     AIActionDraftForbiddenError,
@@ -123,7 +131,12 @@ def _disallowed_patch_fields(draft: AIActionDraft, patch_payload: dict) -> list[
     )
 
 
-def _refresh_missing_fields(draft: AIActionDraft, payload: dict) -> list[dict]:
+def _refresh_missing_fields(
+    draft: AIActionDraft,
+    payload: dict,
+    *,
+    currency_code: str,
+) -> list[dict]:
     current_missing_names = normalize_missing_field_names(
         draft.missing_fields,
         strict=False,
@@ -132,11 +145,13 @@ def _refresh_missing_fields(draft: AIActionDraft, payload: dict) -> list[dict]:
         action_type=draft.action_type,
         payload=payload,
         provider_missing_names=current_missing_names,
+        currency_code=currency_code,
     )
     return build_missing_fields_for_action(
         action_type=draft.action_type,
         payload=payload,
         missing=missing_names,
+        trip_id=draft.trip_id,
     )
 
 
@@ -172,6 +187,18 @@ def _expire_draft(*, draft: AIActionDraft, locked_trip: Trip) -> None:
     _touch_response_message(draft=draft, locked_trip=locked_trip)
 
 
+def _timeline_activity_preconditions(activity) -> dict:
+    return {
+        "target": {
+            "type": "timeline_activity",
+            "id": str(activity.id),
+            "updated_at": activity.updated_at.isoformat(),
+            "title": activity.title,
+            "status": activity.status,
+        }
+    }
+
+
 def patch_action_draft(
     *,
     draft_id,
@@ -194,6 +221,7 @@ def patch_action_draft(
         validate_action_draft_patch_payload(
             draft=draft,
             patch_payload=patch_payload,
+            currency_code=locked_trip.currency_code,
         )
 
         if (
@@ -224,37 +252,108 @@ def patch_action_draft(
             if next_payload == draft.payload:
                 return draft
 
-            still_missing = _refresh_missing_fields(draft, next_payload)
-            try:
-                next_preconditions = (
-                    build_backend_preconditions(
-                        action_type=draft.action_type,
-                        trip_id=draft.trip_id,
-                        payload=next_payload,
-                        required=not still_missing,
-                    )
-                    if action_requires_stale_precondition(draft.action_type)
-                    else {}
+            expense_currency_changed = (
+                draft.action_type == AI_ACTION_EXPENSE_CREATE
+                and next_payload.get("currency_code")
+                != locked_trip.currency_code
+            )
+            if draft.action_type == AI_ACTION_EXPENSE_CREATE:
+                # Expense persistence is trip-currency-only. A draft can wait
+                # for input while the trip currency changes, so restamp the
+                # locked authoritative value on every explicit edit.
+                next_payload["currency_code"] = locked_trip.currency_code
+
+            timeline_create_result = plan_timeline_create_draft(
+                action_type=draft.action_type,
+                trip=locked_trip,
+                payload=next_payload,
+                lock_section=True,
+            )
+            patched_field_names = set(patch_payload)
+            nested_patch = patch_payload.get("data")
+            if isinstance(nested_patch, dict):
+                patched_field_names.update(nested_patch)
+            blocking_create_errors = {
+                field: message
+                for field, message
+                in timeline_create_result.blocking_field_errors.items()
+                if field in patched_field_names
+            }
+            if blocking_create_errors:
+                raise AIActionDraftFieldValidationError(
+                    blocking_create_errors
                 )
+            next_payload = timeline_create_result.payload
+
+            timeline_result = plan_timeline_update_draft(
+                action_type=draft.action_type,
+                trip=locked_trip,
+                payload=next_payload,
+                lock_target=True,
+            )
+            if timeline_result.field_errors:
+                raise AIActionDraftFieldValidationError(
+                    timeline_result.field_errors
+                )
+            next_payload = timeline_result.payload
+
+            still_missing = _refresh_missing_fields(
+                draft,
+                next_payload,
+                currency_code=locked_trip.currency_code,
+            )
+            existing_missing_names = set(
+                normalize_missing_field_names(still_missing, strict=False)
+            )
+            create_planner_missing = [
+                field
+                for field in timeline_create_result.field_errors
+                if field not in existing_missing_names
+            ]
+            if create_planner_missing:
+                still_missing.extend(
+                    build_missing_fields_for_action(
+                        action_type=draft.action_type,
+                        payload=next_payload,
+                        missing=create_planner_missing,
+                        trip_id=draft.trip_id,
+                    )
+                )
+            try:
+                if timeline_result.activity is not None:
+                    next_preconditions = _timeline_activity_preconditions(
+                        timeline_result.activity
+                    )
+                else:
+                    next_preconditions = (
+                        build_backend_preconditions(
+                            action_type=draft.action_type,
+                            trip_id=draft.trip_id,
+                            payload=next_payload,
+                            required=not still_missing,
+                        )
+                        if action_requires_stale_precondition(draft.action_type)
+                        else {}
+                    )
             except ValueError as exc:
                 raise AIActionDraftTargetNotFoundError(
                     "Draft target could not be resolved."
                 ) from exc
-            draft.payload = next_payload
-            draft.preview = _build_patch_preview(
+            next_preview, next_display = build_action_draft_presentation(
                 action_type=draft.action_type,
                 payload=next_payload,
-            )
-            if not still_missing:
-                trip_context = {
-                    "timezone": locked_trip.timezone,
-                    "currency_code": locked_trip.currency_code,
-                }
-                draft.display = build_display(
+                trip=locked_trip,
+                preview_base=_build_patch_preview(
                     action_type=draft.action_type,
                     payload=next_payload,
-                    trip_context=trip_context,
-                )
+                ),
+                timeline_plan=timeline_result.plan,
+                timeline_create_plan=timeline_create_result.plan,
+            )
+            draft.payload = next_payload
+            draft.preview = next_preview
+            if not still_missing or expense_currency_changed:
+                draft.display = next_display
             draft.missing_fields = still_missing
             draft.preconditions = next_preconditions
             if not still_missing:
