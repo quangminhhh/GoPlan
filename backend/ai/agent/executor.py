@@ -53,9 +53,11 @@ from trips.models import (
     TimelineSection,
     Trip,
     TripMember,
+    TripStatus,
 )
 from trips.services import (
     TimelineSectionDateConflictError,
+    TripTerminalError,
     create_timeline_activity,
     create_timeline_day,
     delete_timeline_activity,
@@ -620,6 +622,8 @@ def mark_action_draft_failed(
             )
         except AIActionDraft.DoesNotExist:
             return None
+        if locked_trip.status in {TripStatus.COMPLETED, TripStatus.CANCELLED}:
+            return draft
         if draft.status != AIActionDraftStatus.READY:
             return draft
         draft.status = AIActionDraftStatus.FAILED
@@ -664,6 +668,8 @@ def confirm_action_draft(*, draft_id, trip_id, actor) -> AIActionDraft:
         draft.trip = locked_trip
         if draft.status == AIActionDraftStatus.CONFIRMED:
             return draft
+        if locked_trip.status in {TripStatus.COMPLETED, TripStatus.CANCELLED}:
+            raise TripTerminalError("Completed or cancelled trips are read-only.")
         if draft.status != AIActionDraftStatus.READY:
             raise AIActionDraftNotReadyError("Draft is not ready.")
         if draft.expires_at <= timezone.now():

@@ -869,7 +869,8 @@ class AIActionDraftSequenceAccessTests(APITestCase):
         response = self.client.post(self.cancel_url, {}, format="json")
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.data["error_code"], "AI_DRAFT_NOT_FOUND")
+        self.assertEqual(response.data["error_code"], "TRIP_NOT_FOUND")
+        self.assertEqual(response.data["detail"], "Trip not found.")
         self.trip.refresh_from_db()
         self.response_message.refresh_from_db()
         self.draft.refresh_from_db()

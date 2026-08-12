@@ -90,6 +90,14 @@ class AIActionDraftDetailAPIView(APIView):
     def get(self, request, trip_id, draft_id):
         try:
             ensure_user_can_access_trip_chat(request.user, trip_id)
+        except TripNotFoundError as exc:
+            return _error(
+                str(exc),
+                exc.error_code,
+                status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
             draft = _get_draft_or_404(trip_id=trip_id, draft_id=draft_id)
         except TripNotFoundError:
             return _error(
@@ -108,10 +116,10 @@ class AIActionDraftDetailAPIView(APIView):
 
         try:
             ensure_user_can_access_trip_chat(request.user, trip_id)
-        except TripNotFoundError:
+        except TripNotFoundError as exc:
             return _error(
-                "Draft not found.",
-                "AI_DRAFT_NOT_FOUND",
+                str(exc),
+                exc.error_code,
                 status.HTTP_404_NOT_FOUND,
             )
 
@@ -142,6 +150,8 @@ class AIActionDraftDetailAPIView(APIView):
         except AIActionDraftForbiddenError as exc:
             return _error(str(exc), exc.error_code, status.HTTP_403_FORBIDDEN)
         except AIActionDraftNotReadyError as exc:
+            return _error(str(exc), exc.error_code, status.HTTP_409_CONFLICT)
+        except TripTerminalError as exc:
             return _error(str(exc), exc.error_code, status.HTTP_409_CONFLICT)
         except AIActionDraftPatchFieldNotAllowedError as exc:
             return _error(str(exc), exc.error_code, status.HTTP_400_BAD_REQUEST)
@@ -175,10 +185,10 @@ class AIActionDraftCancelAPIView(APIView):
     def post(self, request, trip_id, draft_id):
         try:
             ensure_user_can_access_trip_chat(request.user, trip_id)
-        except TripNotFoundError:
+        except TripNotFoundError as exc:
             return _error(
-                "Draft not found.",
-                "AI_DRAFT_NOT_FOUND",
+                str(exc),
+                exc.error_code,
                 status.HTTP_404_NOT_FOUND,
             )
 
@@ -212,6 +222,8 @@ class AIActionDraftCancelAPIView(APIView):
                 exc.error_code,
                 status.HTTP_403_FORBIDDEN,
             )
+        except TripTerminalError as exc:
+            return _error(str(exc), exc.error_code, status.HTTP_409_CONFLICT)
 
         return Response({"draft": build_action_draft_payload(draft, viewer=request.user)})
 
@@ -344,6 +356,7 @@ def _should_persist_confirm_failure(exc: Exception) -> bool:
             AIActionDraft.DoesNotExist,
             OperationalError,
             TransferNotSentError,
+            TripTerminalError,
         ),
     )
 
@@ -372,6 +385,14 @@ class AIActionDraftConfirmAPIView(APIView):
     def post(self, request, trip_id, draft_id):
         try:
             ensure_user_can_access_trip_chat(request.user, trip_id)
+        except TripNotFoundError as exc:
+            return _error(
+                str(exc),
+                exc.error_code,
+                status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
             draft = confirm_action_draft(
                 draft_id=draft_id,
                 trip_id=trip_id,

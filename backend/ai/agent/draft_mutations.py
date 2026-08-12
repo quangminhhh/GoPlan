@@ -46,7 +46,8 @@ from ai.chat_changes import (
     mark_ai_response_message_changed,
 )
 from ai.models import AIActionDraft, AIActionDraftStatus
-from trips.models import Trip, TripMember
+from trips.models import Trip, TripMember, TripStatus
+from trips.services import TripTerminalError
 
 
 class AIActionDraftPatchFieldNotAllowedError(Exception):
@@ -196,6 +197,11 @@ def _touch_response_message(*, draft: AIActionDraft, locked_trip: Trip) -> None:
     )
 
 
+def _ensure_locked_trip_allows_draft_mutation(locked_trip: Trip) -> None:
+    if locked_trip.status in {TripStatus.COMPLETED, TripStatus.CANCELLED}:
+        raise TripTerminalError("Completed or cancelled trips are read-only.")
+
+
 def _expire_draft(*, draft: AIActionDraft, locked_trip: Trip) -> None:
     draft.status = AIActionDraftStatus.EXPIRED
     draft.save(update_fields=["status", "updated_at"])
@@ -228,6 +234,7 @@ def patch_action_draft(
             locked_trip=locked_trip,
             actor=actor,
         )
+        _ensure_locked_trip_allows_draft_mutation(locked_trip)
         draft = (
             AIActionDraft.objects.select_for_update(of=("self",))
             .select_related("response_message")
@@ -412,6 +419,15 @@ def cancel_action_draft(*, draft_id, trip_id, actor) -> AIActionDraft:
             .get(pk=draft_id, trip_id=trip_id)
         )
 
+        if draft.status in {
+            AIActionDraftStatus.CONFIRMED,
+            AIActionDraftStatus.CANCELLED,
+            AIActionDraftStatus.EXPIRED,
+            AIActionDraftStatus.FAILED,
+        }:
+            return draft
+        _ensure_locked_trip_allows_draft_mutation(locked_trip)
+
         if (
             draft.status in {
                 AIActionDraftStatus.NEEDS_INFO,
@@ -421,13 +437,6 @@ def cancel_action_draft(*, draft_id, trip_id, actor) -> AIActionDraft:
         ):
             _expire_draft(draft=draft, locked_trip=locked_trip)
             expired = True
-        elif draft.status in {
-            AIActionDraftStatus.CONFIRMED,
-            AIActionDraftStatus.CANCELLED,
-            AIActionDraftStatus.EXPIRED,
-            AIActionDraftStatus.FAILED,
-        }:
-            return draft
         elif not can_cancel_action_draft(draft, viewer=actor):
             raise AIActionDraftForbiddenError("You cannot cancel this draft.")
         else:

@@ -37,6 +37,7 @@ from trips.models import (
     TimelineActivityStatus,
     TripMember,
     TripRole,
+    TripStatus,
 )
 from trips.services import create_trip
 
@@ -393,6 +394,137 @@ class AIActionDraftAPITests(APITestCase, AIActionDraftModelTests):
     def _cancel_url(self, draft_id):
         return f"/api/trips/{self.trip.id}/ai/action-drafts/{draft_id}/cancel"
 
+    def _request_draft_route(self, operation, *, trip_id, draft_id):
+        detail_url = f"/api/trips/{trip_id}/ai/action-drafts/{draft_id}"
+        if operation == "get":
+            return self.client.get(detail_url)
+        if operation == "patch":
+            return self.client.patch(
+                detail_url,
+                {"payload": {}},
+                format="json",
+            )
+        return self.client.post(f"{detail_url}/{operation}")
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_draft_routes_preserve_trip_not_found_access_authority(
+        self,
+        push_chat_message,
+    ):
+        draft = AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            requested_by=self.user,
+            action_type="expense.create",
+            status=AIActionDraftStatus.READY,
+            required_confirmation="CAPTAIN",
+            payload={"title": "Dinner"},
+            preview={"title": "Dinner"},
+            missing_fields=[],
+            preconditions={},
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+        outsider = create_completed_user(
+            "draft-route-outsider@example.com",
+            "draftrouteoutsider",
+            "DRO001",
+        )
+        draft_snapshot = AIActionDraft.objects.filter(pk=draft.id).values().get()
+        self.response_message.refresh_from_db()
+        self.trip.refresh_from_db()
+        message_updated_at = self.response_message.updated_at
+        message_sequence = self.response_message.change_sequence
+        trip_sequence = self.trip.chat_change_sequence
+        self.client.force_authenticate(outsider)
+
+        access_cases = {
+            "nonmember": self.trip.id,
+            "missing_trip": uuid4(),
+        }
+        for access_case, trip_id in access_cases.items():
+            for operation in ("get", "patch", "cancel", "confirm"):
+                with self.subTest(
+                    access_case=access_case,
+                    operation=operation,
+                ):
+                    with self.captureOnCommitCallbacks(execute=False) as callbacks:
+                        response = self._request_draft_route(
+                            operation,
+                            trip_id=trip_id,
+                            draft_id=draft.id,
+                        )
+
+                    self.assertEqual(response.status_code, 404)
+                    self.assertEqual(
+                        response.data,
+                        {
+                            "detail": "Trip not found.",
+                            "error_code": "TRIP_NOT_FOUND",
+                        },
+                    )
+                    self.assertEqual(
+                        AIActionDraft.objects.filter(pk=draft.id).values().get(),
+                        draft_snapshot,
+                    )
+                    self.response_message.refresh_from_db()
+                    self.trip.refresh_from_db()
+                    self.assertEqual(
+                        self.response_message.updated_at,
+                        message_updated_at,
+                    )
+                    self.assertEqual(
+                        self.response_message.change_sequence,
+                        message_sequence,
+                    )
+                    self.assertEqual(self.trip.chat_change_sequence, trip_sequence)
+                    self.assertEqual(callbacks, [])
+                    push_chat_message.assert_not_called()
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_draft_routes_keep_missing_draft_contract_for_active_member(
+        self,
+        push_chat_message,
+    ):
+        self.client.force_authenticate(self.user)
+        missing_draft_id = uuid4()
+        self.response_message.refresh_from_db()
+        self.trip.refresh_from_db()
+        message_updated_at = self.response_message.updated_at
+        message_sequence = self.response_message.change_sequence
+        trip_sequence = self.trip.chat_change_sequence
+
+        for operation in ("get", "patch", "cancel", "confirm"):
+            with self.subTest(operation=operation):
+                with self.captureOnCommitCallbacks(execute=False) as callbacks:
+                    response = self._request_draft_route(
+                        operation,
+                        trip_id=self.trip.id,
+                        draft_id=missing_draft_id,
+                    )
+
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(
+                    response.data,
+                    {
+                        "detail": "Draft not found.",
+                        "error_code": "AI_DRAFT_NOT_FOUND",
+                    },
+                )
+                self.assertFalse(
+                    AIActionDraft.objects.filter(pk=missing_draft_id).exists()
+                )
+                self.response_message.refresh_from_db()
+                self.trip.refresh_from_db()
+                self.assertEqual(self.response_message.updated_at, message_updated_at)
+                self.assertEqual(
+                    self.response_message.change_sequence,
+                    message_sequence,
+                )
+                self.assertEqual(self.trip.chat_change_sequence, trip_sequence)
+                self.assertEqual(callbacks, [])
+                push_chat_message.assert_not_called()
+
     def test_action_draft_detail_exposes_display_and_summary(self):
         self.client.force_authenticate(self.user)
         display_value = {
@@ -472,6 +604,224 @@ class AIActionDraftAPITests(APITestCase, AIActionDraftModelTests):
         draft.refresh_from_db()
         self.assertEqual(draft.status, AIActionDraftStatus.CANCELLED)
         self.assertEqual(draft.cancelled_by_id, self.user.id)
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_terminal_trip_rejects_cancel_without_mutating_draft(
+        self,
+        push_chat_message,
+    ):
+        self.client.force_authenticate(self.user)
+        draft = AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            requested_by=self.user,
+            action_type="expense.create",
+            status=AIActionDraftStatus.READY,
+            required_confirmation="CAPTAIN",
+            payload={"title": "Dinner"},
+            preview={"title": "Dinner"},
+            missing_fields=[],
+            preconditions={},
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+
+        for terminal_status in (TripStatus.COMPLETED, TripStatus.CANCELLED):
+            with self.subTest(trip_status=terminal_status):
+                self.trip.status = terminal_status
+                self.trip.save(update_fields=["status"])
+                draft.refresh_from_db()
+                self.response_message.refresh_from_db()
+                self.trip.refresh_from_db()
+                draft_updated_at = draft.updated_at
+                message_updated_at = self.response_message.updated_at
+                trip_sequence = self.trip.chat_change_sequence
+                message_sequence = self.response_message.change_sequence
+
+                with self.captureOnCommitCallbacks(execute=False) as callbacks:
+                    response = self.client.post(self._cancel_url(draft.id))
+
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(
+                    response.data,
+                    {
+                        "detail": "Completed or cancelled trips are read-only.",
+                        "error_code": "TRIP_TERMINAL",
+                    },
+                )
+                draft.refresh_from_db()
+                self.response_message.refresh_from_db()
+                self.trip.refresh_from_db()
+                self.assertEqual(draft.status, AIActionDraftStatus.READY)
+                self.assertIsNone(draft.cancelled_by_id)
+                self.assertIsNone(draft.cancelled_at)
+                self.assertEqual(draft.updated_at, draft_updated_at)
+                self.assertEqual(self.response_message.updated_at, message_updated_at)
+                self.assertEqual(self.trip.chat_change_sequence, trip_sequence)
+                self.assertEqual(
+                    self.response_message.change_sequence,
+                    message_sequence,
+                )
+                self.assertEqual(callbacks, [])
+                push_chat_message.assert_not_called()
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_terminal_trip_keeps_final_cancel_replays_idempotent(
+        self,
+        push_chat_message,
+    ):
+        self.client.force_authenticate(self.user)
+        final_status_fields = {
+            AIActionDraftStatus.CONFIRMED: {
+                "confirmed_by": self.user,
+                "confirmed_at": timezone.now(),
+                "result": {"object_type": "expense", "object_id": "existing"},
+            },
+            AIActionDraftStatus.CANCELLED: {
+                "cancelled_by": self.user,
+                "cancelled_at": timezone.now(),
+            },
+            AIActionDraftStatus.EXPIRED: {},
+            AIActionDraftStatus.FAILED: {
+                "error_code": "AI_DRAFT_STALE",
+                "error_detail": "Target changed.",
+            },
+        }
+
+        for terminal_status in (TripStatus.COMPLETED, TripStatus.CANCELLED):
+            for draft_status, status_fields in final_status_fields.items():
+                with self.subTest(
+                    trip_status=terminal_status,
+                    draft_status=draft_status,
+                ):
+                    self.trip.status = terminal_status
+                    self.trip.save(update_fields=["status"])
+                    draft = AIActionDraft.objects.create(
+                        trip=self.trip,
+                        interaction=self.interaction,
+                        response_message=self.response_message,
+                        requested_by=self.user,
+                        action_type="expense.create",
+                        status=draft_status,
+                        required_confirmation="CAPTAIN",
+                        payload={"title": "Dinner"},
+                        preview={"title": "Dinner"},
+                        missing_fields=[],
+                        preconditions={},
+                        expires_at=timezone.now() + timedelta(hours=24),
+                        **status_fields,
+                    )
+                    draft_snapshot = AIActionDraft.objects.filter(pk=draft.id).values(
+                        "status",
+                        "result",
+                        "error_code",
+                        "error_detail",
+                        "confirmed_by_id",
+                        "confirmed_at",
+                        "cancelled_by_id",
+                        "cancelled_at",
+                        "updated_at",
+                    ).get()
+                    self.response_message.refresh_from_db()
+                    self.trip.refresh_from_db()
+                    message_updated_at = self.response_message.updated_at
+                    message_sequence = self.response_message.change_sequence
+                    trip_sequence = self.trip.chat_change_sequence
+                    expected_response = {
+                        "draft": build_action_draft_payload(
+                            draft,
+                            viewer=self.user,
+                        )
+                    }
+                    push_chat_message.reset_mock()
+
+                    with self.captureOnCommitCallbacks(execute=False) as callbacks:
+                        response = self.client.post(self._cancel_url(draft.id))
+
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.data, expected_response)
+                    self.assertEqual(
+                        AIActionDraft.objects.filter(pk=draft.id).values(
+                            "status",
+                            "result",
+                            "error_code",
+                            "error_detail",
+                            "confirmed_by_id",
+                            "confirmed_at",
+                            "cancelled_by_id",
+                            "cancelled_at",
+                            "updated_at",
+                        ).get(),
+                        draft_snapshot,
+                    )
+                    self.response_message.refresh_from_db()
+                    self.trip.refresh_from_db()
+                    self.assertEqual(self.response_message.updated_at, message_updated_at)
+                    self.assertEqual(
+                        self.response_message.change_sequence,
+                        message_sequence,
+                    )
+                    self.assertEqual(self.trip.chat_change_sequence, trip_sequence)
+                    self.assertEqual(callbacks, [])
+                    push_chat_message.assert_not_called()
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_terminal_final_cancel_replay_still_requires_active_membership(
+        self,
+        push_chat_message,
+    ):
+        outsider = create_completed_user(
+            "draft-cancel-outsider@example.com",
+            "draftcanceloutsider",
+            "DCO001",
+        )
+        self.trip.status = TripStatus.COMPLETED
+        self.trip.save(update_fields=["status"])
+        draft = AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            requested_by=self.user,
+            action_type="expense.create",
+            status=AIActionDraftStatus.CANCELLED,
+            required_confirmation="CAPTAIN",
+            payload={"title": "Dinner"},
+            preview={"title": "Dinner"},
+            missing_fields=[],
+            preconditions={},
+            expires_at=timezone.now() + timedelta(hours=24),
+            cancelled_by=self.user,
+            cancelled_at=timezone.now(),
+        )
+        draft_updated_at = draft.updated_at
+        self.response_message.refresh_from_db()
+        self.trip.refresh_from_db()
+        message_updated_at = self.response_message.updated_at
+        message_sequence = self.response_message.change_sequence
+        trip_sequence = self.trip.chat_change_sequence
+        self.client.force_authenticate(outsider)
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.post(self._cancel_url(draft.id))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            response.data,
+            {
+                "detail": "Trip not found.",
+                "error_code": "TRIP_NOT_FOUND",
+            },
+        )
+        draft.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.CANCELLED)
+        self.assertEqual(draft.updated_at, draft_updated_at)
+        self.assertEqual(self.response_message.updated_at, message_updated_at)
+        self.assertEqual(self.response_message.change_sequence, message_sequence)
+        self.assertEqual(self.trip.chat_change_sequence, trip_sequence)
+        self.assertEqual(callbacks, [])
+        push_chat_message.assert_not_called()
 
     @patch("ai.chat_changes.push_chat_message")
     def test_cancel_expired_draft_marks_expired_and_returns_conflict(self, push_chat_message):
@@ -771,6 +1121,57 @@ class AIActionDraftPatchTests(APITestCase, AIActionDraftModelTests):
         self.assertEqual(self.trip.chat_change_sequence, original_trip_sequence)
         self.assertEqual(callbacks, [])
         push_chat_message.assert_not_called()
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_terminal_trip_rejects_patch_without_mutating_draft(
+        self,
+        push_chat_message,
+    ):
+        self.client.force_authenticate(self.user)
+        draft = self._create_patch_draft()
+
+        for terminal_status in (TripStatus.COMPLETED, TripStatus.CANCELLED):
+            with self.subTest(trip_status=terminal_status):
+                self.trip.status = terminal_status
+                self.trip.save(update_fields=["status"])
+                draft.refresh_from_db()
+                self.response_message.refresh_from_db()
+                self.trip.refresh_from_db()
+                original_payload = dict(draft.payload)
+                draft_updated_at = draft.updated_at
+                message_updated_at = self.response_message.updated_at
+                trip_sequence = self.trip.chat_change_sequence
+                message_sequence = self.response_message.change_sequence
+
+                with self.captureOnCommitCallbacks(execute=False) as callbacks:
+                    response = self.client.patch(
+                        f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                        {"payload": {"total_amount": "500000"}},
+                        format="json",
+                    )
+
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(
+                    response.data,
+                    {
+                        "detail": "Completed or cancelled trips are read-only.",
+                        "error_code": "TRIP_TERMINAL",
+                    },
+                )
+                draft.refresh_from_db()
+                self.response_message.refresh_from_db()
+                self.trip.refresh_from_db()
+                self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+                self.assertEqual(draft.payload, original_payload)
+                self.assertEqual(draft.updated_at, draft_updated_at)
+                self.assertEqual(self.response_message.updated_at, message_updated_at)
+                self.assertEqual(self.trip.chat_change_sequence, trip_sequence)
+                self.assertEqual(
+                    self.response_message.change_sequence,
+                    message_sequence,
+                )
+                self.assertEqual(callbacks, [])
+                push_chat_message.assert_not_called()
 
     @patch("ai.chat_changes.push_chat_message")
     def test_patch_with_absent_payload_is_a_true_noop(self, push_chat_message):
