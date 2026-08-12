@@ -1,6 +1,7 @@
 const mockUseSession = jest.fn();
 const mockUnreadCount = jest.fn();
 const mockLastKnownUnreadCount = jest.fn();
+const mockNotificationItems = jest.fn();
 const mockTabsScreen = jest.fn();
 
 jest.mock('expo-router', () => {
@@ -23,6 +24,7 @@ jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
 jest.mock('@/features/auth/session', () => ({ useSession: () => mockUseSession() }));
 jest.mock('../application/NotificationsProvider', () => ({
   useNotifications: () => ({
+    items: mockNotificationItems(),
     unreadCount: mockUnreadCount(),
     lastKnownUnreadCount: mockLastKnownUnreadCount(),
   }),
@@ -50,6 +52,7 @@ describe('TabsLayout notifications integration', () => {
       user: { id: 'user-1', requires_profile_setup: false },
     });
     mockLastKnownUnreadCount.mockReturnValue(null);
+    mockNotificationItems.mockReturnValue([]);
   });
 
   it('caps a large unread badge from the root-owned provider', async () => {
@@ -73,5 +76,23 @@ describe('TabsLayout notifications integration', () => {
     await render(<TabsLayout />);
 
     expect(notificationsOptions().tabBarBadge).toBe('•');
+  });
+
+  it('shows a degraded dot for a loaded unread row when count reconciliation is unavailable', async () => {
+    mockUnreadCount.mockReturnValue(null);
+    mockLastKnownUnreadCount.mockReturnValue(0);
+    mockNotificationItems.mockReturnValue([{ id: 'notification-1', is_read: false }]);
+    await render(<TabsLayout />);
+
+    expect(notificationsOptions().tabBarBadge).toBe('•');
+  });
+
+  it('hides the degraded badge when the unknown count has only loaded read rows', async () => {
+    mockUnreadCount.mockReturnValue(null);
+    mockLastKnownUnreadCount.mockReturnValue(0);
+    mockNotificationItems.mockReturnValue([{ id: 'notification-1', is_read: true }]);
+    await render(<TabsLayout />);
+
+    expect(notificationsOptions().tabBarBadge).toBeUndefined();
   });
 });

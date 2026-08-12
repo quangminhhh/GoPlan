@@ -376,6 +376,51 @@ describe('NotificationsProvider', () => {
     await waitFor(() => expect(rendered.result.current.unreadCount).toBe(0));
   });
 
+  it('invalidates zero when a pending load-more appends an unread row outside the count snapshot', async () => {
+    const loadedAfterCountStarted = {
+      ...notification,
+      id: 'notification-loaded-after-count-started',
+    };
+    const rendered = await renderLoaded([notification], 'next-cursor');
+    const pendingLoadMore = deferred<NotificationPage>();
+    const pendingCount = deferred<number>();
+    mockList.mockReturnValueOnce(pendingLoadMore.promise);
+
+    let loadMorePromise!: Promise<void>;
+    await act(() => {
+      loadMorePromise = rendered.result.current.loadMore();
+    });
+    await waitFor(() => expect(mockList).toHaveBeenCalledTimes(2));
+
+    mockGetUnread.mockReset();
+    mockGetUnread.mockReturnValueOnce(pendingCount.promise);
+    await act(() => {
+      emitRealtime({
+        type: 'notification',
+        event: 'read',
+        notification_ids: ['notification-not-loaded'],
+      });
+    });
+    await waitFor(() => expect(mockGetUnread).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      pendingCount.resolve(0);
+      await pendingCount.promise;
+    });
+    await waitFor(() => expect(rendered.result.current.unreadCount).toBe(0));
+
+    await act(async () => {
+      pendingLoadMore.resolve(page([loadedAfterCountStarted]));
+      await loadMorePromise;
+    });
+
+    expect(
+      rendered.result.current.items.find(
+        (item) => item.id === loadedAfterCountStarted.id,
+      )?.is_read,
+    ).toBe(false);
+    expect(rendered.result.current.unreadCount).toBeNull();
+  });
+
   it('retains the last known unread signal when an unknown-id reconciliation fails', async () => {
     mockGetUnread.mockResolvedValue(5);
     const rendered = await renderLoaded();
@@ -422,6 +467,75 @@ describe('NotificationsProvider', () => {
     expect(rendered.result.current.unreadCount).toBe(0);
   });
 
+  it('discards stale load-more on read_all and reconciles a missed post-barrier created push', async () => {
+    const unloaded = { ...notification, id: 'notification-unloaded' };
+    const createdAfterReadAll = {
+      ...notification,
+      id: 'notification-created-after-read-all',
+    };
+    mockGetUnread.mockResolvedValue(2);
+    const rendered = await renderLoaded([notification], 'next-cursor');
+    const staleLoadMore = deferred<NotificationPage>();
+    mockList.mockReturnValueOnce(staleLoadMore.promise);
+
+    let loadMorePromise!: Promise<void>;
+    await act(() => {
+      loadMorePromise = rendered.result.current.loadMore();
+    });
+    await waitFor(() => expect(mockList).toHaveBeenCalledTimes(2));
+    mockGetUnread.mockResolvedValue(1);
+    mockList.mockResolvedValueOnce(page([createdAfterReadAll]));
+
+    await act(() => {
+      emitRealtime({ type: 'notification', event: 'read_all' });
+    });
+    await waitFor(() => expect(mockList).toHaveBeenCalledTimes(3));
+    await act(async () => {
+      staleLoadMore.resolve(page([unloaded, createdAfterReadAll]));
+      await loadMorePromise;
+    });
+
+    expect(rendered.result.current.items.some((item) => item.id === unloaded.id)).toBe(
+      false,
+    );
+    expect(
+      rendered.result.current.items.find(
+        (item) => item.id === createdAfterReadAll.id,
+      )?.is_read,
+    ).toBe(false);
+    await waitFor(() => expect(rendered.result.current.unreadCount).toBe(1));
+  });
+
+  it('discards a stale first page on read_all and keeps a missed post-barrier notification unread', async () => {
+    const createdAfterReadAll = {
+      ...notification,
+      id: 'notification-created-after-read-all',
+    };
+    mockGetUnread.mockResolvedValue(1);
+    const rendered = await renderLoaded();
+    const staleRefresh = deferred<NotificationPage>();
+    mockList.mockReturnValueOnce(staleRefresh.promise);
+
+    let staleRefreshPromise!: Promise<void>;
+    await act(() => {
+      staleRefreshPromise = rendered.result.current.refreshForFocus();
+    });
+    await waitFor(() => expect(mockList).toHaveBeenCalledTimes(2));
+    mockList.mockResolvedValueOnce(page([createdAfterReadAll]));
+
+    await act(() => {
+      emitRealtime({ type: 'notification', event: 'read_all' });
+    });
+    await waitFor(() => expect(mockList).toHaveBeenCalledTimes(3));
+    await act(async () => {
+      staleRefresh.resolve(page([notification, createdAfterReadAll]));
+      await staleRefreshPromise;
+    });
+
+    expect(rendered.result.current.items).toEqual([createdAfterReadAll]);
+    expect(rendered.result.current.items[0]?.is_read).toBe(false);
+  });
+
   it('does not let a REST read-all completion mark a notification created after its realtime echo', async () => {
     const rendered = await renderLoaded();
     const pendingMarkAll = deferred<number>();
@@ -456,6 +570,473 @@ describe('NotificationsProvider', () => {
       rendered.result.current.items.find((item) => item.id === 'notification-after-read-all')?.is_read,
     ).toBe(false);
     expect(rendered.result.current.unreadCount).toBe(1);
+  });
+
+  it('uses the REST updated count when count reconciliation fails and preserves a later created push', async () => {
+    const createdAfterRequest = {
+      ...notification,
+      id: 'notification-created-after-request',
+    };
+    mockGetUnread.mockResolvedValue(2);
+    const rendered = await renderLoaded();
+    const pendingMarkAll = deferred<number>();
+    mockMarkAll.mockReturnValueOnce(pendingMarkAll.promise);
+
+    let markAllPromise!: Promise<boolean>;
+    await act(() => {
+      markAllPromise = rendered.result.current.markAllRead();
+    });
+    await waitFor(() => expect(mockMarkAll).toHaveBeenCalledTimes(1));
+
+    mockGetUnread.mockResolvedValue(3);
+    await act(() => {
+      emitRealtime({
+        type: 'notification',
+        event: 'created',
+        notification: createdAfterRequest,
+      });
+    });
+    await waitFor(() => expect(rendered.result.current.unreadCount).toBe(3));
+
+    mockGetUnread.mockRejectedValueOnce(
+      axiosErrorWith(503, { detail: 'Count unavailable.' }),
+    );
+    mockList.mockResolvedValueOnce(
+      page([
+        createdAfterRequest,
+        { ...notification, is_read: true, read_at: '2026-08-09T02:00:00Z' },
+      ]),
+    );
+    await act(async () => {
+      pendingMarkAll.resolve(2);
+      await markAllPromise;
+    });
+
+    expect(rendered.result.current.items.find((item) => item.id === notification.id)?.is_read).toBe(true);
+    expect(
+      rendered.result.current.items.find((item) => item.id === createdAfterRequest.id)
+        ?.is_read,
+    ).toBe(false);
+    expect(rendered.result.current.unreadCount).toBe(1);
+  });
+
+  it('invalidates an ambiguous two-client read-all badge when count reconciliation fails', async () => {
+    const second = { ...notification, id: 'notification-2' };
+    const createdBetweenReadAlls = {
+      ...notification,
+      id: 'notification-created-between-read-alls',
+    };
+    mockGetUnread.mockResolvedValue(2);
+    const rendered = await renderLoaded([notification, second]);
+    const pendingMarkAll = deferred<number>();
+    mockMarkAll.mockReturnValueOnce(pendingMarkAll.promise);
+
+    let markAllPromise!: Promise<boolean>;
+    await act(() => {
+      markAllPromise = rendered.result.current.markAllRead();
+    });
+    await waitFor(() => expect(mockMarkAll).toHaveBeenCalledTimes(1));
+
+    mockGetUnread.mockResolvedValueOnce(0).mockResolvedValueOnce(1);
+    mockList.mockResolvedValueOnce(page([createdBetweenReadAlls]));
+    await act(() => {
+      emitRealtime({ type: 'notification', event: 'read_all' });
+    });
+    await waitFor(() => expect(rendered.result.current.unreadCount).toBeNull());
+    await act(() => {
+      emitRealtime({
+        type: 'notification',
+        event: 'created',
+        notification: createdBetweenReadAlls,
+      });
+    });
+    await waitFor(() => expect(rendered.result.current.unreadCount).toBe(1));
+
+    mockGetUnread.mockRejectedValueOnce(
+      axiosErrorWith(503, { detail: 'Count unavailable.' }),
+    );
+    mockList.mockResolvedValueOnce(
+      page([
+        {
+          ...createdBetweenReadAlls,
+          is_read: true,
+          read_at: '2026-08-09T02:00:00Z',
+        },
+      ]),
+    );
+    await act(async () => {
+      pendingMarkAll.resolve(1);
+      await markAllPromise;
+    });
+
+    expect(rendered.result.current.items[0]?.is_read).toBe(true);
+    expect(rendered.result.current.unreadCount).toBeNull();
+    expect(rendered.result.current.lastKnownUnreadCount).toBe(1);
+  });
+
+  it('does not subtract a positive own-echo delta from a later unread notification', async () => {
+    const createdAfterEcho = {
+      ...notification,
+      id: 'notification-created-after-own-echo',
+    };
+    mockGetUnread.mockResolvedValue(1);
+    const rendered = await renderLoaded();
+    const pendingMarkAll = deferred<number>();
+    mockMarkAll.mockReturnValueOnce(pendingMarkAll.promise);
+
+    let markAllPromise!: Promise<boolean>;
+    await act(() => {
+      markAllPromise = rendered.result.current.markAllRead();
+    });
+    await waitFor(() => expect(mockMarkAll).toHaveBeenCalledTimes(1));
+
+    mockGetUnread.mockResolvedValueOnce(0).mockResolvedValueOnce(1);
+    mockList.mockResolvedValueOnce(page([createdAfterEcho]));
+    await act(() => {
+      emitRealtime({ type: 'notification', event: 'read_all' });
+    });
+    await act(() => {
+      emitRealtime({
+        type: 'notification',
+        event: 'created',
+        notification: createdAfterEcho,
+      });
+    });
+    await waitFor(() => expect(rendered.result.current.unreadCount).toBe(1));
+
+    mockGetUnread.mockRejectedValueOnce(
+      axiosErrorWith(503, { detail: 'Count unavailable.' }),
+    );
+    mockList.mockResolvedValueOnce(page([createdAfterEcho]));
+    await act(async () => {
+      pendingMarkAll.resolve(1);
+      await markAllPromise;
+    });
+
+    expect(rendered.result.current.items[0]?.is_read).toBe(false);
+    expect(rendered.result.current.unreadCount).toBeNull();
+    expect(rendered.result.current.lastKnownUnreadCount).toBe(1);
+  });
+
+  it('invalidates an ambiguous zero delta when a post-mutation unread push was missed', async () => {
+    const createdAfterMutation = {
+      ...notification,
+      id: 'notification-created-after-mutation',
+    };
+    mockGetUnread.mockResolvedValue(1);
+    const rendered = await renderLoaded();
+    const pendingMarkAll = deferred<number>();
+    mockMarkAll.mockReturnValueOnce(pendingMarkAll.promise);
+
+    let markAllPromise!: Promise<boolean>;
+    await act(() => {
+      markAllPromise = rendered.result.current.markAllRead();
+    });
+    await waitFor(() => expect(mockMarkAll).toHaveBeenCalledTimes(1));
+
+    mockGetUnread.mockResolvedValueOnce(0);
+    mockList.mockResolvedValueOnce(page([]));
+    await act(() => {
+      emitRealtime({ type: 'notification', event: 'read_all' });
+    });
+    await waitFor(() => expect(rendered.result.current.unreadCount).toBe(0));
+
+    mockGetUnread.mockRejectedValueOnce(
+      axiosErrorWith(503, { detail: 'Count unavailable.' }),
+    );
+    mockList.mockResolvedValueOnce(page([createdAfterMutation]));
+    await act(async () => {
+      pendingMarkAll.resolve(0);
+      await markAllPromise;
+    });
+
+    expect(rendered.result.current.items).toEqual([createdAfterMutation]);
+    expect(rendered.result.current.items[0]?.is_read).toBe(false);
+    expect(rendered.result.current.unreadCount).toBeNull();
+    expect(rendered.result.current.lastKnownUnreadCount).toBe(0);
+  });
+
+  it('invalidates a non-ambiguous zero badge below the refreshed unread rows', async () => {
+    const createdAfterMutation = {
+      ...notification,
+      id: 'notification-created-after-mutation',
+    };
+    mockGetUnread.mockResolvedValue(0);
+    const rendered = await renderLoaded([notification]);
+    const pendingMarkAll = deferred<number>();
+    mockMarkAll.mockReturnValueOnce(pendingMarkAll.promise);
+
+    let markAllPromise!: Promise<boolean>;
+    await act(() => {
+      markAllPromise = rendered.result.current.markAllRead();
+    });
+    await waitFor(() => expect(mockMarkAll).toHaveBeenCalledTimes(1));
+
+    mockGetUnread.mockRejectedValueOnce(
+      axiosErrorWith(503, { detail: 'Count unavailable.' }),
+    );
+    mockList.mockResolvedValueOnce(page([createdAfterMutation]));
+    await act(async () => {
+      pendingMarkAll.resolve(0);
+      await markAllPromise;
+    });
+
+    expect(rendered.result.current.items).toEqual([createdAfterMutation]);
+    expect(rendered.result.current.items[0]?.is_read).toBe(false);
+    expect(rendered.result.current.unreadCount).toBeNull();
+    expect(rendered.result.current.lastKnownUnreadCount).toBe(0);
+  });
+
+  it('uses a trailing zero count to correct a delayed created envelope already read by mark-all', async () => {
+    const delayedCreated = {
+      ...notification,
+      id: 'notification-created-before-mark-all',
+    };
+    mockGetUnread.mockResolvedValue(1);
+    const rendered = await renderLoaded([notification]);
+    const pendingMarkAll = deferred<number>();
+    mockMarkAll.mockReturnValueOnce(pendingMarkAll.promise);
+
+    let markAllPromise!: Promise<boolean>;
+    await act(() => {
+      markAllPromise = rendered.result.current.markAllRead();
+    });
+    await waitFor(() => expect(mockMarkAll).toHaveBeenCalledTimes(1));
+
+    mockList.mockRejectedValueOnce(
+      axiosErrorWith(503, { detail: 'Notifications are temporarily unavailable.' }),
+    );
+    mockGetUnread.mockReset();
+    mockGetUnread.mockResolvedValueOnce(0).mockResolvedValueOnce(0);
+    await act(async () => {
+      pendingMarkAll.resolve(2);
+      await markAllPromise;
+    });
+    expect(rendered.result.current.unreadCount).toBe(0);
+
+    await act(() => {
+      emitRealtime({
+        type: 'notification',
+        event: 'created',
+        notification: delayedCreated,
+      });
+    });
+
+    await waitFor(() => {
+      expect(
+        rendered.result.current.items.find((item) => item.id === delayedCreated.id)
+          ?.is_read,
+      ).toBe(true);
+      expect(rendered.result.current.unreadCount).toBe(0);
+    });
+    expect(mockGetUnread).toHaveBeenCalledTimes(2);
+  });
+
+  it('scopes zero-count outcomes to rows known when reconciliation started', async () => {
+    const rendered = await renderLoaded([notification]);
+    const pendingRead = deferred<void>();
+    const pendingCount = deferred<number>();
+    mockMarkRead.mockReturnValueOnce(pendingRead.promise);
+    mockGetUnread.mockReset();
+    mockGetUnread.mockReturnValueOnce(pendingCount.promise);
+
+    let readPromise!: Promise<boolean>;
+    await act(() => {
+      readPromise = rendered.result.current.markRead(notification.id);
+    });
+    await act(() => {
+      emitRealtime({
+        type: 'notification',
+        event: 'read',
+        notification_ids: ['notification-not-loaded'],
+      });
+    });
+    await waitFor(() => expect(mockGetUnread).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      pendingCount.resolve(0);
+      await pendingCount.promise;
+    });
+    await waitFor(() =>
+      expect(rendered.result.current.items[0]?.is_read).toBe(true),
+    );
+    await act(async () => {
+      pendingRead.reject(
+        axiosErrorWith(503, { detail: 'Could not mark notification as read.' }),
+      );
+      await readPromise;
+    });
+
+    await expect(readPromise).resolves.toBe(true);
+    expect(rendered.result.current.rowErrors.has(notification.id)).toBe(false);
+
+    const laterNotification = {
+      ...notification,
+      id: 'notification-created-after-zero-request',
+    };
+    mockGetUnread.mockRejectedValueOnce(
+      axiosErrorWith(503, { detail: 'Count unavailable.' }),
+    );
+    await act(() => {
+      emitRealtime({
+        type: 'notification',
+        event: 'created',
+        notification: laterNotification,
+      });
+    });
+    await waitFor(() =>
+      expect(
+        rendered.result.current.items.find((item) => item.id === laterNotification.id)
+          ?.is_read,
+      ).toBe(false),
+    );
+
+    mockMarkRead.mockRejectedValueOnce(
+      axiosErrorWith(503, { detail: 'Could not mark notification as read.' }),
+    );
+    let laterReadResult!: boolean;
+    await act(async () => {
+      laterReadResult = await rendered.result.current.markRead(laterNotification.id);
+    });
+
+    expect(laterReadResult).toBe(false);
+    expect(
+      rendered.result.current.rowErrors.get(laterNotification.id)?.message,
+    ).toBe('Could not mark notification as read.');
+  });
+
+  it('treats local read-all success as a newer outcome for an older read failure', async () => {
+    const rendered = await renderLoaded();
+    const pendingRead = deferred<void>();
+    mockMarkRead.mockReturnValueOnce(pendingRead.promise);
+    mockList.mockResolvedValueOnce(
+      page([{ ...notification, is_read: true, read_at: '2026-08-09T02:00:00Z' }]),
+    );
+    mockGetUnread.mockResolvedValue(0);
+
+    let readPromise!: Promise<boolean>;
+    await act(() => {
+      readPromise = rendered.result.current.markRead(notification.id);
+    });
+    await waitFor(() => expect(mockMarkRead).toHaveBeenCalledTimes(1));
+
+    await act(async () => rendered.result.current.markAllRead());
+    expect(rendered.result.current.items[0]?.is_read).toBe(true);
+
+    await act(async () => {
+      pendingRead.reject(
+        axiosErrorWith(503, { detail: 'Could not mark notification as read.' }),
+      );
+      await readPromise;
+    });
+
+    await expect(readPromise).resolves.toBe(true);
+    expect(rendered.result.current.rowErrors.has(notification.id)).toBe(false);
+  });
+
+  it('does not hide a later read failure behind an older local read-all response', async () => {
+    const createdAfterReadAll = {
+      ...notification,
+      id: 'notification-created-after-read-all',
+    };
+    mockGetUnread.mockResolvedValue(1);
+    const rendered = await renderLoaded();
+    const pendingMarkAll = deferred<number>();
+    mockMarkAll.mockReturnValueOnce(pendingMarkAll.promise);
+
+    let markAllPromise!: Promise<boolean>;
+    await act(() => {
+      markAllPromise = rendered.result.current.markAllRead();
+    });
+    await waitFor(() => expect(mockMarkAll).toHaveBeenCalledTimes(1));
+
+    mockList.mockResolvedValueOnce(page([createdAfterReadAll]));
+    await act(() => {
+      emitRealtime({ type: 'notification', event: 'read_all' });
+      emitRealtime({
+        type: 'notification',
+        event: 'created',
+        notification: createdAfterReadAll,
+      });
+    });
+    const pendingRead = deferred<void>();
+    mockMarkRead.mockReturnValueOnce(pendingRead.promise);
+    let readPromise!: Promise<boolean>;
+    await act(() => {
+      readPromise = rendered.result.current.markRead(createdAfterReadAll.id);
+    });
+    await waitFor(() => expect(mockMarkRead).toHaveBeenCalledTimes(1));
+
+    mockGetUnread.mockRejectedValueOnce(
+      axiosErrorWith(503, { detail: 'Count unavailable.' }),
+    );
+    mockList.mockResolvedValueOnce(
+      page([createdAfterReadAll]),
+    );
+    await act(async () => {
+      pendingMarkAll.resolve(1);
+      await markAllPromise;
+    });
+    await act(async () => {
+      pendingRead.reject(
+        axiosErrorWith(503, { detail: 'Could not mark notification as read.' }),
+      );
+      await readPromise;
+    });
+
+    await expect(readPromise).resolves.toBe(false);
+    expect(rendered.result.current.rowErrors.get(createdAfterReadAll.id)?.message).toBe(
+      'Could not mark notification as read.',
+    );
+    expect(rendered.result.current.unreadCount).toBeNull();
+  });
+
+  it('does not clear a later row error when an older local read-all response arrives', async () => {
+    const createdAfterReadAll = {
+      ...notification,
+      id: 'notification-created-after-read-all',
+    };
+    mockGetUnread.mockResolvedValue(1);
+    const rendered = await renderLoaded();
+    const pendingMarkAll = deferred<number>();
+    mockMarkAll.mockReturnValueOnce(pendingMarkAll.promise);
+
+    let markAllPromise!: Promise<boolean>;
+    await act(() => {
+      markAllPromise = rendered.result.current.markAllRead();
+    });
+    await waitFor(() => expect(mockMarkAll).toHaveBeenCalledTimes(1));
+
+    mockList.mockResolvedValueOnce(page([createdAfterReadAll]));
+    await act(() => {
+      emitRealtime({ type: 'notification', event: 'read_all' });
+      emitRealtime({
+        type: 'notification',
+        event: 'created',
+        notification: createdAfterReadAll,
+      });
+    });
+    mockMarkRead.mockRejectedValueOnce(
+      axiosErrorWith(503, { detail: 'Could not mark notification as read.' }),
+    );
+    await act(async () => rendered.result.current.markRead(createdAfterReadAll.id));
+    expect(
+      rendered.result.current.rowErrors.get(createdAfterReadAll.id)?.message,
+    ).toBe('Could not mark notification as read.');
+
+    mockGetUnread.mockRejectedValueOnce(
+      axiosErrorWith(503, { detail: 'Count unavailable.' }),
+    );
+    mockList.mockResolvedValueOnce(page([createdAfterReadAll]));
+    await act(async () => {
+      pendingMarkAll.resolve(1);
+      await markAllPromise;
+    });
+
+    expect(rendered.result.current.items[0]?.is_read).toBe(false);
+    expect(
+      rendered.result.current.rowErrors.get(createdAfterReadAll.id)?.message,
+    ).toBe('Could not mark notification as read.');
   });
 
   it('clears stale read mutation errors when realtime confirms the resulting state', async () => {
@@ -788,6 +1369,77 @@ describe('NotificationsProvider', () => {
 
     expect(rendered.result.current.items.every((item) => item.is_read)).toBe(true);
     expect(rendered.result.current.unreadCount).toBe(0);
+  });
+
+  it('fences a pre-mark-all first page and reconciles unloaded rows after REST succeeds', async () => {
+    const unloaded = { ...notification, id: 'notification-unloaded' };
+    mockGetUnread.mockResolvedValue(2);
+    const rendered = await renderLoaded();
+    const staleRefresh = deferred<NotificationPage>();
+    mockList.mockReturnValueOnce(staleRefresh.promise);
+
+    let refreshPromise!: Promise<void>;
+    await act(() => {
+      refreshPromise = rendered.result.current.refreshForFocus();
+    });
+    await waitFor(() => expect(mockList).toHaveBeenCalledTimes(2));
+
+    mockGetUnread.mockResolvedValue(0);
+    mockList.mockResolvedValueOnce(
+      page([
+        { ...notification, is_read: true, read_at: '2026-08-09T02:00:00Z' },
+        { ...unloaded, is_read: true, read_at: '2026-08-09T02:00:00Z' },
+      ]),
+    );
+    await act(async () => rendered.result.current.markAllRead());
+    expect(mockList).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      staleRefresh.resolve(page([notification, unloaded]));
+      await refreshPromise;
+    });
+
+    expect(rendered.result.current.items.map((item) => item.id)).toEqual([
+      notification.id,
+      unloaded.id,
+    ]);
+    expect(rendered.result.current.items.every((item) => item.is_read)).toBe(true);
+    expect(rendered.result.current.unreadCount).toBe(0);
+  });
+
+  it('fences a pre-mark-all load-more response before reconciling the first page', async () => {
+    const unloaded = { ...notification, id: 'notification-unloaded' };
+    mockGetUnread.mockResolvedValue(2);
+    const rendered = await renderLoaded([notification], 'next-cursor');
+    const staleLoadMore = deferred<NotificationPage>();
+    mockList.mockReturnValueOnce(staleLoadMore.promise);
+
+    let loadMorePromise!: Promise<void>;
+    await act(() => {
+      loadMorePromise = rendered.result.current.loadMore();
+    });
+    await waitFor(() => expect(mockList).toHaveBeenCalledTimes(2));
+
+    mockGetUnread.mockResolvedValue(0);
+    mockList.mockResolvedValueOnce(
+      page([
+        { ...notification, is_read: true, read_at: '2026-08-09T02:00:00Z' },
+      ], 'fresh-cursor'),
+    );
+    await act(async () => rendered.result.current.markAllRead());
+    expect(mockList).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      staleLoadMore.resolve(page([unloaded], null));
+      await loadMorePromise;
+    });
+
+    expect(rendered.result.current.items.map((item) => item.id)).toEqual([
+      notification.id,
+    ]);
+    expect(rendered.result.current.items[0]?.is_read).toBe(true);
+    expect(rendered.result.current.unreadCount).toBe(0);
+    expect(rendered.result.current.loadingMore).toBe(false);
   });
 
   it('reconciles both the badge and loaded list when the app returns to foreground', async () => {

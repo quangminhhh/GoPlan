@@ -6,7 +6,8 @@ import { colors } from '@/shared/theme/tokens';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 
 function TabsNavigator() {
-  const { unreadCount, lastKnownUnreadCount } = useNotifications();
+  const { items, unreadCount, lastKnownUnreadCount } = useNotifications();
+  const hasLoadedUnread = items.some((item) => !item.is_read);
   const notificationsBadge =
     unreadCount !== null
       ? unreadCount > 0
@@ -14,7 +15,7 @@ function TabsNavigator() {
           ? '99+'
           : unreadCount
         : undefined
-      : lastKnownUnreadCount !== null && lastKnownUnreadCount > 0
+      : (lastKnownUnreadCount !== null && lastKnownUnreadCount > 0) || hasLoadedUnread
         ? '•'
         : undefined;
   return (

@@ -36,11 +36,11 @@ def env_origins(name: str) -> tuple[str, ...]:
     if not origins:
         raise ImproperlyConfigured(f"{name} must contain at least one origin.")
 
-    for origin in origins:
+    for entry_index, origin in enumerate(origins, start=1):
         lowered_origin = origin.lower()
         if lowered_origin == "null" or "*" in origin:
             raise ImproperlyConfigured(
-                f"{name} must contain only explicit HTTP(S) origins."
+                f"{name} entry {entry_index} must be an explicit HTTP(S) origin."
             )
 
         try:
@@ -48,25 +48,26 @@ def env_origins(name: str) -> tuple[str, ...]:
             parsed = urlsplit(origin)
             hostname = parsed.hostname
             _ = parsed.port
-        except (ValidationError, ValueError) as exc:
-            raise ImproperlyConfigured(
-                f"{name} contains an invalid origin: {origin}."
-            ) from exc
-
-        if (
-            parsed.scheme not in {"http", "https"}
-            or hostname is None
-            or hostname.startswith(".")
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path
-            or parsed.query
-            or parsed.fragment
-            or parsed.netloc.endswith(":")
-        ):
-            raise ImproperlyConfigured(
-                f"{name} contains an invalid origin: {origin}."
+        except (ValidationError, ValueError):
+            invalid_origin = True
+        else:
+            invalid_origin = (
+                parsed.scheme not in {"http", "https"}
+                or hostname is None
+                or hostname.startswith(".")
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+                or parsed.netloc.endswith(":")
             )
+
+        if invalid_origin:
+            raise ImproperlyConfigured(
+                f"{name} entry {entry_index} must be a valid HTTP(S) origin "
+                "without credentials, path, query, or fragment."
+            ) from None
 
     return origins
 
