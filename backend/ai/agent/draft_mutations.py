@@ -25,6 +25,7 @@ from ai.agent.drafts import (
 from ai.agent.draft_validation import (
     AIActionDraftFieldValidationError,
     validate_action_draft_patch_payload,
+    validate_action_draft_patch_shape,
 )
 from ai.agent.executor import (
     AIActionDraftExpiredError,
@@ -83,7 +84,8 @@ def _apply_draft_patch_payload(draft: AIActionDraft, patch_payload: dict) -> dic
         AI_ACTION_TIMELINE_ACTIVITY_CREATE,
         AI_ACTION_TIMELINE_ACTIVITY_UPDATE,
     }:
-        data = dict(next_payload.get("data") or {})
+        existing_data = next_payload.get("data")
+        data = dict(existing_data) if isinstance(existing_data, dict) else {}
         data_overridden = False
         for key, value in patch_payload.items():
             if key == "data":
@@ -218,10 +220,20 @@ def patch_action_draft(
             .select_related("response_message")
             .get(pk=draft_id, trip_id=trip_id)
         )
+        validate_action_draft_patch_shape(
+            draft=draft,
+            patch_payload=patch_payload,
+        )
+        next_payload = (
+            _apply_draft_patch_payload(draft, patch_payload)
+            if patch_payload
+            else draft.payload
+        )
         validate_action_draft_patch_payload(
             draft=draft,
             patch_payload=patch_payload,
             currency_code=locked_trip.currency_code,
+            candidate_payload=next_payload,
         )
 
         if (
@@ -245,10 +257,6 @@ def patch_action_draft(
             if not patch_payload:
                 return draft
 
-            next_payload = _apply_draft_patch_payload(
-                draft,
-                patch_payload,
-            )
             if next_payload == draft.payload:
                 return draft
 

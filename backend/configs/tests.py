@@ -53,7 +53,8 @@ class SettingsEnvironmentTests(SimpleTestCase):
                 ):
                     with self.assertRaisesMessage(
                         ImproperlyConfigured,
-                        "TEST_ALLOWED_ORIGINS must contain only explicit HTTP(S) origins.",
+                        "TEST_ALLOWED_ORIGINS entry 1 must be an explicit "
+                        "HTTP(S) origin.",
                     ):
                         env_origins("TEST_ALLOWED_ORIGINS")
 
@@ -80,13 +81,42 @@ class SettingsEnvironmentTests(SimpleTestCase):
                 ):
                     with self.assertRaisesMessage(
                         ImproperlyConfigured,
-                        f"TEST_ALLOWED_ORIGINS contains an invalid origin: {value}.",
-                    ):
+                        "TEST_ALLOWED_ORIGINS entry 1 must be a valid HTTP(S) origin",
+                    ) as raised:
                         env_origins("TEST_ALLOWED_ORIGINS")
+                self.assertNotIn(value, str(raised.exception))
+
+    def test_env_origins_redacts_invalid_values_and_discards_validation_context(self):
+        marker = "REVIEW_FAKE_SECRET_72"
+        cases = (
+            f"not-a-url-{marker}",
+            f"https://review-user:{marker}@example.com",
+        )
+
+        for value in cases:
+            with self.subTest(value=value):
+                with patch.dict(
+                    os.environ,
+                    {
+                        "TEST_ALLOWED_ORIGINS": (
+                            f"https://app.example.com,{value}"
+                        )
+                    },
+                    clear=True,
+                ):
+                    with self.assertRaisesMessage(
+                        ImproperlyConfigured,
+                        "TEST_ALLOWED_ORIGINS entry 2",
+                    ) as raised:
+                        env_origins("TEST_ALLOWED_ORIGINS")
+
+                self.assertNotIn(marker, str(raised.exception))
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertIsNone(raised.exception.__context__)
 
     def test_asgi_startup_rejects_unsafe_origin_allowlists(self):
         cases = (
-            ("*", "must contain only explicit HTTP(S) origins"),
+            ("*", "entry 1 must be an explicit HTTP(S) origin"),
             ("", "must contain at least one origin"),
         )
         for value, expected_error in cases:
@@ -103,6 +133,32 @@ class SettingsEnvironmentTests(SimpleTestCase):
 
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(expected_error, result.stderr)
+
+    def test_asgi_startup_does_not_log_invalid_origin_values(self):
+        marker = "REVIEW_FAKE_SECRET_72"
+        cases = (
+            f"not-a-url-{marker}",
+            f"https://review-user:{marker}@example.com",
+        )
+
+        for value in cases:
+            with self.subTest(value=value):
+                environment = os.environ.copy()
+                environment["CORS_ALLOWED_ORIGINS"] = value
+                result = subprocess.run(
+                    [sys.executable, "-c", "import configs.asgi"],
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                    text=True,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "CORS_ALLOWED_ORIGINS entry 1 must be a valid HTTP(S) origin",
+                    result.stderr,
+                )
+                self.assertNotIn(marker, result.stderr)
 
     def test_env_int_uses_default_when_variable_is_missing(self):
         with patch.dict(os.environ, {}, clear=True):

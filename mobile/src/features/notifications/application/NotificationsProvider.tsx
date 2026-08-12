@@ -188,21 +188,26 @@ function OwnedNotificationsProvider({ children, ownerUserId }: NotificationsProv
       if (!isOwnerGenerationCurrent(ownerGeneration)) {
         return;
       }
+      const loadedUnreadCount = next.items.filter((item) => !item.is_read).length;
+      const effectiveNext =
+        next.unreadCount !== null && next.unreadCount < loadedUnreadCount
+          ? { ...next, unreadCount: null }
+          : next;
       const previous = realtimeStateRef.current;
-      realtimeStateRef.current = next;
-      if (previous.items !== next.items) {
-        itemsRef.current = next.items;
-        setItems(next.items);
+      realtimeStateRef.current = effectiveNext;
+      if (previous.items !== effectiveNext.items) {
+        itemsRef.current = effectiveNext.items;
+        setItems(effectiveNext.items);
       }
-      if (previous.unreadCount !== next.unreadCount) {
-        setUnreadCount(next.unreadCount);
+      if (previous.unreadCount !== effectiveNext.unreadCount) {
+        setUnreadCount(effectiveNext.unreadCount);
       }
       if (
-        next.unreadCount !== null &&
-        lastKnownUnreadCountRef.current !== next.unreadCount
+        effectiveNext.unreadCount !== null &&
+        lastKnownUnreadCountRef.current !== effectiveNext.unreadCount
       ) {
-        lastKnownUnreadCountRef.current = next.unreadCount;
-        setLastKnownUnreadCount(next.unreadCount);
+        lastKnownUnreadCountRef.current = effectiveNext.unreadCount;
+        setLastKnownUnreadCount(effectiveNext.unreadCount);
       }
     },
     [isOwnerGenerationCurrent],
@@ -392,29 +397,50 @@ function OwnedNotificationsProvider({ children, ownerUserId }: NotificationsProv
       }
       const requestId = countRequestRef.current + 1;
       countRequestRef.current = requestId;
+      const requestState = realtimeStateRef.current;
       const requestVersion = captureNotificationRealtimeVersion(
-        realtimeStateRef.current,
+        requestState,
       );
+      const knownItemIdsAtStart = requestState.items.map((item) => item.id);
       try {
         const count = await getUnreadCount();
         if (
           isOwnerGenerationCurrent(ownerGeneration) &&
           requestId === countRequestRef.current
         ) {
-          commitRealtimeState(
-            notificationRealtimeReducer(realtimeStateRef.current, {
-              type: 'UNREAD_COUNT_RESOLVED',
-              unreadCount: count,
-              requestVersion,
-            }),
-            ownerGeneration,
-          );
+          const previous = realtimeStateRef.current;
+          const next = notificationRealtimeReducer(previous, {
+            type: 'UNREAD_COUNT_RESOLVED',
+            unreadCount: count,
+            requestVersion,
+            knownItemIdsAtStart,
+          });
+          if (count === 0 && next.version > previous.version) {
+            const sequence = readOutcomeSequenceRef.current + 1;
+            readOutcomeSequenceRef.current = sequence;
+            for (const notificationId of knownItemIdsAtStart) {
+              readOutcomeByIdRef.current.set(notificationId, sequence);
+              const current = overridesRef.current.get(notificationId);
+              overridesRef.current.set(notificationId, {
+                ...current,
+                isRead: true,
+                version: next.version,
+              });
+            }
+            clearResolvedReadErrors(knownItemIdsAtStart, ownerGeneration);
+          }
+          commitRealtimeState(next, ownerGeneration);
         }
       } catch {
         // Keep the last usable badge. Focus and foreground transitions retry.
       }
     },
-    [captureOwnerGeneration, commitRealtimeState, isOwnerGenerationCurrent],
+    [
+      captureOwnerGeneration,
+      clearResolvedReadErrors,
+      commitRealtimeState,
+      isOwnerGenerationCurrent,
+    ],
   );
 
   const requestRealtimeCountReconcile = useCallback(
@@ -676,21 +702,41 @@ function OwnedNotificationsProvider({ children, ownerUserId }: NotificationsProv
     setMarkingAllRead(true);
     setGlobalMutationError(null);
     try {
-      await markAllNotificationsRead();
+      const updatedCount = await markAllNotificationsRead();
       if (!isOwnerGenerationCurrent(ownerGeneration)) {
         return false;
       }
-      if (visibleIdsAtStart.length > 0) {
-        applyNotificationEvent(
-          {
-            type: 'notification',
-            event: 'read',
-            notification_ids: visibleIdsAtStart,
-          },
-          ownerGeneration,
-        );
+      const countIsAmbiguous =
+        readAllOutcomeSequenceRef.current > outcomeSequenceAtStart;
+      const sequence = readOutcomeSequenceRef.current + 1;
+      readOutcomeSequenceRef.current = sequence;
+      for (const notificationId of visibleIdsAtStart) {
+        readOutcomeByIdRef.current.set(notificationId, sequence);
       }
-      await reconcileUnreadCount(ownerGeneration);
+      const next = notificationRealtimeReducer(realtimeStateRef.current, {
+        type: 'LOCAL_READ_ALL_CONFIRMED',
+        notificationIds: visibleIdsAtStart,
+        updatedCount,
+        countIsAmbiguous,
+      });
+      const version = next.version;
+      for (const notificationId of visibleIdsAtStart) {
+        const current = overridesRef.current.get(notificationId);
+        overridesRef.current.set(notificationId, {
+          ...current,
+          isRead: true,
+          version,
+        });
+      }
+      commitRealtimeState(next, ownerGeneration);
+      clearResolvedReadErrors(visibleIdsAtStart, ownerGeneration);
+      await Promise.all([
+        loadFirstPage(
+          hasUsablePageRef.current ? 'silent' : 'initial',
+          ownerGeneration,
+        ),
+        reconcileUnreadCount(ownerGeneration),
+      ]);
       return isOwnerGenerationCurrent(ownerGeneration);
     } catch (caught) {
       if (!isOwnerGenerationCurrent(ownerGeneration)) {
@@ -708,9 +754,11 @@ function OwnedNotificationsProvider({ children, ownerUserId }: NotificationsProv
       }
     }
   }, [
-    applyNotificationEvent,
     captureOwnerGeneration,
+    clearResolvedReadErrors,
+    commitRealtimeState,
     isOwnerGenerationCurrent,
+    loadFirstPage,
     reconcileUnreadCount,
   ]);
 
@@ -840,6 +888,12 @@ function OwnedNotificationsProvider({ children, ownerUserId }: NotificationsProv
         return;
       }
       applyNotificationEvent(event, ownerGeneration);
+      if (event.event === 'read_all' && hasRequestedListRef.current) {
+        void loadFirstPage(
+          hasUsablePageRef.current ? 'silent' : 'initial',
+          ownerGeneration,
+        );
+      }
       requestRealtimeCountReconcile(ownerGeneration);
     });
     return unsubscribe;
@@ -847,6 +901,7 @@ function OwnedNotificationsProvider({ children, ownerUserId }: NotificationsProv
     applyNotificationEvent,
     captureOwnerGeneration,
     isOwnerGenerationCurrent,
+    loadFirstPage,
     requestRealtimeCountReconcile,
     subscribe,
   ]);

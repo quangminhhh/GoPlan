@@ -43,9 +43,16 @@ export type NotificationRealtimeReducerAction =
       requestVersion: number;
     }
   | {
+      type: 'LOCAL_READ_ALL_CONFIRMED';
+      notificationIds: string[];
+      updatedCount: number;
+      countIsAmbiguous: boolean;
+    }
+  | {
       type: 'UNREAD_COUNT_RESOLVED';
       unreadCount: number | null;
       requestVersion: number;
+      knownItemIdsAtStart: string[];
     };
 
 interface InitialNotificationRealtimeState {
@@ -286,10 +293,16 @@ function mergeFirstPage(
       state.overlays.readById.has(item.id) ? markItemRead(item) : item,
     );
   }
+  const loadedUnreadCount = items.filter((item) => !item.is_read).length;
+  const unreadCount =
+    state.unreadCount !== null && state.unreadCount < loadedUnreadCount
+      ? null
+      : state.unreadCount;
 
   return {
     ...state,
     items,
+    unreadCount,
     overlays: {
       createdById: compactOverlayMap(state.overlays.createdById, requestVersion),
       readById: compactOverlayMap(state.overlays.readById, requestVersion),
@@ -301,10 +314,39 @@ function mergeFirstPage(
   };
 }
 
+function applyLocalReadAllConfirmation(
+  state: NotificationRealtimeState,
+  notificationIds: string[],
+  rawUpdatedCount: number,
+  countIsAmbiguous: boolean,
+): NotificationRealtimeState {
+  const updatedCount = Number.isFinite(rawUpdatedCount)
+    ? Math.max(0, Math.floor(rawUpdatedCount))
+    : 0;
+  const version = state.version + 1;
+  const readById = new Map(state.overlays.readById);
+  const idsToMark = new Set(notificationIds);
+  for (const notificationId of idsToMark) {
+    readById.set(notificationId, { version, countDelta: 0 });
+  }
+  return {
+    ...state,
+    items: state.items.map((item) =>
+      idsToMark.has(item.id) ? markItemRead(item) : item,
+    ),
+    unreadCount: countIsAmbiguous
+      ? null
+      : adjustUnreadCount(state.unreadCount, -updatedCount),
+    version,
+    overlays: { ...state.overlays, readById },
+  };
+}
+
 function mergeUnreadCount(
   state: NotificationRealtimeState,
   incomingCount: number | null,
   rawRequestVersion: number,
+  knownItemIdsAtStart: string[],
 ): NotificationRealtimeState {
   const requestVersion = normalizeRequestVersion(state, rawRequestVersion);
   // A DB query can observe an in-flight mutation, so replaying deltas can double-apply it.
@@ -312,7 +354,40 @@ function mergeUnreadCount(
   if (requestVersion !== state.version) {
     return state;
   }
-  return { ...state, unreadCount: normalizeUnreadCount(incomingCount) };
+  const unreadCount = normalizeUnreadCount(incomingCount);
+  if (unreadCount !== 0) {
+    const loadedUnreadCount = state.items.filter((item) => !item.is_read).length;
+    return {
+      ...state,
+      unreadCount:
+        unreadCount !== null && unreadCount < loadedUnreadCount
+          ? null
+          : unreadCount,
+    };
+  }
+
+  // Zero is monotonic read authority only for rows known before the count query.
+  // A first-page response can add a newer row without advancing this clock.
+  const version = state.version + 1;
+  const idsToMark = new Set(
+    knownItemIdsAtStart.filter((notificationId) => notificationId.length > 0),
+  );
+  const readById = new Map(state.overlays.readById);
+  for (const notificationId of idsToMark) {
+    readById.set(notificationId, { version, countDelta: 0 });
+  }
+  const items = state.items.map((item) =>
+    idsToMark.has(item.id) ? markItemRead(item) : item,
+  );
+  const loadedUnreadCount = items.filter((item) => !item.is_read).length;
+
+  return {
+    ...state,
+    items,
+    unreadCount: loadedUnreadCount > 0 ? null : 0,
+    version,
+    overlays: { ...state.overlays, readById },
+  };
 }
 
 export function createNotificationRealtimeState(
@@ -345,7 +420,19 @@ export function notificationRealtimeReducer(
       return { ...state, version: state.version + 1 };
     case 'FIRST_PAGE_RESOLVED':
       return mergeFirstPage(state, action.items, action.requestVersion);
+    case 'LOCAL_READ_ALL_CONFIRMED':
+      return applyLocalReadAllConfirmation(
+        state,
+        action.notificationIds,
+        action.updatedCount,
+        action.countIsAmbiguous,
+      );
     case 'UNREAD_COUNT_RESOLVED':
-      return mergeUnreadCount(state, action.unreadCount, action.requestVersion);
+      return mergeUnreadCount(
+        state,
+        action.unreadCount,
+        action.requestVersion,
+        action.knownItemIdsAtStart,
+      );
   }
 }

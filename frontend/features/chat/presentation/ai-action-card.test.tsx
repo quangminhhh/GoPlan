@@ -357,6 +357,150 @@ describe("AIActionCard", () => {
     });
   });
 
+  it("renders data wrapper field errors inline and retries after editing", async () => {
+    const validationMessage = "end_time must be after start_time";
+    const editableDraft = makeDraft({
+      action_type: "timeline.activity.update",
+      status: "NEEDS_INFO",
+      can_confirm: false,
+      can_cancel: true,
+      can_edit: true,
+      missing_fields: [
+        { name: "data", label: "Activity details", type: "json" },
+      ],
+    });
+    vi.mocked(patchAIActionDraft)
+      .mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            detail: "Field validation failed.",
+            error_code: "FIELD_VALIDATION_FAILED",
+            field_errors: { data: validationMessage },
+            draft: editableDraft,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        draft: makeDraft({
+          action_type: "timeline.activity.update",
+          status: "READY",
+          missing_fields: [],
+        }),
+      });
+    render(
+      <AIActionCard
+        tripId="trip-1"
+        draft={editableDraft}
+        onDraftChanged={vi.fn()}
+      />,
+    );
+
+    const details = screen.getByLabelText("Activity details");
+    fireEvent.change(details, {
+      target: { value: '{"start_time":"10:00","end_time":"08:00"}' },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save info" }));
+
+    expect(await screen.findByText(validationMessage)).toBeInTheDocument();
+    const save = screen.getByRole("button", { name: "Save info" });
+    expect(save).toBeDisabled();
+    fireEvent.click(save);
+    expect(patchAIActionDraft).toHaveBeenCalledTimes(1);
+
+    fireEvent.change(details, {
+      target: { value: '{"start_time":"08:00","end_time":"10:00"}' },
+    });
+    expect(screen.queryByText(validationMessage)).toBeNull();
+    expect(save).toBeEnabled();
+    fireEvent.click(save);
+
+    await waitFor(() => {
+      expect(patchAIActionDraft).toHaveBeenNthCalledWith(
+        2,
+        "trip-1",
+        "draft-1",
+        { data: { start_time: "08:00", end_time: "10:00" } },
+      );
+    });
+  });
+
+  it("renders direct time-range field errors inline and retries after editing", async () => {
+    const validationMessage = "Start time conflicts with an existing activity.";
+    const editableDraft = makeDraft({
+      action_type: "timeline.activity.create",
+      status: "NEEDS_INFO",
+      can_confirm: false,
+      can_cancel: true,
+      can_edit: true,
+      missing_fields: [
+        {
+          name: "time_range",
+          label: "Time",
+          type: "time_range",
+          constraints: {
+            section_index: 1,
+            section_date: "2026-04-20",
+            pair: ["start_time", "end_time"],
+          },
+        },
+      ],
+    });
+    vi.mocked(patchAIActionDraft)
+      .mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            detail: "Field validation failed.",
+            error_code: "FIELD_VALIDATION_FAILED",
+            field_errors: { start_time: validationMessage },
+            draft: editableDraft,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        draft: makeDraft({
+          action_type: "timeline.activity.create",
+          status: "READY",
+          missing_fields: [],
+        }),
+      });
+    render(
+      <AIActionCard
+        tripId="trip-1"
+        draft={editableDraft}
+        onDraftChanged={vi.fn()}
+      />,
+    );
+
+    const start = screen.getByLabelText("Start");
+    fireEvent.change(start, { target: { value: "08:30" } });
+    fireEvent.change(screen.getByLabelText("End"), {
+      target: { value: "10:00" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save info" }));
+
+    expect(await screen.findByText(validationMessage)).toBeInTheDocument();
+    const save = screen.getByRole("button", { name: "Save info" });
+    expect(save).toBeDisabled();
+    fireEvent.click(save);
+    expect(patchAIActionDraft).toHaveBeenCalledTimes(1);
+
+    fireEvent.change(start, { target: { value: "08:45" } });
+    expect(screen.queryByText(validationMessage)).toBeNull();
+    expect(save).toBeEnabled();
+    fireEvent.click(save);
+
+    await waitFor(() => {
+      expect(patchAIActionDraft).toHaveBeenNthCalledWith(
+        2,
+        "trip-1",
+        "draft-1",
+        { start_time: "08:45", end_time: "10:00" },
+      );
+    });
+  });
+
   it("does not resubmit fields that are no longer missing after a partial save", async () => {
     vi.mocked(patchAIActionDraft)
       .mockResolvedValueOnce({

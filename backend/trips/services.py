@@ -1259,7 +1259,8 @@ def _normalize_timeline_patch_clock(value):
     return parsed.replace(tzinfo=None, microsecond=0) if parsed is not None else value
 
 
-def _normalize_timeline_patch_input(data: dict) -> dict:
+def normalize_timeline_activity_input(data: dict) -> dict:
+    """Normalize legacy timeline values before schema or domain validation."""
     normalized = dict(data)
     system_type = normalized.get("system_type")
     if system_type in _LEGACY_TIMELINE_SYSTEM_TYPES:
@@ -1422,7 +1423,7 @@ def plan_timeline_activity_create(
             {"data": "Activity data must be an object."}
         )
 
-    normalized = _normalize_timeline_patch_input(data)
+    normalized = normalize_timeline_activity_input(data)
     explicit_fields = set(normalized)
     serializer = CreateTimelineActivitySerializer(data=normalized)
     serializer.is_valid(raise_exception=True)
@@ -1531,7 +1532,7 @@ def plan_timeline_activity_patch(
             {"data": "Activity patch must be an object."}
         )
 
-    normalized = _normalize_timeline_patch_input(data)
+    normalized = normalize_timeline_activity_input(data)
     explicit_fields = set(normalized)
     serializer_input = dict(normalized)
 

@@ -198,6 +198,17 @@ function readyTripDetail(
   };
 }
 
+function retainedTripDetailFailure(message: string) {
+  return {
+    ...readyTripDetail(),
+    error: {
+      kind: 'network' as const,
+      message,
+      status: 500,
+    },
+  };
+}
+
 async function enterFocus(): Promise<() => void> {
   if (focusEffect === null) {
     throw new Error('Expected useFocusEffect to register a callback.');
@@ -1471,23 +1482,16 @@ describe('useTripChat', () => {
     expect(mockListChatHistory).toHaveBeenCalledTimes(1);
   });
 
-  it('restarts subscription, catch-up, and AI typing after a transient access error without clearing history', async () => {
+  it('restarts subscription, catch-up, and AI typing after a retained-detail access error without reloading history', async () => {
     const anchor = message();
     const missed = message({
       id: '99999999-9999-4999-8999-999999999999',
       content: 'Recovered by catch-up',
       change_sequence: 2,
     });
-    const transientState = {
-      ...readyTripDetail(),
-      detail: null,
-      status: 'error' as const,
-      error: {
-        kind: 'network' as const,
-        message: 'Temporary trip-detail failure.',
-        status: 404,
-      },
-    };
+    const transientState = retainedTripDetailFailure(
+      'Temporary trip-detail failure.',
+    );
     let tripState: ReturnType<typeof readyTripDetail> | typeof transientState =
       readyTripDetail();
     mockUseTripDetail.mockImplementation(() => tripState);
@@ -1559,7 +1563,7 @@ describe('useTripChat', () => {
     await act(async () => blur());
   });
 
-  it('atomically suspends in-flight chat work while preserving retryable content and confirmed history', async () => {
+  it('atomically suspends in-flight chat work for a retained-detail refresh error', async () => {
     const reactionRow = message();
     const deleteRow = message({
       id: '77777777-7777-4777-8777-777777777777',
@@ -1569,16 +1573,9 @@ describe('useTripChat', () => {
       id: '88888888-8888-4888-8888-888888888888',
       content: 'Hide pending',
     });
-    const transientState = {
-      ...readyTripDetail(),
-      detail: null,
-      status: 'error' as const,
-      error: {
-        kind: 'network' as const,
-        message: 'Trip authority is temporarily unknown.',
-        status: 404,
-      },
-    };
+    const transientState = retainedTripDetailFailure(
+      'Trip authority is temporarily unknown.',
+    );
     let tripState: ReturnType<typeof readyTripDetail> | typeof transientState =
       readyTripDetail();
     const pendingGap = deferred<{
@@ -1677,6 +1674,39 @@ describe('useTripChat', () => {
       error: { errorCode: 'CHAT_MUTATION_INTERRUPTED' },
     });
     expect(view.result.current.messages).toEqual([]);
+    expect(
+      mockSendRealtime.mock.calls.filter(
+        ([command]) => command.type === 'chat.unsubscribe',
+      ),
+    ).toHaveLength(1);
+    expect(
+      [
+        mockGapFillChatMessages.mock.calls[0]?.[2],
+        mockListChatHistory.mock.calls[1]?.[2],
+        mockSendChatMessage.mock.calls[1]?.[2],
+        mockAddChatReaction.mock.calls[0]?.[3],
+        mockDeleteChatMessage.mock.calls[0]?.[3],
+        mockHideChatMessages.mock.calls[0]?.[2],
+      ].every((signal) => signal?.aborted === true),
+    ).toBe(true);
+
+    const blockedSend = await captureInAct(() =>
+      view.result.current.sendMessage('Must wait for access recovery'),
+    );
+    const blockedReaction = await captureInAct(() =>
+      view.result.current.toggleReaction(reactionRow.id, '👍'),
+    );
+    expect(blockedSend).toMatchObject({ kind: 'blocked' });
+    expect(blockedReaction).toMatchObject({ kind: 'rejected' });
+    expect(mockSendChatMessage).toHaveBeenCalledTimes(2);
+    expect(mockAddChatReaction).toHaveBeenCalledTimes(1);
+
+    await view.rerender({});
+    expect(
+      mockSendRealtime.mock.calls.filter(
+        ([command]) => command.type === 'chat.unsubscribe',
+      ),
+    ).toHaveLength(1);
 
     await act(async () => {
       pendingGap.resolve({ results: [], has_more: false });
@@ -1724,6 +1754,21 @@ describe('useTripChat', () => {
     await view.rerender({});
     await waitFor(() => expect(view.result.current.accessStatus).toBe('granted'));
     await waitFor(() => expect(view.result.current.messages).toHaveLength(5));
+    expect(view.result.current.messages.map((item) => item.content)).toEqual(
+      expect.arrayContaining([
+        reactionRow.content,
+        deleteRow.content,
+        hideRow.content,
+        'Already failed before suspension',
+        'Retry me after recovery',
+      ]),
+    );
+    expect(view.result.current.failedByClientId.get(priorFailedClientId)).toEqual(
+      networkFailure,
+    );
+    expect(view.result.current.failedByClientId.get(clientMessageId)).toMatchObject({
+      errorCode: 'CHAT_ACCESS_UNCERTAIN',
+    });
     await act(async () => {
       await view.result.current.loadOlder();
     });
@@ -1731,18 +1776,11 @@ describe('useTripChat', () => {
     expect(view.result.current.hasMoreOlder).toBe(false);
   });
 
-  it('keeps fresh send and reaction lock ownership when aborted operations settle later', async () => {
+  it('fences stale async completions after a retained-detail refresh error', async () => {
     const confirmed = message();
-    const transientState = {
-      ...readyTripDetail(),
-      detail: null,
-      status: 'error' as const,
-      error: {
-        kind: 'network' as const,
-        message: 'Trip authority is temporarily unknown.',
-        status: 404,
-      },
-    };
+    const transientState = retainedTripDetailFailure(
+      'Trip authority is temporarily unknown.',
+    );
     let tripState: ReturnType<typeof readyTripDetail> | typeof transientState =
       readyTripDetail();
     const oldSend = deferred<Awaited<ReturnType<typeof sendChatMessage>>>();
@@ -1865,10 +1903,12 @@ describe('useTripChat', () => {
   it.each(['TRIP_NOT_FOUND', 'FORBIDDEN'] as const)(
     'keeps exact trip-detail access loss %s authoritative and kicked',
     async (errorCode) => {
+      const activeTripState = readyTripDetail();
       mockUseTripDetail.mockReturnValue({
-        ...readyTripDetail(),
-        detail: null,
-        status: 'error',
+        ...activeTripState,
+        detail:
+          errorCode === 'TRIP_NOT_FOUND' ? null : activeTripState.detail,
+        status: errorCode === 'TRIP_NOT_FOUND' ? 'error' : 'ready',
         error: {
           kind: 'message',
           message: 'Access is gone.',
