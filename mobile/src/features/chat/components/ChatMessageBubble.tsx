@@ -1,5 +1,11 @@
-import { Ionicons } from '@expo/vector-icons';
-import { memo, useCallback, useMemo } from 'react';
+import { FontAwesome6, Ionicons } from '@expo/vector-icons';
+import {
+  type ComponentRef,
+  memo,
+  useCallback,
+  useMemo,
+  useRef,
+} from 'react';
 import {
   ActivityIndicator,
   type AccessibilityActionEvent,
@@ -22,6 +28,7 @@ import {
   type AIActionDraft,
 } from '../ai/drafts';
 import { parseGoPlanAIMention } from '../ai/mention';
+import type { AccessibilityFocusTarget } from '../ai/accessibilityFocus';
 import type {
   AllowedReactionEmoji,
   ChatApiFailure,
@@ -52,6 +59,8 @@ export type ApplyMessageAIDraftSnapshot = (
   input: ApplyMessageAIDraftSnapshotInput,
 ) => Promise<void>;
 
+export type ChatMessageActionFocusResolver = () => AccessibilityFocusTarget;
+
 interface ChatMessageBubbleProps {
   message: ChatMessage;
   currentUserId: string;
@@ -65,10 +74,14 @@ interface ChatMessageBubbleProps {
   deleting: boolean;
   reactionBusy: boolean;
   actionsEnabled: boolean;
+  showReactionAffordance?: boolean;
   ambiguousAIDraftIds?: ReadonlySet<string>;
   selectionMode: boolean;
   selected: boolean;
-  onOpenActions: (messageId: string) => void;
+  onOpenActions: (
+    messageId: string,
+    resolveFocusTarget: ChatMessageActionFocusResolver,
+  ) => void;
   onToggleSelection: (messageId: string) => void;
   onRetry: (clientMessageId: string) => void;
   onToggleReaction: (messageId: string, emoji: AllowedReactionEmoji) => void;
@@ -206,6 +219,7 @@ function ChatMessageBubbleComponent({
   deleting,
   reactionBusy,
   actionsEnabled,
+  showReactionAffordance = false,
   ambiguousAIDraftIds = EMPTY_DRAFT_ID_SET,
   selectionMode,
   selected,
@@ -215,8 +229,11 @@ function ChatMessageBubbleComponent({
   onToggleReaction,
   onApplyAIDraftSnapshot,
 }: ChatMessageBubbleProps) {
+  const bubbleRef = useRef<ComponentRef<typeof Pressable>>(null);
+  const reactionAffordanceRef = useRef<ComponentRef<typeof Pressable>>(null);
   const canSelect = !pending && !failed && !deleting;
-  const canOpenActions = actionsEnabled && canSelect && !selectionMode;
+  const canOpenActions =
+    actionsEnabled && canSelect && !reactionBusy && !selectionMode;
   const canRetry = Boolean(actionsEnabled && failed && message.client_message_id);
   const time = formatMessageTime(message.created_at);
   const label = senderLabel(message);
@@ -279,9 +296,18 @@ function ChatMessageBubbleComponent({
     return [];
   }, [canOpenActions, canRetry, canSelect, selected, selectionMode]);
 
-  const openActions = useCallback(() => {
+  const openBubbleActions = useCallback(() => {
     if (canOpenActions) {
-      onOpenActions(message.id);
+      onOpenActions(message.id, () => bubbleRef.current);
+    }
+  }, [canOpenActions, message.id, onOpenActions]);
+
+  const openReactionActions = useCallback(() => {
+    if (canOpenActions) {
+      onOpenActions(
+        message.id,
+        () => reactionAffordanceRef.current ?? bubbleRef.current,
+      );
     }
   }, [canOpenActions, message.id, onOpenActions]);
 
@@ -305,14 +331,14 @@ function ChatMessageBubbleComponent({
   const handleAccessibilityAction = useCallback(
     (event: AccessibilityActionEvent) => {
       if (event.nativeEvent.actionName === 'openMessageActions') {
-        openActions();
+        openBubbleActions();
       } else if (event.nativeEvent.actionName === 'toggleSelection') {
         toggleSelection();
       } else if (event.nativeEvent.actionName === 'retrySend') {
         retry();
       }
     },
-    [openActions, retry, toggleSelection],
+    [openBubbleActions, retry, toggleSelection],
   );
 
   const content = message.sender_kind === 'AI' ? (
@@ -339,6 +365,7 @@ function ChatMessageBubbleComponent({
 
   const bubble = (
     <Pressable
+      ref={bubbleRef}
       accessible
       accessibilityRole={canOpenActions || (selectionMode && canSelect) ? 'button' : undefined}
       accessibilityLabel={messageAccessibilityLabel(message, isOwn, pending, failed, deleting)}
@@ -356,7 +383,7 @@ function ChatMessageBubbleComponent({
       accessibilityActions={accessibilityActions}
       delayLongPress={400}
       onAccessibilityAction={handleAccessibilityAction}
-      onLongPress={canOpenActions ? openActions : undefined}
+      onLongPress={canOpenActions ? openBubbleActions : undefined}
       onPress={selectionMode && canSelect ? toggleSelection : undefined}
       style={({ pressed }) => [
         styles.bubble,
@@ -448,11 +475,64 @@ function ChatMessageBubbleComponent({
     />
   );
 
+  const reactionAffordance =
+    showReactionAffordance && actionsEnabled && canSelect && !selectionMode ? (
+      <Pressable
+        ref={reactionAffordanceRef}
+        accessibilityRole="button"
+        accessibilityLabel="React to this message"
+        accessibilityHint="Opens reactions and other message actions"
+        accessibilityState={{ disabled: reactionBusy, busy: reactionBusy }}
+        disabled={reactionBusy}
+        onPress={openReactionActions}
+        style={({ pressed }) => [
+          styles.reactionAffordance,
+          pressed && !reactionBusy ? styles.pressed : null,
+          reactionBusy ? styles.reactionAffordanceBusy : null,
+        ]}
+        testID={`chat-reaction-affordance-${message.id}`}
+      >
+        <FontAwesome6
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+          color={colors.textMuted}
+          name="face-smile"
+          size={17}
+          solid
+        />
+        <View
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+          style={styles.reactionAffordanceBadge}
+        >
+          <FontAwesome6
+            color={colors.background}
+            name="plus"
+            size={8}
+            solid
+          />
+        </View>
+      </Pressable>
+    ) : null;
+
+  const bubbleActionRow = (
+    <View
+      style={[styles.bubbleActionRow, isOwn ? styles.bubbleActionRowOwn : null]}
+      testID={`chat-bubble-action-row-${message.id}`}
+    >
+      {bubble}
+      {reactionAffordance}
+    </View>
+  );
+
   if (isOwn) {
     return (
       <View style={[styles.row, styles.ownRow, selected ? styles.selectedRow : null]}>
-        <View style={[styles.messageColumn, styles.ownColumn]}>
-          {bubble}
+        <View
+          style={[styles.messageColumn, styles.ownColumn]}
+          testID={`chat-column-${message.id}`}
+        >
+          {bubbleActionRow}
           {actionDraftCards}
           {reactions}
           {meta}
@@ -472,6 +552,7 @@ function ChatMessageBubbleComponent({
           styles.otherColumn,
           message.sender_kind === 'AI' ? styles.aiColumn : null,
         ]}
+        testID={`chat-column-${message.id}`}
       >
         {showSender ? (
           <View style={styles.senderRow}>
@@ -483,7 +564,7 @@ function ChatMessageBubbleComponent({
             ) : null}
           </View>
         ) : null}
-        {bubble}
+        {bubbleActionRow}
         {actionDraftCards}
         {reactions}
         {meta}
@@ -513,9 +594,9 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   selectedRow: { backgroundColor: colors.primarySoft },
-  messageColumn: { minWidth: 0, gap: spacing.xs },
-  ownColumn: { maxWidth: '82%', alignItems: 'flex-end' },
-  otherColumn: { maxWidth: '82%', alignItems: 'flex-start' },
+  messageColumn: { minWidth: 0, flexShrink: 1, gap: spacing.xs },
+  ownColumn: { maxWidth: '94%', alignItems: 'flex-end' },
+  otherColumn: { maxWidth: '88%', alignItems: 'flex-start' },
   aiColumn: { maxWidth: '100%', flex: 1, alignItems: 'stretch' },
   avatarGutter: { width: 32, minHeight: 32, justifyContent: 'flex-end' },
   aiAvatar: {
@@ -537,6 +618,7 @@ const styles = StyleSheet.create({
   senderTag: { ...typography.caption, color: colors.textMuted },
   aiSender: { color: colors.violet },
   bubble: {
+    flexShrink: 1,
     minHeight: 44,
     minWidth: 48,
     justifyContent: 'center',
@@ -564,6 +646,35 @@ const styles = StyleSheet.create({
   },
   pendingBubble: { opacity: 0.68 },
   pressed: { opacity: 0.58 },
+  reactionAffordance: {
+    position: 'relative',
+    width: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radii.full,
+    borderCurve: 'continuous',
+  },
+  reactionAffordanceBusy: { opacity: 0.55 },
+  reactionAffordanceBadge: {
+    position: 'absolute',
+    right: 7,
+    bottom: 7,
+    width: 14,
+    height: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radii.full,
+    borderCurve: 'continuous',
+    backgroundColor: colors.primary,
+  },
+  bubbleActionRow: {
+    maxWidth: '100%',
+    minHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  bubbleActionRowOwn: { flexDirection: 'row-reverse' },
   messageText: { ...typography.body, color: colors.text },
   ownMessageText: { color: colors.background },
   aiContent: { minWidth: 0, gap: spacing.sm },

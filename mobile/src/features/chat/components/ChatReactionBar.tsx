@@ -1,3 +1,4 @@
+import { FontAwesome6 } from '@expo/vector-icons';
 import { memo, useCallback, useMemo } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
@@ -6,6 +7,7 @@ import {
   type AllowedReactionEmoji,
   type ReactionSummary,
 } from '../types';
+import { ChatReactionIcon } from './ChatReactionIcon';
 
 export const REACTION_ACCESSIBILITY_LABELS: Record<AllowedReactionEmoji, string> = {
   '❤️': 'Heart',
@@ -52,8 +54,19 @@ const ReactionChip = memo(function ReactionChip({
   }${reactedByMe ? ', you reacted' : ''}`;
   const content = (
     <>
-      <Text style={styles.emoji}>{emoji}</Text>
+      <ChatReactionIcon emoji={emoji} />
       <Text style={styles.count}>{formatReactionCount(count)}</Text>
+      {reactedByMe ? (
+        <FontAwesome6
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+          color={colors.primary}
+          name="check"
+          size={11}
+          solid
+          testID={`chat-reaction-selected-${emoji}`}
+        />
+      ) : null}
     </>
   );
 
@@ -150,6 +163,5 @@ const styles = StyleSheet.create({
   },
   chipPressed: { opacity: 0.58 },
   chipBusy: { opacity: 0.55 },
-  emoji: { ...typography.body },
   count: { ...typography.caption, color: colors.text },
 });

@@ -104,10 +104,12 @@ function readyDraft(id: string, title: string) {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((next) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((next, fail) => {
     resolve = next;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
 }
 
 function axiosConfig(): InternalAxiosRequestConfig {
@@ -127,6 +129,35 @@ function expiredPatchError(draft: ReturnType<typeof makeDraft>): AxiosError {
     statusText: 'Conflict',
     config,
   });
+}
+
+function authoritativeDraftError(
+  errorCode: 'TRIP_TERMINAL' | 'FORBIDDEN' | 'TRIP_NOT_FOUND',
+): AxiosError {
+  const config = axiosConfig();
+  const accessLost = errorCode !== 'TRIP_TERMINAL';
+  const status =
+    errorCode === 'TRIP_TERMINAL'
+      ? 409
+      : errorCode === 'TRIP_NOT_FOUND'
+        ? 404
+        : 403;
+  return new AxiosError('Room authority changed', 'ERR_BAD_RESPONSE', config, {}, {
+    status,
+    data: {
+      detail: accessLost
+        ? 'You no longer have access to this trip.'
+        : 'Completed or cancelled trips are read-only.',
+      error_code: errorCode,
+    },
+    headers: new AxiosHeaders(),
+    statusText: accessLost ? 'Forbidden' : 'Conflict',
+    config,
+  });
+}
+
+function terminalDraftError(): AxiosError {
+  return authoritativeDraftError('TRIP_TERMINAL');
 }
 
 async function flushPresentationCarryover(): Promise<void> {
@@ -204,6 +235,479 @@ describe('AIActionDraftCardController resource lifecycle', () => {
     expect(mockCancel).not.toHaveBeenCalled();
     expect(mockConfirm).not.toHaveBeenCalled();
     expect(mockCheck).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['preflight', 'FORBIDDEN'],
+    ['patch', 'TRIP_TERMINAL'],
+  ] as const)(
+    'reports a live %s room-authority failure exactly once',
+    async (failureStage, errorCode) => {
+      const source = editableDraft(
+        'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        'Draft A',
+      );
+      const failure = authoritativeDraftError(errorCode);
+      const reportAuthoritativeFailure = jest.fn();
+      const coordinator = createAIReconciliationCoordinator({
+        resourceKey: `user-a:${TRIP_A}`,
+        tripId: TRIP_A,
+        reportAuthoritativeFailure,
+      });
+      if (failureStage === 'preflight') {
+        mockGet.mockRejectedValueOnce(failure);
+      } else {
+        mockGet.mockResolvedValueOnce({ draft: source });
+        mockPatch.mockRejectedValueOnce(failure);
+      }
+
+      await render(
+        <AIReconciliationCoordinatorProvider value={coordinator}>
+          <AIActionDraftCardController
+            draft={source}
+            onDraftChanged={jest.fn()}
+            tripId={TRIP_A}
+          />
+        </AIReconciliationCoordinatorProvider>,
+      );
+      await fireEvent.press(screen.getByRole('button', { name: 'Edit draft' }));
+      await fireEvent.changeText(screen.getByLabelText('Title'), 'Local edit');
+      await fireEvent.press(
+        screen.getByRole('button', { name: 'Save draft information' }),
+      );
+
+      expect(reportAuthoritativeFailure).toHaveBeenCalledTimes(1);
+      expect(reportAuthoritativeFailure).toHaveBeenCalledWith(
+        expect.objectContaining({ errorCode }),
+      );
+    },
+  );
+
+  it.each(['confirm', 'check'] as const)(
+    'reports %s authority normalized inside the confirm controller exactly once',
+    async (operation) => {
+      const source = readyDraft(
+        'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        'Draft A',
+      );
+      const failure = authoritativeDraftError('TRIP_NOT_FOUND');
+      const reportAuthoritativeFailure = jest.fn();
+      const coordinator = createAIReconciliationCoordinator({
+        resourceKey: `user-a:${TRIP_A}`,
+        tripId: TRIP_A,
+        reportAuthoritativeFailure,
+      });
+      mockGet.mockResolvedValueOnce({ draft: source });
+      if (operation === 'confirm') {
+        mockConfirm.mockImplementationOnce(async (options) => {
+          const normalized = options.dependencies?.normalizeError(
+            failure,
+            'get',
+            source.id,
+          );
+          if (normalized === undefined) {
+            throw new Error('Expected scoped confirm dependencies.');
+          }
+          return {
+            ...createConfirmAmbiguityState(source),
+            kind: 'unknown',
+            failure: normalized,
+            message: normalized.message,
+            canCheckStatus: true,
+          };
+        });
+      } else {
+        mockConfirm.mockResolvedValueOnce({
+          ...createConfirmAmbiguityState(source),
+          kind: 'unknown',
+          message: 'The confirmation outcome is unknown.',
+          canCheckStatus: true,
+        });
+        mockCheck.mockImplementationOnce(async (options) => {
+          const normalized = options.dependencies?.normalizeError(
+            failure,
+            'get',
+            source.id,
+          );
+          if (normalized === undefined) {
+            throw new Error('Expected scoped check dependencies.');
+          }
+          return {
+            ...options.state,
+            kind: 'unknown',
+            failure: normalized,
+            message: normalized.message,
+            canCheckStatus: true,
+          };
+        });
+      }
+
+      await render(
+        <AIReconciliationCoordinatorProvider value={coordinator}>
+          <AIActionDraftCardController
+            draft={source}
+            onDraftChanged={jest.fn()}
+            tripId={TRIP_A}
+          />
+        </AIReconciliationCoordinatorProvider>,
+      );
+      await fireEvent.press(screen.getByRole('button', { name: 'Confirm' }));
+      await fireEvent.press(
+        screen.getByRole('button', { name: 'Confirm this action' }),
+      );
+      if (operation === 'check') {
+        await fireEvent.press(
+          screen.getByRole('button', { name: 'Check status' }),
+        );
+      }
+
+      expect(reportAuthoritativeFailure).toHaveBeenCalledTimes(1);
+      expect(reportAuthoritativeFailure).toHaveBeenCalledWith(
+        expect.objectContaining({ errorCode: 'TRIP_NOT_FOUND' }),
+      );
+    },
+  );
+
+  it('reports a live cancel room-authority failure exactly once', async () => {
+    const source = readyDraft(
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'Draft A',
+    );
+    const reportAuthoritativeFailure = jest.fn();
+    const coordinator = createAIReconciliationCoordinator({
+      resourceKey: `user-a:${TRIP_A}`,
+      tripId: TRIP_A,
+      reportAuthoritativeFailure,
+    });
+    mockGet.mockResolvedValueOnce({ draft: source });
+    mockCancel.mockRejectedValueOnce(
+      authoritativeDraftError('TRIP_NOT_FOUND'),
+    );
+
+    await render(
+      <AIReconciliationCoordinatorProvider value={coordinator}>
+        <AIActionDraftCardController
+          draft={source}
+          onDraftChanged={jest.fn()}
+          tripId={TRIP_A}
+        />
+      </AIReconciliationCoordinatorProvider>,
+    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Cancel' }));
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Cancel this draft' }),
+    );
+
+    expect(reportAuthoritativeFailure).toHaveBeenCalledTimes(1);
+    expect(reportAuthoritativeFailure).toHaveBeenCalledWith(
+      expect.objectContaining({ errorCode: 'TRIP_NOT_FOUND' }),
+    );
+  });
+
+  it('does not report room authority from a stale disabled operation', async () => {
+    const source = editableDraft(
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'Draft A',
+    );
+    const pendingPatch = deferred<AIActionDraftEnvelope>();
+    const reportAuthoritativeFailure = jest.fn();
+    const coordinator = createAIReconciliationCoordinator({
+      resourceKey: `user-a:${TRIP_A}`,
+      tripId: TRIP_A,
+      reportAuthoritativeFailure,
+    });
+    mockGet.mockResolvedValueOnce({ draft: source });
+    mockPatch.mockReturnValueOnce(pendingPatch.promise);
+    const rendered = await render(
+      <AIReconciliationCoordinatorProvider value={coordinator}>
+        <AIActionDraftCardController
+          draft={source}
+          onDraftChanged={jest.fn()}
+          tripId={TRIP_A}
+        />
+      </AIReconciliationCoordinatorProvider>,
+    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Edit draft' }));
+    await fireEvent.changeText(screen.getByLabelText('Title'), 'Local edit');
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Save draft information' }),
+    );
+    await rendered.rerender(
+      <AIReconciliationCoordinatorProvider value={coordinator}>
+        <AIActionDraftCardController
+          draft={source}
+          interactionDisabled
+          onDraftChanged={jest.fn()}
+          tripId={TRIP_A}
+        />
+      </AIReconciliationCoordinatorProvider>,
+    );
+
+    await act(async () => {
+      pendingPatch.reject(authoritativeDraftError('TRIP_TERMINAL'));
+      await pendingPatch.promise.catch(() => undefined);
+    });
+    expect(reportAuthoritativeFailure).not.toHaveBeenCalled();
+  });
+
+  it('aborts and fences an in-flight PATCH when interaction becomes disabled', async () => {
+    const source = editableDraft(
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'Draft A',
+    );
+    const pendingPatch = deferred<AIActionDraftEnvelope>();
+    let patchSignal: AbortSignal | undefined;
+    const changed = jest.fn();
+    mockGet.mockResolvedValueOnce({ draft: source });
+    mockPatch.mockImplementationOnce(
+      async (_tripId, _draftId, _payload, signal) => {
+        patchSignal = signal;
+        return pendingPatch.promise;
+      },
+    );
+    const rendered = await render(
+      <AIActionDraftCardController
+        draft={source}
+        onDraftChanged={changed}
+        tripId={TRIP_A}
+      />,
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Edit draft' }));
+    await fireEvent.changeText(screen.getByLabelText('Title'), 'Local edit');
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Save draft information' }),
+    );
+    expect(patchSignal?.aborted).toBe(false);
+
+    await rendered.rerender(
+      <AIActionDraftCardController
+        draft={source}
+        interactionDisabled
+        onDraftChanged={changed}
+        tripId={TRIP_A}
+      />,
+    );
+
+    expect(patchSignal?.aborted).toBe(true);
+    expect(
+      screen.getByRole('button', { name: 'Save draft information' }).props
+        .accessibilityState,
+    ).toMatchObject({ busy: false, disabled: true });
+    expect(screen.getByText(/draft actions became unavailable/i)).toBeTruthy();
+
+    await act(async () => {
+      pendingPatch.resolve({
+        draft: makeDraft({
+          ...source,
+          display: { title: 'Late PATCH', kicker: 'Expense' },
+          updated_at: '2026-05-13T00:10:00.000Z',
+        }),
+      });
+      await pendingPatch.promise;
+    });
+    expect(changed).not.toHaveBeenCalled();
+    expect(screen.queryByText('Late PATCH')).toBeNull();
+
+    await rendered.rerender(
+      <AIActionDraftCardController
+        draft={source}
+        onDraftChanged={changed}
+        tripId={TRIP_A}
+      />,
+    );
+    expect(
+      screen.getByRole('button', { name: 'Save draft information' }).props
+        .accessibilityState,
+    ).toMatchObject({ busy: false, disabled: false });
+  });
+
+  it('escalates terminal PATCH authority from one draft to the room coordinator', async () => {
+    const source = editableDraft(
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'Draft A',
+    );
+    const reportAuthoritativeFailure = jest.fn();
+    const coordinator = createAIReconciliationCoordinator({
+      resourceKey: `user-a:${TRIP_A}`,
+      tripId: TRIP_A,
+      reportAuthoritativeFailure,
+    });
+    mockGet.mockResolvedValueOnce({ draft: source });
+    mockPatch.mockRejectedValueOnce(terminalDraftError());
+
+    await render(
+      <AIReconciliationCoordinatorProvider value={coordinator}>
+        <AIActionDraftCardController
+          draft={source}
+          onDraftChanged={jest.fn()}
+          tripId={TRIP_A}
+        />
+      </AIReconciliationCoordinatorProvider>,
+    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Edit draft' }));
+    await fireEvent.changeText(screen.getByLabelText('Title'), 'Local edit');
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Save draft information' }),
+    );
+
+    expect(reportAuthoritativeFailure).toHaveBeenCalledTimes(1);
+    expect(reportAuthoritativeFailure).toHaveBeenCalledWith(
+      expect.objectContaining({
+        errorCode: 'TRIP_TERMINAL',
+        status: 409,
+      }),
+    );
+  });
+
+  it('aborts and fences an in-flight cancel when interaction becomes disabled', async () => {
+    const source = readyDraft(
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'Draft A',
+    );
+    const confirmed = makeDraft({
+      ...source,
+      status: 'CONFIRMED',
+      can_confirm: false,
+      can_cancel: false,
+      updated_at: '2026-05-13T00:10:00.000Z',
+    });
+    const pendingCancel = deferred<AIActionDraftEnvelope>();
+    let cancelSignal: AbortSignal | undefined;
+    const changed = jest.fn();
+    mockGet.mockResolvedValueOnce({ draft: source });
+    mockCancel.mockImplementationOnce(async (_tripId, _draftId, signal) => {
+      cancelSignal = signal;
+      return pendingCancel.promise;
+    });
+    const rendered = await render(
+      <AIActionDraftCardController
+        draft={source}
+        onDraftChanged={changed}
+        tripId={TRIP_A}
+      />,
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Cancel' }));
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Cancel this draft' }),
+    );
+    expect(cancelSignal?.aborted).toBe(false);
+
+    await rendered.rerender(
+      <AIActionDraftCardController
+        draft={source}
+        interactionDisabled
+        onDraftChanged={changed}
+        tripId={TRIP_A}
+      />,
+    );
+
+    expect(cancelSignal?.aborted).toBe(true);
+    expect(
+      screen.getByRole('button', { name: 'Cancel' }).props.accessibilityState,
+    ).toMatchObject({ busy: false, disabled: true });
+
+    await act(async () => {
+      pendingCancel.resolve({ draft: confirmed });
+      await pendingCancel.promise;
+    });
+    expect(changed).not.toHaveBeenCalled();
+    expect(mockReconcile).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('Draft status: Ready')).toBeTruthy();
+
+    await rendered.rerender(
+      <AIActionDraftCardController
+        draft={source}
+        onDraftChanged={changed}
+        tripId={TRIP_A}
+      />,
+    );
+    expect(
+      screen.getByRole('button', { name: 'Cancel' }).props.accessibilityState,
+    ).toMatchObject({ busy: false, disabled: false });
+  });
+
+  it('fails closed and fences an in-flight confirm when interaction becomes disabled', async () => {
+    const source = readyDraft(
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'Draft A',
+    );
+    const confirmed = makeDraft({
+      ...source,
+      status: 'CONFIRMED',
+      can_confirm: false,
+      can_cancel: false,
+      updated_at: '2026-05-13T00:10:00.000Z',
+    });
+    const pendingConfirm = deferred<ReturnType<typeof createConfirmAmbiguityState>>();
+    let confirmSignal: AbortSignal | undefined;
+    const changed = jest.fn();
+    mockGet.mockResolvedValueOnce({ draft: source });
+    mockConfirm.mockImplementationOnce(async (options) => {
+      confirmSignal = options.signal;
+      const next = await pendingConfirm.promise;
+      const reconcile = options.dependencies?.reconcile;
+      if (reconcile === undefined) {
+        throw new Error('Expected injected confirm dependencies.');
+      }
+      await reconcile({
+        tripId: TRIP_A,
+        previousDraft: source,
+        nextDraft: confirmed,
+      });
+      return next;
+    });
+    const rendered = await render(
+      <AIActionDraftCardController
+        draft={source}
+        onDraftChanged={changed}
+        tripId={TRIP_A}
+      />,
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Confirm' }));
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Confirm this action' }),
+    );
+    expect(confirmSignal?.aborted).toBe(false);
+
+    await rendered.rerender(
+      <AIActionDraftCardController
+        draft={source}
+        interactionDisabled
+        onDraftChanged={changed}
+        tripId={TRIP_A}
+      />,
+    );
+
+    expect(confirmSignal?.aborted).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Confirm' })).toBeNull();
+    expect(
+      screen.getByRole('button', { name: 'Check status' }).props
+        .accessibilityState,
+    ).toMatchObject({ busy: false, disabled: true });
+    expect(screen.getByText(/draft actions became unavailable/i)).toBeTruthy();
+
+    await act(async () => {
+      pendingConfirm.resolve(createConfirmAmbiguityState(confirmed));
+      await pendingConfirm.promise;
+    });
+    expect(changed).not.toHaveBeenCalled();
+    expect(mockReconcile).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('Draft status: Ready')).toBeTruthy();
+
+    await rendered.rerender(
+      <AIActionDraftCardController
+        draft={source}
+        onDraftChanged={changed}
+        tripId={TRIP_A}
+      />,
+    );
+    expect(
+      screen.getByRole('button', { name: 'Check status' }).props
+        .accessibilityState,
+    ).toMatchObject({ busy: false, disabled: false });
   });
 
   it('aborts resource A and ignores its late completion after switching to B', async () => {

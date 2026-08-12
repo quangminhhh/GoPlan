@@ -89,6 +89,10 @@ export class FakeSocket implements RealtimeSocket {
     this.onclose?.({ code });
   }
 
+  error(): void {
+    this.onerror?.();
+  }
+
   send(data: string): void {
     this.sent.push(data);
   }
@@ -122,6 +126,7 @@ export class FakeManager implements RealtimeManager {
   readonly connectCalls: RealtimeOwner[] = [];
   readonly restartCalls: RealtimeOwner[] = [];
   readonly disconnectCalls: RealtimeDisconnectReason[] = [];
+  retryConnectionCalls = 0;
   readonly events: string[] = [];
   private snapshot: RealtimeSnapshot = {
     status: 'disconnected',
@@ -146,6 +151,12 @@ export class FakeManager implements RealtimeManager {
 
   send(_message: RealtimeEnvelope): boolean {
     return false;
+  }
+
+  retryConnection(): boolean {
+    this.retryConnectionCalls += 1;
+    this.events.push('retryConnection');
+    return true;
   }
 
   subscribe(_type: string, _listener: RealtimeMessageListener): () => void {

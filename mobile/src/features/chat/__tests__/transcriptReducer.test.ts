@@ -140,12 +140,16 @@ describe('transcriptReducer', () => {
       resourceKey: RESOURCE_KEY,
       version: 0,
       roomStatus: 'idle',
+      isLoadingInitial: false,
       terminalLocked: false,
     });
     expect(first.confirmed).not.toBe(second.confirmed);
     expect(first.pending).not.toBe(second.pending);
     expect(first.hidden).not.toBe(second.hidden);
     expect(first.reactionLiveVersions).not.toBe(second.reactionLiveVersions);
+    expect(first.deferredAuthoritativePatches).not.toBe(
+      second.deferredAuthoritativePatches,
+    );
 
     const ignored = transcriptReducer(first, {
       type: 'UPSERT',
@@ -535,6 +539,115 @@ describe('transcriptReducer', () => {
       expect(after.confirmed.has('unknown')).toBe(false);
     },
   );
+
+  it('materializes a deferred full patch over a stale older page', () => {
+    const stale = message('not-loaded', { content: 'Stale older snapshot' });
+    const tombstone = message('not-loaded', {
+      content: '',
+      updated_at: '2026-08-09T10:10:00.000Z',
+      change_sequence: 10,
+      is_deleted_for_everyone: true,
+      deleted_for_everyone_at: '2026-08-09T10:10:00.000Z',
+      deleted_for_everyone_by_id: 'member-1',
+      delete_for_everyone_until: null,
+      can_delete_for_everyone: false,
+      reactions: [],
+    });
+    const initial = createTranscriptState(RESOURCE_KEY);
+    const deferred = transcriptReducer(initial, {
+      type: 'PATCH_KNOWN',
+      resourceKey: RESOURCE_KEY,
+      messages: [tombstone],
+      requestVersion: initial.version,
+    });
+
+    expect(deferred.confirmed.has(stale.id)).toBe(false);
+    expect(deferred.deferredAuthoritativePatches.has(stale.id)).toBe(true);
+
+    const materialized = transcriptReducer(deferred, {
+      type: 'OLDER_RESOLVED',
+      resourceKey: RESOURCE_KEY,
+      messages: [stale],
+      nextCursor: null,
+      requestVersion: initial.version,
+    });
+
+    expect(materialized.confirmed.get(stale.id)).toEqual(tombstone);
+    expect(materialized.deferredAuthoritativePatches.has(stale.id)).toBe(false);
+  });
+
+  it('composes deferred full and reaction authority before an older row appears', () => {
+    const stale = message('not-loaded', { content: 'Stale older snapshot' });
+    const updated = message('not-loaded', {
+      content: 'Changed while not loaded',
+      updated_at: '2026-08-09T10:10:00.000Z',
+      change_sequence: 10,
+    });
+    const latestReactions = [reaction('😂', ['member-2'])];
+    const initial = createTranscriptState(RESOURCE_KEY);
+    const withFullPatch = transcriptReducer(initial, {
+      type: 'PATCH_KNOWN',
+      resourceKey: RESOURCE_KEY,
+      messages: [updated],
+      requestVersion: initial.version,
+    });
+    const withReactionPatch = transcriptReducer(withFullPatch, {
+      type: 'REACTION_PATCH',
+      resourceKey: RESOURCE_KEY,
+      messageId: stale.id,
+      reactions: latestReactions,
+      changeSequence: 11,
+      updatedAt: '2026-08-09T10:11:00.000Z',
+    });
+
+    const materialized = transcriptReducer(withReactionPatch, {
+      type: 'UPSERT',
+      resourceKey: RESOURCE_KEY,
+      messages: [stale],
+      requestVersion: initial.version,
+    });
+
+    expect(materialized.confirmed.get(stale.id)).toMatchObject({
+      content: updated.content,
+      reactions: latestReactions,
+      change_sequence: 11,
+      updated_at: '2026-08-09T10:11:00.000Z',
+    });
+    expect(materialized.deferredAuthoritativePatches.size).toBe(0);
+  });
+
+  it('keeps a deferred tombstone authoritative over a later reaction push', () => {
+    const stale = message('not-loaded');
+    const tombstone = message('not-loaded', {
+      content: '',
+      change_sequence: 10,
+      is_deleted_for_everyone: true,
+      deleted_for_everyone_at: '2026-08-09T10:10:00.000Z',
+      reactions: [],
+    });
+    const initial = createTranscriptState(RESOURCE_KEY);
+    const deferred = transcriptReducer(initial, {
+      type: 'PATCH_KNOWN',
+      resourceKey: RESOURCE_KEY,
+      messages: [tombstone],
+    });
+    const afterImpossibleReaction = transcriptReducer(deferred, {
+      type: 'REACTION_PATCH',
+      resourceKey: RESOURCE_KEY,
+      messageId: stale.id,
+      reactions: [reaction('👍', ['member-2'])],
+      changeSequence: 11,
+      updatedAt: '2026-08-09T10:11:00.000Z',
+    });
+    const materialized = transcriptReducer(afterImpossibleReaction, {
+      type: 'UPSERT',
+      resourceKey: RESOURCE_KEY,
+      messages: [stale],
+    });
+
+    expect(afterImpossibleReaction).toBe(deferred);
+    expect(materialized.confirmed.get(stale.id)).toEqual(tombstone);
+  });
 
   it('rejects a known REST patch that began before a local optimistic mutation', () => {
     const base = message('server-1', {
@@ -1266,6 +1379,150 @@ describe('transcriptReducer', () => {
     });
     expect(afterLiveHistoryUpdate.confirmed.has('server-2')).toBe(true);
     expect(afterLiveHistoryUpdate.terminalLocked).toBe(true);
+
+    const afterTerminalHistoryLoad = transcriptReducer(locked, {
+      type: 'INIT_RESOLVED',
+      resourceKey: RESOURCE_KEY,
+      messages: [message('server-history')],
+      nextCursor: null,
+      requestVersion: locked.version,
+    });
+    expect(afterTerminalHistoryLoad.confirmed.has('server-history')).toBe(true);
+    expect(afterTerminalHistoryLoad.terminalLocked).toBe(true);
+  });
+
+  it('normalizes terminal state while preserving an active read-only page', () => {
+    let state = transcriptReducer(createTranscriptState(RESOURCE_KEY), {
+      type: 'INIT_START',
+      resourceKey: RESOURCE_KEY,
+    });
+    state = transcriptReducer(state, {
+      type: 'OLDER_START',
+      resourceKey: RESOURCE_KEY,
+    });
+    state = transcriptReducer(state, {
+      type: 'CATCHUP_PHASE',
+      resourceKey: RESOURCE_KEY,
+      phase: 'gap',
+    });
+
+    const locked = transcriptReducer(state, {
+      type: 'TERMINAL_LOCK',
+      resourceKey: RESOURCE_KEY,
+      error: terminalFailure,
+      requestVersion: state.version,
+    });
+
+    expect(locked).toMatchObject({
+      roomStatus: 'ready',
+      roomError: null,
+      terminalLocked: true,
+      isLoadingOlder: true,
+      olderLoadError: null,
+      isGapFilling: true,
+      isUpdating: false,
+    });
+    expect(
+      transcriptReducer(locked, {
+        type: 'INIT_START',
+        resourceKey: RESOURCE_KEY,
+      }),
+    ).toBe(locked);
+    expect(
+      transcriptReducer(locked, {
+        type: 'OLDER_START',
+        resourceKey: RESOURCE_KEY,
+      }),
+    ).toBe(locked);
+    const updating = transcriptReducer(locked, {
+      type: 'CATCHUP_PHASE',
+      resourceKey: RESOURCE_KEY,
+      phase: 'update',
+    });
+    expect(updating).toMatchObject({
+      terminalLocked: true,
+      isGapFilling: false,
+      isUpdating: true,
+    });
+  });
+
+  it('allows terminal history pagination to expose and settle its busy state', () => {
+    const initialized = transcriptReducer(createTranscriptState(RESOURCE_KEY), {
+      type: 'INIT_RESOLVED',
+      resourceKey: RESOURCE_KEY,
+      messages: [message('newest')],
+      nextCursor: 'older-page',
+      requestVersion: 0,
+    });
+    const locked = transcriptReducer(initialized, {
+      type: 'TERMINAL_LOCK',
+      resourceKey: RESOURCE_KEY,
+      error: terminalFailure,
+      requestVersion: initialized.version,
+    });
+    const loading = transcriptReducer(locked, {
+      type: 'OLDER_START',
+      resourceKey: RESOURCE_KEY,
+    });
+
+    expect(loading.isLoadingOlder).toBe(true);
+    expect(
+      transcriptReducer(loading, {
+        type: 'OLDER_START',
+        resourceKey: RESOURCE_KEY,
+      }),
+    ).toBe(loading);
+
+    const settled = transcriptReducer(loading, {
+      type: 'OLDER_RESOLVED',
+      resourceKey: RESOURCE_KEY,
+      messages: [message('older')],
+      nextCursor: null,
+      requestVersion: loading.version,
+    });
+    expect(settled.isLoadingOlder).toBe(false);
+    expect(settled.hasMoreOlder).toBe(false);
+    expect(settled.confirmed.has('older')).toBe(true);
+    expect(settled.terminalLocked).toBe(true);
+  });
+
+  it('exposes terminal initial-history retry without replacing the read-only room', () => {
+    const locked = transcriptReducer(createTranscriptState(RESOURCE_KEY), {
+      type: 'TERMINAL_LOCK',
+      resourceKey: RESOURCE_KEY,
+      error: terminalFailure,
+      requestVersion: 0,
+    });
+    const loading = transcriptReducer(locked, {
+      type: 'INIT_START',
+      resourceKey: RESOURCE_KEY,
+    });
+
+    expect(loading).toMatchObject({
+      roomStatus: 'ready',
+      terminalLocked: true,
+      isLoadingInitial: true,
+      roomError: null,
+    });
+    expect(
+      transcriptReducer(loading, {
+        type: 'INIT_START',
+        resourceKey: RESOURCE_KEY,
+      }),
+    ).toBe(loading);
+
+    const failed = transcriptReducer(loading, {
+      type: 'INIT_FAILED',
+      resourceKey: RESOURCE_KEY,
+      error: failure,
+      requestVersion: loading.version,
+    });
+    expect(failed).toMatchObject({
+      roomStatus: 'ready',
+      terminalLocked: true,
+      isLoadingInitial: false,
+      roomError: failure,
+    });
   });
 
   it('suspends only active work while preserving confirmed history and retryable sends', () => {

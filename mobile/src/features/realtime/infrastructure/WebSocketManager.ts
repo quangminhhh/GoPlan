@@ -1,5 +1,9 @@
 import { isAuthTicketCurrent } from '@/shared/api/authSessionLifecycle';
 import {
+  type RealtimeDiagnosticCategory,
+  type RealtimeDiagnosticReason,
+  type RealtimeDiagnostics,
+  type RealtimeDisconnectReason,
   type RealtimeEnvelope,
   type RealtimeManager,
   type RealtimeMessageListener,
@@ -16,6 +20,7 @@ const SOCKET_OPEN = 1;
 
 export const REALTIME_TIMING = {
   openTimeoutMs: 30_000,
+  errorCloseGraceMs: 500,
   heartbeatIntervalMs: 25_000,
   heartbeatTimeoutMs: 30_000,
   maxReconnectAttempts: 10,
@@ -28,6 +33,29 @@ export const REALTIME_TIMING = {
 interface SocketOpenTimeout {
   handle: TimerHandle | null;
   socket: RealtimeSocket;
+}
+
+interface SocketErrorCloseTimeout {
+  handle: TimerHandle | null;
+  socket: RealtimeSocket;
+}
+
+interface ReconnectTimeout {
+  handle: TimerHandle | null;
+}
+
+interface HeartbeatTimeout {
+  handle: TimerHandle | null;
+}
+
+interface HeartbeatInterval {
+  handle: TimerHandle | null;
+}
+
+interface ReconnectCause {
+  reason: RealtimeDiagnosticReason;
+  category: RealtimeDiagnosticCategory;
+  closeCode?: number | null;
 }
 
 export interface RealtimeSocket {
@@ -47,6 +75,18 @@ export type RealtimeSocketFactory = (
 
 type TimerHandle = ReturnType<typeof setTimeout>;
 type TicketRequestKind = 'issue' | 'refresh';
+
+const INITIAL_DIAGNOSTICS: RealtimeDiagnostics = {
+  phase: 'idle',
+  reason: null,
+  category: null,
+  terminal: false,
+  closeCode: null,
+  reconnectAttempt: 0,
+  retryDelayMs: null,
+  ticketPhase: null,
+  heartbeat: 'inactive',
+};
 
 export interface RealtimeScheduler {
   setTimeout(callback: () => void, delayMs: number): TimerHandle;
@@ -135,6 +175,7 @@ export class WebSocketManager implements RealtimeManager {
   private snapshot: RealtimeSnapshot = {
     status: 'disconnected',
     connectionEpoch: 0,
+    diagnostics: { ...INITIAL_DIAGNOSTICS },
   };
   private currentOwner: RealtimeOwner | null = null;
   private hardStoppedOwner: RealtimeOwner | null = null;
@@ -142,10 +183,11 @@ export class WebSocketManager implements RealtimeManager {
   private isConnecting = false;
   private reconnectAttempt = 0;
   private reconnectBootstrapUsed = false;
-  private reconnectTimer: TimerHandle | null = null;
+  private reconnectTimer: ReconnectTimeout | null = null;
   private openTimeout: SocketOpenTimeout | null = null;
-  private heartbeatTimer: TimerHandle | null = null;
-  private heartbeatTimeoutTimer: TimerHandle | null = null;
+  private errorCloseTimeout: SocketErrorCloseTimeout | null = null;
+  private heartbeatTimer: HeartbeatInterval | null = null;
+  private heartbeatTimeoutTimer: HeartbeatTimeout | null = null;
   private awaitingPong = false;
   private destroyed = false;
 
@@ -157,6 +199,12 @@ export class WebSocketManager implements RealtimeManager {
 
   connect(owner: RealtimeOwner): void {
     if (!this.canUseOwner(owner)) return;
+    if (
+      sameOwner(this.currentOwner, owner) &&
+      this.snapshot.diagnostics?.terminal === true
+    ) {
+      return;
+    }
     if (!sameOwner(this.currentOwner, owner)) {
       this.invalidateWork(true);
       this.currentOwner = copyOwner(owner);
@@ -172,6 +220,16 @@ export class WebSocketManager implements RealtimeManager {
     }
 
     const status = this.snapshot.connectionEpoch > 0 ? 'reconnecting' : 'connecting';
+    if (status === 'connecting') {
+      this.updateSnapshot(status, {
+        reason: null,
+        category: null,
+        terminal: false,
+        closeCode: null,
+        reconnectAttempt: 0,
+        retryDelayMs: null,
+      });
+    }
     this.beginTicketRequest(owner, 'issue', status);
   }
 
@@ -180,24 +238,90 @@ export class WebSocketManager implements RealtimeManager {
     this.invalidateWork(true);
     this.currentOwner = copyOwner(owner);
     this.hardStoppedOwner = null;
+    this.updateSnapshot('reconnecting', {
+      phase: 'idle',
+      reason: 'runtime_restart',
+      category: 'lifecycle',
+      terminal: false,
+      closeCode: null,
+      reconnectAttempt: 0,
+      retryDelayMs: null,
+      ticketPhase: null,
+      heartbeat: 'inactive',
+    });
     this.beginTicketRequest(owner, 'issue', 'reconnecting');
   }
 
-  disconnect(_reason: 'auth' | 'background' | 'offline' | 'unmount'): void {
+  disconnect(reason: RealtimeDisconnectReason): void {
     if (this.destroyed) return;
+    const preserveAuthenticationFailure =
+      (reason === 'background' || reason === 'offline') &&
+      this.snapshot.diagnostics?.reason === 'authentication_failed' &&
+      this.snapshot.diagnostics.terminal === true &&
+      this.currentOwner !== null &&
+      sameOwner(this.hardStoppedOwner, this.currentOwner);
     this.invalidateWork(true);
     this.currentOwner = null;
-    this.setStatus('disconnected');
+    if (preserveAuthenticationFailure) return;
+    this.updateSnapshot('disconnected', {
+      phase: 'stopped',
+      reason: this.disconnectDiagnosticReason(reason),
+      category: 'lifecycle',
+      terminal: reason === 'unmount',
+      closeCode: null,
+      reconnectAttempt: 0,
+      retryDelayMs: null,
+      ticketPhase: null,
+      heartbeat: 'inactive',
+    });
   }
 
   send(message: RealtimeEnvelope): boolean {
-    if (this.socket?.readyState !== SOCKET_OPEN) return false;
+    const socket = this.socket;
+    const owner = this.currentOwner;
+    const requestId = this.connectRequestId;
+    if (
+      this.snapshot.status !== 'connected' ||
+      socket?.readyState !== SOCKET_OPEN ||
+      owner === null
+    ) {
+      return false;
+    }
+
+    let serialized: string;
     try {
-      this.socket.send(JSON.stringify(message));
-      return true;
+      const encoded = JSON.stringify(message);
+      if (encoded === undefined) return false;
+      serialized = encoded;
     } catch {
       return false;
     }
+
+    try {
+      socket.send(serialized);
+      return true;
+    } catch {
+      this.failActiveSocket(socket, owner, requestId, {
+        reason: 'send_failed',
+        category: 'transport',
+      });
+      return false;
+    }
+  }
+
+  retryConnection(): boolean {
+    const owner = this.currentOwner;
+    if (
+      this.destroyed ||
+      owner === null ||
+      this.snapshot.diagnostics?.terminal !== true ||
+      this.snapshot.diagnostics.reason !== 'retry_exhausted'
+    ) {
+      return false;
+    }
+
+    this.restart(owner);
+    return this.snapshot.status === 'reconnecting';
   }
 
   subscribe(type: string, listener: RealtimeMessageListener): () => void {
@@ -261,14 +385,31 @@ export class WebSocketManager implements RealtimeManager {
     } catch {
       this.invalidateWork(true);
       this.currentOwner = copyOwner(owner);
-      this.setStatus('disconnected');
+      this.updateSnapshot('disconnected', {
+        phase: 'stopped',
+        reason: 'invalid_configuration',
+        category: 'configuration',
+        terminal: true,
+        closeCode: null,
+        reconnectAttempt: 0,
+        retryDelayMs: null,
+        ticketPhase: null,
+        heartbeat: 'inactive',
+      });
       return;
     }
 
     this.clearReconnectTimer();
     const requestId = ++this.connectRequestId;
     this.isConnecting = true;
-    this.setStatus(status);
+    this.updateSnapshot(status, {
+      phase: 'requesting_ticket',
+      terminal: false,
+      reconnectAttempt: this.reconnectAttempt,
+      retryDelayMs: null,
+      ticketPhase: requestKind,
+      heartbeat: 'inactive',
+    });
     void this.fetchTicket(url, owner, requestId, requestKind);
   }
 
@@ -305,26 +446,36 @@ export class WebSocketManager implements RealtimeManager {
       socket = this.dependencies.socketFactory(url, [WS_SUBPROTOCOL, ticket]);
     } catch {
       this.isConnecting = false;
-      this.scheduleReconnect(owner, 'issue');
+      this.scheduleReconnect(owner, 'issue', {
+        reason: 'socket_factory_failed',
+        category: 'transport',
+      });
       return;
     }
 
     this.socket = socket;
     let authHandled = false;
+    // An open handshake alone is not evidence of a healthy connection. Keep
+    // the retry budget across short-lived sockets until this socket answers a
+    // heartbeat that the client actually sent.
+    let stabilityConfirmed = false;
+    this.updateSnapshot(this.snapshot.status, {
+      phase: 'opening_socket',
+      ticketPhase: null,
+    });
     this.startOpenTimeout(socket, owner, requestId);
 
     socket.onopen = () => {
       this.clearOpenTimeout(socket);
+      this.clearErrorCloseTimeout(socket);
       if (!this.isActiveSocket(socket, owner, requestId)) {
         this.detachSocket(socket, true);
         return;
       }
       this.isConnecting = false;
       this.clearReconnectTimer();
-      this.reconnectAttempt = 0;
-      this.reconnectBootstrapUsed = false;
-      this.markConnected();
       this.startHeartbeat(socket, owner, requestId);
+      this.markConnected();
     };
 
     socket.onmessage = (event) => {
@@ -338,7 +489,7 @@ export class WebSocketManager implements RealtimeManager {
         this.detachSocket(socket, true);
         this.stopHeartbeat();
         if (authErrorCode(message) === 'token_expired') {
-          this.beginTicketRequest(owner, 'refresh', 'reconnecting');
+          this.handleTokenExpiry(owner);
         } else {
           this.hardStop(owner);
         }
@@ -346,7 +497,21 @@ export class WebSocketManager implements RealtimeManager {
       }
 
       if (message.type === 'pong') {
+        if (this.snapshot.status !== 'connected') return;
+        const answeredHeartbeat = this.awaitingPong;
         this.clearHeartbeatTimeout();
+        if (!stabilityConfirmed && answeredHeartbeat) {
+          stabilityConfirmed = true;
+          this.reconnectAttempt = 0;
+          this.reconnectBootstrapUsed = false;
+          this.updateDiagnostics({
+            reconnectAttempt: 0,
+            retryDelayMs: null,
+            heartbeat: 'scheduled',
+          });
+        } else {
+          this.updateDiagnostics({ heartbeat: 'scheduled' });
+        }
         return;
       }
 
@@ -355,22 +520,47 @@ export class WebSocketManager implements RealtimeManager {
 
     socket.onclose = (event) => {
       this.clearOpenTimeout(socket);
+      this.clearErrorCloseTimeout(socket);
       if (authHandled || !this.isActiveSocket(socket, owner, requestId)) return;
       this.detachSocket(socket, false);
       this.isConnecting = false;
       this.stopHeartbeat();
 
       if (event.code === 4002) {
-        this.beginTicketRequest(owner, 'refresh', 'reconnecting');
+        this.handleTokenExpiry(owner, event.code);
       } else if (event.code === 4001) {
-        this.hardStop(owner);
+        this.hardStop(owner, event.code);
       } else {
-        this.handleNetworkClose(owner);
+        this.handleNetworkClose(owner, {
+          reason: 'socket_closed',
+          category: 'transport',
+          closeCode: event.code,
+        });
       }
     };
 
     socket.onerror = () => {
-      // React Native reports a close after an error. The close code owns recovery.
+      if (!this.isActiveSocket(socket, owner, requestId)) return;
+
+      // Native implementations normally publish a close after an error, but
+      // React Native does not guarantee it. Leave the handlers attached briefly
+      // so an authoritative close code can win, while immediately leaving the
+      // falsely-connected UI state and bounding the no-close path.
+      this.clearOpenTimeout(socket);
+      this.stopHeartbeat();
+      this.updateSnapshot(
+        this.snapshot.connectionEpoch > 0 ? 'reconnecting' : 'connecting',
+        {
+          phase: 'awaiting_close',
+          reason: 'socket_error',
+          category: 'transport',
+          terminal: false,
+          retryDelayMs: null,
+          ticketPhase: null,
+          heartbeat: 'inactive',
+        },
+      );
+      this.startErrorCloseTimeout(socket, owner, requestId);
     };
   }
 
@@ -395,7 +585,10 @@ export class WebSocketManager implements RealtimeManager {
       this.detachSocket(socket, true);
       this.isConnecting = false;
       this.stopHeartbeat();
-      this.handleNetworkClose(owner);
+      this.handleNetworkClose(owner, {
+        reason: 'socket_open_timeout',
+        category: 'transport',
+      });
     }, REALTIME_TIMING.openTimeoutMs);
   }
 
@@ -403,6 +596,39 @@ export class WebSocketManager implements RealtimeManager {
     const timeout = this.openTimeout;
     if (timeout === null || (socket && timeout.socket !== socket)) return;
     this.openTimeout = null;
+    if (timeout.handle !== null) {
+      this.dependencies.scheduler.clearTimeout(timeout.handle);
+    }
+  }
+
+  private startErrorCloseTimeout(
+    socket: RealtimeSocket,
+    owner: RealtimeOwner,
+    requestId: number,
+  ): void {
+    if (this.errorCloseTimeout?.socket === socket) return;
+    this.clearErrorCloseTimeout();
+    const timeout: SocketErrorCloseTimeout = { handle: null, socket };
+    this.errorCloseTimeout = timeout;
+    timeout.handle = this.dependencies.scheduler.setTimeout(() => {
+      if (this.errorCloseTimeout !== timeout) return;
+      this.errorCloseTimeout = null;
+      if (!this.isActiveSocket(socket, owner, requestId)) return;
+
+      this.detachSocket(socket, true);
+      this.isConnecting = false;
+      this.stopHeartbeat();
+      this.handleNetworkClose(owner, {
+        reason: 'socket_error_without_close',
+        category: 'transport',
+      });
+    }, REALTIME_TIMING.errorCloseGraceMs);
+  }
+
+  private clearErrorCloseTimeout(socket?: RealtimeSocket): void {
+    const timeout = this.errorCloseTimeout;
+    if (timeout === null || (socket && timeout.socket !== socket)) return;
+    this.errorCloseTimeout = null;
     if (timeout.handle !== null) {
       this.dependencies.scheduler.clearTimeout(timeout.handle);
     }
@@ -433,26 +659,73 @@ export class WebSocketManager implements RealtimeManager {
         return;
       }
     }
-    this.scheduleReconnect(owner, requestKind);
+    this.scheduleReconnect(owner, requestKind, {
+      reason: 'ticket_request_failed',
+      category: 'ticket',
+    });
   }
 
-  private handleNetworkClose(owner: RealtimeOwner): void {
+  private handleTokenExpiry(
+    owner: RealtimeOwner,
+    closeCode: number | null = null,
+  ): void {
+    const cause: ReconnectCause = {
+      reason: 'token_expired',
+      category: 'authentication',
+      closeCode,
+    };
+    this.updateSnapshot('reconnecting', {
+      reason: cause.reason,
+      category: cause.category,
+      terminal: false,
+      closeCode,
+      retryDelayMs: null,
+      ticketPhase: null,
+      heartbeat: 'inactive',
+    });
+    if (!this.reconnectBootstrapUsed) {
+      this.reconnectBootstrapUsed = true;
+      this.beginTicketRequest(owner, 'refresh', 'reconnecting');
+      return;
+    }
+    this.scheduleReconnect(owner, 'refresh', cause);
+  }
+
+  private handleNetworkClose(owner: RealtimeOwner, cause: ReconnectCause): void {
+    this.updateSnapshot('reconnecting', {
+      reason: cause.reason,
+      category: cause.category,
+      terminal: false,
+      closeCode: cause.closeCode ?? null,
+      ticketPhase: null,
+      heartbeat: 'inactive',
+    });
     if (!this.reconnectBootstrapUsed) {
       this.reconnectBootstrapUsed = true;
       this.beginTicketRequest(owner, 'issue', 'reconnecting');
       return;
     }
-    this.scheduleReconnect(owner, 'issue');
+    this.scheduleReconnect(owner, 'issue', cause);
   }
 
   private scheduleReconnect(
     owner: RealtimeOwner,
     requestKind: TicketRequestKind,
+    cause: ReconnectCause,
   ): void {
     if (!this.canUseOwner(owner) || !sameOwner(this.currentOwner, owner)) return;
     if (this.reconnectAttempt >= REALTIME_TIMING.maxReconnectAttempts) {
       this.isConnecting = false;
-      this.setStatus('disconnected');
+      this.updateSnapshot('disconnected', {
+        phase: 'stopped',
+        reason: 'retry_exhausted',
+        category: 'retry',
+        terminal: true,
+        reconnectAttempt: this.reconnectAttempt,
+        retryDelayMs: null,
+        ticketPhase: null,
+        heartbeat: 'inactive',
+      });
       return;
     }
 
@@ -461,7 +734,12 @@ export class WebSocketManager implements RealtimeManager {
       REALTIME_TIMING.maxBackoffMs,
     );
     this.reconnectAttempt += 1;
-    this.scheduleRetry(owner, requestKind, baseDelay + this.jitterMs());
+    this.scheduleRetry(
+      owner,
+      requestKind,
+      baseDelay + this.jitterMs(),
+      cause,
+    );
   }
 
   private scheduleThrottledReconnect(
@@ -474,19 +752,39 @@ export class WebSocketManager implements RealtimeManager {
       requestedDelay + this.jitterMs(),
       REALTIME_TIMING.throttleMaxMs,
     );
-    this.scheduleRetry(owner, requestKind, delay);
+    this.scheduleRetry(owner, requestKind, delay, {
+      reason: 'ticket_throttled',
+      category: 'ticket',
+    });
   }
 
   private scheduleRetry(
     owner: RealtimeOwner,
     requestKind: TicketRequestKind,
     delayMs: number,
+    cause: ReconnectCause,
   ): void {
     if (!this.canUseOwner(owner) || !sameOwner(this.currentOwner, owner)) return;
     this.clearReconnectTimer();
     this.isConnecting = false;
-    this.setStatus('reconnecting');
-    this.reconnectTimer = this.dependencies.scheduler.setTimeout(() => {
+    this.updateSnapshot('reconnecting', {
+      phase: 'waiting_retry',
+      reason: cause.reason,
+      category: cause.category,
+      terminal: false,
+      closeCode:
+        cause.closeCode === undefined
+          ? this.snapshot.diagnostics?.closeCode ?? null
+          : cause.closeCode,
+      reconnectAttempt: this.reconnectAttempt,
+      retryDelayMs: delayMs,
+      ticketPhase: null,
+      heartbeat: 'inactive',
+    });
+    const timeout: ReconnectTimeout = { handle: null };
+    this.reconnectTimer = timeout;
+    timeout.handle = this.dependencies.scheduler.setTimeout(() => {
+      if (this.reconnectTimer !== timeout) return;
       this.reconnectTimer = null;
       this.beginTicketRequest(owner, requestKind, 'reconnecting');
     }, delayMs);
@@ -502,8 +800,12 @@ export class WebSocketManager implements RealtimeManager {
     requestId: number,
   ): void {
     this.stopHeartbeat();
-    this.heartbeatTimer = this.dependencies.scheduler.setInterval(() => {
+    const interval: HeartbeatInterval = { handle: null };
+    this.heartbeatTimer = interval;
+    interval.handle = this.dependencies.scheduler.setInterval(() => {
       if (
+        this.heartbeatTimer !== interval ||
+        this.snapshot.status !== 'connected' ||
         this.awaitingPong ||
         !this.isActiveSocket(socket, owner, requestId) ||
         socket.readyState !== SOCKET_OPEN
@@ -513,13 +815,23 @@ export class WebSocketManager implements RealtimeManager {
       try {
         socket.send(JSON.stringify({ type: 'ping' }));
       } catch {
-        this.failActiveSocket(socket, owner, requestId);
+        this.failActiveSocket(socket, owner, requestId, {
+          reason: 'heartbeat_send_failed',
+          category: 'heartbeat',
+        });
         return;
       }
       this.awaitingPong = true;
-      this.heartbeatTimeoutTimer = this.dependencies.scheduler.setTimeout(() => {
+      this.updateDiagnostics({ heartbeat: 'awaiting_pong' });
+      const timeout: HeartbeatTimeout = { handle: null };
+      this.heartbeatTimeoutTimer = timeout;
+      timeout.handle = this.dependencies.scheduler.setTimeout(() => {
+        if (this.heartbeatTimeoutTimer !== timeout) return;
         this.heartbeatTimeoutTimer = null;
-        this.failActiveSocket(socket, owner, requestId);
+        this.failActiveSocket(socket, owner, requestId, {
+          reason: 'heartbeat_timeout',
+          category: 'heartbeat',
+        });
       }, REALTIME_TIMING.heartbeatTimeoutMs);
     }, REALTIME_TIMING.heartbeatIntervalMs);
   }
@@ -528,35 +840,48 @@ export class WebSocketManager implements RealtimeManager {
     socket: RealtimeSocket,
     owner: RealtimeOwner,
     requestId: number,
+    cause: ReconnectCause,
   ): void {
     if (!this.isActiveSocket(socket, owner, requestId)) return;
     this.detachSocket(socket, true);
     this.isConnecting = false;
     this.stopHeartbeat();
-    this.handleNetworkClose(owner);
+    this.handleNetworkClose(owner, cause);
   }
 
   private stopHeartbeat(): void {
-    if (this.heartbeatTimer !== null) {
-      this.dependencies.scheduler.clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
+    const interval = this.heartbeatTimer;
+    this.heartbeatTimer = null;
+    if (interval !== null && interval.handle !== null) {
+      this.dependencies.scheduler.clearInterval(interval.handle);
     }
     this.clearHeartbeatTimeout();
   }
 
   private clearHeartbeatTimeout(): void {
-    if (this.heartbeatTimeoutTimer !== null) {
-      this.dependencies.scheduler.clearTimeout(this.heartbeatTimeoutTimer);
-      this.heartbeatTimeoutTimer = null;
+    const timeout = this.heartbeatTimeoutTimer;
+    this.heartbeatTimeoutTimer = null;
+    if (timeout !== null && timeout.handle !== null) {
+      this.dependencies.scheduler.clearTimeout(timeout.handle);
     }
     this.awaitingPong = false;
   }
 
-  private hardStop(owner: RealtimeOwner): void {
+  private hardStop(owner: RealtimeOwner, closeCode: number | null = null): void {
     this.hardStoppedOwner = copyOwner(owner);
     this.invalidateWork(true);
     this.currentOwner = copyOwner(owner);
-    this.setStatus('disconnected');
+    this.updateSnapshot('disconnected', {
+      phase: 'stopped',
+      reason: 'authentication_failed',
+      category: 'authentication',
+      terminal: true,
+      closeCode,
+      reconnectAttempt: 0,
+      retryDelayMs: null,
+      ticketPhase: null,
+      heartbeat: 'inactive',
+    });
   }
 
   private invalidateWork(resetAttempts: boolean): void {
@@ -564,6 +889,7 @@ export class WebSocketManager implements RealtimeManager {
     this.isConnecting = false;
     this.clearReconnectTimer();
     this.clearOpenTimeout();
+    this.clearErrorCloseTimeout();
     this.stopHeartbeat();
     if (this.socket !== null) {
       this.detachSocket(this.socket, true);
@@ -575,14 +901,16 @@ export class WebSocketManager implements RealtimeManager {
   }
 
   private clearReconnectTimer(): void {
-    if (this.reconnectTimer !== null) {
-      this.dependencies.scheduler.clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
+    const timeout = this.reconnectTimer;
+    this.reconnectTimer = null;
+    if (timeout !== null && timeout.handle !== null) {
+      this.dependencies.scheduler.clearTimeout(timeout.handle);
     }
   }
 
   private detachSocket(socket: RealtimeSocket, shouldClose: boolean): void {
     this.clearOpenTimeout(socket);
+    this.clearErrorCloseTimeout(socket);
     if (this.socket === socket) {
       this.socket = null;
     }
@@ -622,14 +950,42 @@ export class WebSocketManager implements RealtimeManager {
     this.snapshot = {
       status: 'connected',
       connectionEpoch: this.snapshot.connectionEpoch + 1,
+      diagnostics: {
+        ...INITIAL_DIAGNOSTICS,
+        phase: 'open',
+        reconnectAttempt: this.reconnectAttempt,
+        heartbeat: 'scheduled',
+      },
     };
     this.emitSnapshot();
   }
 
-  private setStatus(status: RealtimeSnapshot['status']): void {
-    if (this.snapshot.status === status) return;
-    this.snapshot = { ...this.snapshot, status };
+  private updateSnapshot(
+    status: RealtimeSnapshot['status'],
+    diagnosticsPatch: Partial<RealtimeDiagnostics>,
+  ): void {
+    const currentDiagnostics = this.snapshot.diagnostics ?? INITIAL_DIAGNOSTICS;
+    const diagnostics = { ...currentDiagnostics, ...diagnosticsPatch };
+    const diagnosticsChanged = (
+      Object.keys(diagnosticsPatch) as (keyof RealtimeDiagnostics)[]
+    ).some((key) => currentDiagnostics[key] !== diagnostics[key]);
+    if (this.snapshot.status === status && !diagnosticsChanged) return;
+    this.snapshot = { ...this.snapshot, status, diagnostics };
     this.emitSnapshot();
+  }
+
+  private updateDiagnostics(
+    diagnosticsPatch: Partial<RealtimeDiagnostics>,
+  ): void {
+    this.updateSnapshot(this.snapshot.status, diagnosticsPatch);
+  }
+
+  private disconnectDiagnosticReason(
+    reason: RealtimeDisconnectReason,
+  ): RealtimeDiagnosticReason {
+    if (reason === 'auth') return 'auth_unavailable';
+    if (reason === 'unmount') return 'unmounted';
+    return reason;
   }
 
   private emitSnapshot(): void {

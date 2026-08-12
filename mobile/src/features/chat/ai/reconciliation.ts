@@ -1,5 +1,6 @@
 import { publishExpenseEvent } from '@/features/expenses/expenseEvents';
 import { publishTimelineEvent } from '@/features/timeline/timelineEvents';
+import type { ChatApiFailure } from '../types';
 import {
   canonicalizeAIUuid,
   isKnownAIActionType,
@@ -80,6 +81,11 @@ export interface AIReconciliationCoordinator {
     readonly previousStatus: AIActionDraftStatus | null;
     readonly draft: AIActionDraft;
   }) => Promise<AIReconciliationChannel | null>;
+  /** Escalates room-level access/terminal authority discovered by a draft API. */
+  readonly reportAuthoritativeFailure: (failure: ChatApiFailure) => void;
+  readonly setAuthoritativeFailureReporter: (
+    reporter: ((failure: ChatApiFailure) => void) | null,
+  ) => void;
 }
 
 export function createAIReconciliationCoordinator(options: {
@@ -87,11 +93,14 @@ export function createAIReconciliationCoordinator(options: {
   readonly resourceKey?: string;
   readonly publishers?: AIReconciliationPublishers;
   readonly reconcile?: typeof reconcileNewlyConfirmedDraft;
+  readonly reportAuthoritativeFailure?: (failure: ChatApiFailure) => void;
 }): AIReconciliationCoordinator {
   const claims = new Map<
     string,
     Promise<AIReconciliationChannel | null>
   >();
+  let authoritativeFailureReporter =
+    options.reportAuthoritativeFailure ?? (() => undefined);
 
   const canonicalDraftId = (draft: AIActionDraft): string =>
     canonicalizeAIUuid(draft.id) ?? draft.id.trim().toLowerCase();
@@ -99,6 +108,11 @@ export function createAIReconciliationCoordinator(options: {
   return {
     resourceKey: options.resourceKey ?? options.tripId,
     tripId: options.tripId,
+    reportAuthoritativeFailure: (failure) =>
+      authoritativeFailureReporter(failure),
+    setAuthoritativeFailureReporter: (reporter) => {
+      authoritativeFailureReporter = reporter ?? (() => undefined);
+    },
     seedConfirmedDrafts: (drafts) => {
       for (const draft of drafts) {
         if (draft.status !== 'CONFIRMED') {

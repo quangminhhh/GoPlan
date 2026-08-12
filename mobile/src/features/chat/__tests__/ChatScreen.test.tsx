@@ -24,7 +24,10 @@ jest.mock('expo-router', () => ({
 jest.mock('../hooks/useTripChat', () => ({
   useTripChat: (input: unknown) => mockUseTripChat(input),
 }), { virtual: true });
-jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
+jest.mock('@expo/vector-icons', () => ({
+  FontAwesome6: () => null,
+  Ionicons: () => null,
+}));
 jest.mock('@/features/auth/components/UserAvatar', () => ({ UserAvatar: () => null }));
 jest.mock('react-native-safe-area-context', () => {
   const actual = jest.requireActual<
@@ -100,6 +103,9 @@ function chatResult(overrides: Record<string, unknown> = {}) {
     roomStatus: 'ready',
     subscriptionStatus: 'subscribed',
     roomError: null,
+    readSyncError: null,
+    initialLoadError: null,
+    isLoadingInitial: false,
     messages: [] as readonly ChatMessage[],
     pendingClientIds: emptySet,
     failedClientIds: emptySet,
@@ -110,6 +116,7 @@ function chatResult(overrides: Record<string, unknown> = {}) {
     isGapFilling: false,
     isUpdating: false,
     connectionStatus: 'connected',
+    connectionDiagnostics: null,
     connectionEpoch: 1,
     isReadOnly: false,
     pendingReactionMessageIds: emptySet,
@@ -121,7 +128,10 @@ function chatResult(overrides: Record<string, unknown> = {}) {
     tripStatus: 'PLANNING',
     accessStatus: 'granted',
     loadOlder: jest.fn().mockResolvedValue(undefined),
+    retryCatchUp: jest.fn(),
+    retryConnection: jest.fn().mockReturnValue(false),
     retryInitialLoad: jest.fn().mockResolvedValue(undefined),
+    retrySubscription: jest.fn(),
     sendMessage: jest.fn().mockResolvedValue({
       kind: 'created',
       clientMessageId: 'client-1',
@@ -208,6 +218,7 @@ describe('ChatScreen', () => {
   });
 
   it('keeps history but removes every composer mutation when subscription is rejected', async () => {
+    const retrySubscription = jest.fn();
     mockUseTripChat.mockReturnValue(
       chatResult({
         subscriptionStatus: 'rejected',
@@ -217,18 +228,69 @@ describe('ChatScreen', () => {
           detail: 'Too many chat rooms are subscribed.',
         },
         messages: [message('message-1')],
+        retrySubscription,
       }),
     );
     await render(<ChatScreen />);
 
     expect(screen.getByText('Content message-1')).toBeTruthy();
-    expect(screen.getByTestId('chat-subscription-rejected')).toHaveTextContent(
-      'Too many chat rooms are subscribed.',
-    );
+    expect(screen.getByText('Too many chat rooms are subscribed.')).toBeTruthy();
     expect(screen.getByTestId('chat-read-only-footer')).toBeTruthy();
     expect(screen.queryByLabelText('Message')).toBeNull();
     expect(screen.getByTestId('chat-message-message-1').props.accessibilityActions).toEqual([]);
+    await fireEvent.press(screen.getByLabelText('Retry live chat'));
+    expect(retrySubscription).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    ['COMPLETED', 'This completed trip’s chat is read-only.'],
+    ['CANCELLED', 'This cancelled trip’s chat is read-only.'],
+  ])(
+    'keeps terminal %s write-locked while exposing read-plane recovery',
+    async (tripStatus, terminalCopy) => {
+      const retrySubscription = jest.fn();
+      mockUseTripChat.mockReturnValue(
+        chatResult({
+          tripStatus,
+          isReadOnly: true,
+          subscriptionStatus: 'rejected',
+          connectionStatus: 'reconnecting',
+          roomError: {
+            errorCode: 'SUBSCRIPTION_LIMIT_REACHED',
+            detail: 'Too many chat rooms are subscribed.',
+          },
+          isGapFilling: true,
+          isUpdating: true,
+          retrySubscription,
+          mutationError: {
+            messageId: null,
+            error: failure('An unrelated mutation error.'),
+          },
+          messages: [message('message-1')],
+        }),
+      );
+      await render(<ChatScreen />);
+
+      expect(screen.getByTestId('chat-terminal-notice')).toHaveTextContent(
+        terminalCopy,
+      );
+      expect(screen.getByTestId('chat-read-only-footer')).toHaveTextContent(
+        terminalCopy,
+      );
+      expect(
+        screen.getByText(
+          'Live updates could not confirm this room. Retry to receive late messages.',
+        ),
+      ).toBeTruthy();
+      await fireEvent.press(screen.getByLabelText('Retry live updates'));
+      expect(retrySubscription).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId('chat-catch-up-status')).toHaveTextContent(
+        'Updating read-only chat history…',
+      );
+      expect(screen.queryByTestId('chat-mutation-error')).toBeNull();
+      expect(screen.queryByTestId('chat-connection-banner')).toBeNull();
+    },
+  );
 
   it('preserves a local draft while a temporary subscription rejection hides mutations', async () => {
     const readyResult = chatResult();
@@ -334,6 +396,45 @@ describe('ChatScreen', () => {
 
     expect(screen.getByTestId('chat-terminal-notice')).toHaveTextContent(copy);
     expect(screen.getByTestId('chat-read-only-footer')).toHaveTextContent(copy);
+    expect(screen.queryByLabelText('Message')).toBeNull();
+  });
+
+  it('offers a read-only history retry without reopening terminal mutations', async () => {
+    const retryInitialLoad = jest.fn().mockResolvedValue(undefined);
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        tripStatus: 'COMPLETED',
+        isReadOnly: true,
+        initialLoadError: failure('Chat history could not be loaded.'),
+        retryInitialLoad,
+      }),
+    );
+    await render(<ChatScreen />);
+
+    expect(screen.getByTestId('chat-terminal-notice')).toBeTruthy();
+    expect(
+      screen.getByTestId('chat-terminal-history-error'),
+    ).toHaveTextContent(/Chat history could not be loaded\./);
+    expect(screen.queryByLabelText('Message')).toBeNull();
+    await fireEvent.press(screen.getByLabelText('Retry chat history'));
+    expect(retryInitialLoad).toHaveBeenCalledTimes(1);
+  });
+
+  it('replaces terminal history retry with an inline loading state', async () => {
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        tripStatus: 'COMPLETED',
+        isReadOnly: true,
+        isLoadingInitial: true,
+        initialLoadError: failure('Prior history request failed.'),
+      }),
+    );
+    await render(<ChatScreen />);
+
+    expect(screen.getByTestId('chat-terminal-history-loading')).toHaveTextContent(
+      'Loading chat history…',
+    );
+    expect(screen.queryByLabelText('Retry chat history')).toBeNull();
     expect(screen.queryByLabelText('Message')).toBeNull();
   });
 
@@ -766,6 +867,81 @@ describe('ChatScreen', () => {
     );
     expect(screen.getByText('Earlier messages could not be loaded.')).toBeTruthy();
     expect(screen.getByText('Content message-1')).toBeTruthy();
+  });
+
+  it('offers an accessible in-place retry for a failed message catch-up', async () => {
+    const retryCatchUp = jest.fn();
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        messages: [message('message-1')],
+        readSyncError: {
+          errorCode: 'CHAT_SYNC_FAILED',
+          detail: 'Missed messages could not be synchronized.',
+        },
+        retryCatchUp,
+      }),
+    );
+    await render(<ChatScreen />);
+
+    expect(screen.getByText('Missed messages could not be synchronized.')).toBeTruthy();
+    await fireEvent.press(screen.getByLabelText('Retry catching up'));
+    expect(retryCatchUp).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('Content message-1')).toBeTruthy();
+  });
+
+  it('keeps a read-sync warning but hides a no-op retry until live chat is subscribed', async () => {
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        connectionStatus: 'reconnecting',
+        subscriptionStatus: 'waiting',
+        messages: [message('message-1')],
+        readSyncError: {
+          errorCode: 'CHAT_SYNC_FAILED',
+          detail: 'Read history may be stale.',
+        },
+      }),
+    );
+    await render(<ChatScreen />);
+
+    expect(screen.getByText('Read history may be stale.')).toBeTruthy();
+    expect(screen.queryByLabelText('Retry catching up')).toBeNull();
+  });
+
+  it('shows terminal transport exhaustion and restarts the actual connection', async () => {
+    const retryConnection = jest.fn().mockReturnValue(true);
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        tripStatus: 'COMPLETED',
+        isReadOnly: true,
+        connectionStatus: 'disconnected',
+        subscriptionStatus: 'waiting',
+        connectionDiagnostics: {
+          phase: 'stopped',
+          reason: 'retry_exhausted',
+          category: 'retry',
+          terminal: true,
+          closeCode: null,
+          reconnectAttempt: 10,
+          retryDelayMs: null,
+          ticketPhase: null,
+          heartbeat: 'inactive',
+        },
+        retryConnection,
+      }),
+    );
+    jest.useFakeTimers();
+    try {
+      await render(<ChatScreen />);
+      await act(async () => {
+        jest.advanceTimersByTime(2_500);
+      });
+      expect(screen.getByText(/stopped after repeated connection failures/)).toBeTruthy();
+      await fireEvent.press(screen.getByLabelText('Retry live connection'));
+      expect(retryConnection).toHaveBeenCalledTimes(1);
+      expect(screen.queryByLabelText('Message')).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('surfaces an unknown room protocol error without disabling a healthy transcript', async () => {

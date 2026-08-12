@@ -1,4 +1,4 @@
-import type { RealtimeOwner } from '../types';
+import type { RealtimeEnvelope, RealtimeOwner } from '../types';
 import { TicketRequestError } from '../infrastructure/ticket-api';
 import {
   REALTIME_TIMING,
@@ -98,6 +98,17 @@ describe('WebSocketManager', () => {
 
     expect(value.tickets.issueCalls).toBe(0);
     expect(value.manager.getSnapshot().status).toBe('disconnected');
+    expect(value.manager.getSnapshot().diagnostics).toMatchObject({
+      phase: 'stopped',
+      reason: 'invalid_configuration',
+      category: 'configuration',
+      terminal: true,
+    });
+    expect(jest.getTimerCount()).toBe(0);
+    expect(value.manager.retryConnection()).toBe(false);
+    value.manager.connect(OWNER_A);
+    await flushPromises();
+    expect(value.tickets.issueCalls).toBe(0);
     expect(jest.getTimerCount()).toBe(0);
   });
 
@@ -117,20 +128,28 @@ describe('WebSocketManager', () => {
         protocols: ['goplan.realtime.v1', 'ticket-1'],
       },
     ]);
-    expect(value.manager.getSnapshot()).toEqual({
+    expect(value.manager.getSnapshot()).toMatchObject({
       status: 'connecting',
       connectionEpoch: 0,
+      diagnostics: {
+        phase: 'opening_socket',
+        ticketPhase: null,
+      },
     });
 
     value.sockets.sockets[0].open();
-    expect(value.manager.getSnapshot()).toEqual({
+    expect(value.manager.getSnapshot()).toMatchObject({
       status: 'connected',
       connectionEpoch: 1,
+      diagnostics: {
+        phase: 'open',
+        heartbeat: 'scheduled',
+      },
     });
-    expect(snapshots).toHaveBeenLastCalledWith({
+    expect(snapshots).toHaveBeenLastCalledWith(expect.objectContaining({
       status: 'connected',
       connectionEpoch: 1,
-    });
+    }));
   });
 
   it('bounds a stuck opening socket and enters bootstrap then backoff recovery', async () => {
@@ -193,13 +212,50 @@ describe('WebSocketManager', () => {
 
     replacement.open();
     openTimeoutCallbacks[1]?.();
-    expect(value.manager.getSnapshot()).toEqual({
+    expect(value.manager.getSnapshot()).toMatchObject({
       status: 'connected',
       connectionEpoch: 1,
     });
     expect(replacement.closeCalls).toHaveLength(0);
     expect(value.tickets.issueCalls).toBe(2);
     expect(stale.closeCalls).toHaveLength(1);
+  });
+
+  it('does not let a cleared stale reconnect callback replace the active retry', async () => {
+    const reconnectCallbacks: (() => void)[] = [];
+    const value = harness({
+      scheduler: {
+        ...jestScheduler,
+        setTimeout: (callback, delayMs) => {
+          if (delayMs === 1_000) {
+            reconnectCallbacks.push(callback);
+          }
+          return jestScheduler.setTimeout(callback, delayMs);
+        },
+      },
+    });
+    value.tickets.defaultIssue = () =>
+      Promise.reject(new TicketRequestError('transient'));
+
+    value.manager.connect(OWNER_A);
+    await flushPromises();
+    expect(reconnectCallbacks).toHaveLength(1);
+    expect(value.tickets.issueCalls).toBe(1);
+
+    value.manager.restart(OWNER_A);
+    await flushPromises();
+    expect(reconnectCallbacks).toHaveLength(2);
+    expect(value.tickets.issueCalls).toBe(2);
+
+    reconnectCallbacks[0]?.();
+    await flushPromises();
+    expect(value.tickets.issueCalls).toBe(2);
+
+    await jest.advanceTimersByTimeAsync(999);
+    expect(value.tickets.issueCalls).toBe(2);
+    await jest.advanceTimersByTimeAsync(1);
+    await flushPromises();
+    expect(value.tickets.issueCalls).toBe(3);
   });
 
   it.each(['disconnect', 'destroy'] as const)(
@@ -332,6 +388,55 @@ describe('WebSocketManager', () => {
     ]);
   });
 
+  it('rejects an unserializable payload without recycling a healthy socket', async () => {
+    const value = harness();
+    const socket = await connectOpen(value);
+    const cyclic: RealtimeEnvelope = { type: 'notification.read_all' };
+    cyclic.self = cyclic;
+
+    expect(value.manager.send(cyclic)).toBe(false);
+
+    expect(socket.sent).toHaveLength(0);
+    expect(socket.closeCalls).toHaveLength(0);
+    expect(value.tickets.issueCalls).toBe(1);
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'connected',
+      connectionEpoch: 1,
+      diagnostics: { phase: 'open' },
+    });
+  });
+
+  it('recovers when an open socket throws while sending', async () => {
+    const sockets = new FakeSocketFactory();
+    const value = harness({
+      socketFactory: (url, protocols) => {
+        const socket = sockets.create(url, protocols);
+        socket.send = () => {
+          throw new Error('native send failure');
+        };
+        return socket;
+      },
+    });
+    value.manager.connect(OWNER_A);
+    await flushPromises();
+    const socket = sockets.sockets[0];
+    socket.open();
+
+    expect(value.manager.send({ type: 'notification.read_all' })).toBe(false);
+    await flushPromises();
+
+    expect(socket.closeCalls).toHaveLength(1);
+    expect(value.tickets.issueCalls).toBe(2);
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'reconnecting',
+      diagnostics: {
+        reason: 'send_failed',
+        category: 'transport',
+        terminal: false,
+      },
+    });
+  });
+
   it('waits for pong without resetting the timeout on the next heartbeat tick', async () => {
     const value = harness();
     const socket = await connectOpen(value);
@@ -360,6 +465,42 @@ describe('WebSocketManager', () => {
     expect(socket.sent).toHaveLength(2);
   });
 
+  it('does not let a cleared stale heartbeat timeout invalidate a new socket timeout', async () => {
+    const timeoutCallbacks: (() => void)[] = [];
+    const value = harness({
+      scheduler: {
+        ...jestScheduler,
+        setTimeout: (callback, delayMs) => {
+          if (delayMs === REALTIME_TIMING.heartbeatTimeoutMs) {
+            timeoutCallbacks.push(callback);
+          }
+          return jestScheduler.setTimeout(callback, delayMs);
+        },
+      },
+    });
+    const first = await connectOpen(value);
+    await jest.advanceTimersByTimeAsync(REALTIME_TIMING.heartbeatIntervalMs);
+    expect(timeoutCallbacks).toHaveLength(2);
+
+    first.serverClose();
+    await flushPromises();
+    const replacement = value.sockets.sockets[1];
+    replacement.open();
+    await jest.advanceTimersByTimeAsync(REALTIME_TIMING.heartbeatIntervalMs);
+    expect(timeoutCallbacks).toHaveLength(4);
+
+    timeoutCallbacks[1]?.();
+    replacement.message(JSON.stringify({ type: 'pong' }));
+    await jest.advanceTimersByTimeAsync(REALTIME_TIMING.heartbeatTimeoutMs);
+    await flushPromises();
+
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'connected',
+      connectionEpoch: 2,
+    });
+    expect(replacement.closeCalls).toHaveLength(0);
+  });
+
   it('uses one immediate network-close bootstrap before exponential backoff', async () => {
     const value = harness();
     const first = await connectOpen(value);
@@ -376,6 +517,284 @@ describe('WebSocketManager', () => {
     expect(value.tickets.issueCalls).toBe(3);
   });
 
+  it('keeps backoff state across sockets that open then close before a valid pong', async () => {
+    const value = harness();
+    const first = await connectOpen(value);
+
+    first.serverClose();
+    await flushPromises();
+    expect(value.tickets.issueCalls).toBe(2);
+
+    let unstableSocket = value.sockets.sockets[1];
+    for (
+      let attemptIndex = 0;
+      attemptIndex < REALTIME_TIMING.maxReconnectAttempts;
+      attemptIndex += 1
+    ) {
+      unstableSocket.open();
+      unstableSocket.serverClose();
+
+      const delay = Math.min(
+        1_000 * 2 ** attemptIndex,
+        REALTIME_TIMING.maxBackoffMs,
+      );
+      await jest.advanceTimersByTimeAsync(delay - 1);
+      expect(value.tickets.issueCalls).toBe(attemptIndex + 2);
+      await jest.advanceTimersByTimeAsync(1);
+      await flushPromises();
+      expect(value.tickets.issueCalls).toBe(attemptIndex + 3);
+      unstableSocket = value.sockets.sockets[attemptIndex + 2];
+    }
+
+    unstableSocket.open();
+    unstableSocket.serverClose();
+
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'disconnected',
+      diagnostics: {
+        phase: 'stopped',
+        reason: 'retry_exhausted',
+        category: 'retry',
+        terminal: true,
+        reconnectAttempt: REALTIME_TIMING.maxReconnectAttempts,
+      },
+    });
+    expect(jest.getTimerCount()).toBe(0);
+
+    const issueCallsBeforeManualRetry = value.tickets.issueCalls;
+    value.manager.connect(OWNER_A);
+    await flushPromises();
+    expect(value.tickets.issueCalls).toBe(issueCallsBeforeManualRetry);
+    expect(jest.getTimerCount()).toBe(0);
+
+    value.tickets.defaultIssue = () => Promise.resolve('manual-retry-ticket');
+    expect(value.manager.retryConnection()).toBe(true);
+    expect(value.manager.retryConnection()).toBe(false);
+    await flushPromises();
+    expect(value.tickets.issueCalls).toBe(issueCallsBeforeManualRetry + 1);
+    expect(value.sockets.calls.at(-1)?.protocols[1]).toBe(
+      'manual-retry-ticket',
+    );
+    value.sockets.sockets.at(-1)?.open();
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'connected',
+      diagnostics: { terminal: false, phase: 'open' },
+    });
+  });
+
+  it('restores a fresh immediate bootstrap only after the socket answers a heartbeat', async () => {
+    const value = harness();
+    const first = await connectOpen(value);
+
+    first.serverClose();
+    await flushPromises();
+    const bootstrapSocket = value.sockets.sockets[1];
+    bootstrapSocket.open();
+    bootstrapSocket.serverClose();
+    await jest.advanceTimersByTimeAsync(1_000);
+    await flushPromises();
+
+    const recoveredSocket = value.sockets.sockets[2];
+    recoveredSocket.open();
+    recoveredSocket.message(JSON.stringify({ type: 'pong' }));
+    expect(value.manager.getSnapshot().diagnostics?.reconnectAttempt).toBe(1);
+
+    await jest.advanceTimersByTimeAsync(REALTIME_TIMING.heartbeatIntervalMs);
+    expect(recoveredSocket.sent).toContain(JSON.stringify({ type: 'ping' }));
+    recoveredSocket.message(JSON.stringify({ type: 'pong' }));
+    expect(value.manager.getSnapshot().diagnostics?.reconnectAttempt).toBe(0);
+
+    recoveredSocket.serverClose();
+    await flushPromises();
+
+    expect(value.tickets.issueCalls).toBe(4);
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'reconnecting',
+      diagnostics: {
+        phase: 'opening_socket',
+        reconnectAttempt: 0,
+        retryDelayMs: null,
+      },
+    });
+  });
+
+  it('leaves connected immediately on socket error and recovers if native close never arrives', async () => {
+    const value = harness();
+    const socket = await connectOpen(value);
+
+    socket.error();
+
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'reconnecting',
+      diagnostics: {
+        phase: 'awaiting_close',
+        reason: 'socket_error',
+        category: 'transport',
+        terminal: false,
+      },
+    });
+    expect(value.manager.send({ type: 'notification.read_all' })).toBe(false);
+    expect(value.tickets.issueCalls).toBe(1);
+
+    await jest.advanceTimersByTimeAsync(REALTIME_TIMING.errorCloseGraceMs - 1);
+    expect(value.tickets.issueCalls).toBe(1);
+    await jest.advanceTimersByTimeAsync(1);
+    await flushPromises();
+
+    expect(socket.closeCalls).toHaveLength(1);
+    expect(value.tickets.issueCalls).toBe(2);
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'reconnecting',
+      diagnostics: {
+        reason: 'socket_error_without_close',
+        category: 'transport',
+      },
+    });
+  });
+
+  it('ignores a late pong after socket error without corrupting diagnostics', async () => {
+    const value = harness();
+    const socket = await connectOpen(value);
+    await jest.advanceTimersByTimeAsync(REALTIME_TIMING.heartbeatIntervalMs);
+
+    socket.error();
+    socket.message(JSON.stringify({ type: 'pong' }));
+
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'reconnecting',
+      diagnostics: {
+        phase: 'awaiting_close',
+        reason: 'socket_error',
+        category: 'transport',
+        heartbeat: 'inactive',
+      },
+    });
+  });
+
+  it('does not let a cleared stale heartbeat interval steal an authoritative close', async () => {
+    const intervalCallbacks: (() => void)[] = [];
+    const value = harness({
+      scheduler: {
+        ...jestScheduler,
+        setInterval: (callback, delayMs) => {
+          if (delayMs === REALTIME_TIMING.heartbeatIntervalMs) {
+            intervalCallbacks.push(callback);
+          }
+          return jestScheduler.setInterval(callback, delayMs);
+        },
+      },
+    });
+    const socket = await connectOpen(value);
+    expect(intervalCallbacks).toHaveLength(1);
+
+    socket.error();
+    const sendAfterError = jest.fn(() => {
+      throw new Error('socket is already failing');
+    });
+    socket.send = sendAfterError;
+    intervalCallbacks[0]?.();
+
+    expect(sendAfterError).not.toHaveBeenCalled();
+    expect(value.tickets.issueCalls).toBe(1);
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'reconnecting',
+      diagnostics: {
+        phase: 'awaiting_close',
+        reason: 'socket_error',
+        heartbeat: 'inactive',
+      },
+    });
+
+    socket.serverClose(4001);
+    await jest.advanceTimersByTimeAsync(REALTIME_TIMING.errorCloseGraceMs);
+    await flushPromises();
+
+    expect(value.tickets.issueCalls).toBe(1);
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'disconnected',
+      diagnostics: {
+        phase: 'stopped',
+        reason: 'authentication_failed',
+        category: 'authentication',
+        terminal: true,
+        closeCode: 4001,
+      },
+    });
+  });
+
+  it('cancels the socket-error fallback if the same opening socket succeeds', async () => {
+    const value = harness();
+    value.manager.connect(OWNER_A);
+    await flushPromises();
+    const socket = value.sockets.sockets[0];
+
+    socket.error();
+    socket.open();
+    await jest.advanceTimersByTimeAsync(REALTIME_TIMING.errorCloseGraceMs);
+    await flushPromises();
+
+    expect(socket.closeCalls).toHaveLength(0);
+    expect(value.tickets.issueCalls).toBe(1);
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'connected',
+      connectionEpoch: 1,
+      diagnostics: {
+        phase: 'open',
+        reason: null,
+        heartbeat: 'scheduled',
+      },
+    });
+  });
+
+  it('lets a close code win over the socket-error fallback and cancels its timer', async () => {
+    const value = harness();
+    const socket = await connectOpen(value);
+
+    socket.error();
+    socket.serverClose(4001);
+    value.manager.connect(OWNER_A);
+    await jest.advanceTimersByTimeAsync(REALTIME_TIMING.errorCloseGraceMs);
+    await flushPromises();
+
+    expect(value.tickets.issueCalls).toBe(1);
+    expect(value.manager.getSnapshot()).toMatchObject({
+      status: 'disconnected',
+      diagnostics: {
+        phase: 'stopped',
+        reason: 'authentication_failed',
+        category: 'authentication',
+        terminal: true,
+        closeCode: 4001,
+      },
+    });
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it.each(['disconnect', 'restart', 'destroy'] as const)(
+    'cancels a socket-error fallback on %s',
+    async (action) => {
+      const value = harness();
+      const socket = await connectOpen(value);
+      socket.error();
+      expect(jest.getTimerCount()).toBe(1);
+
+      if (action === 'disconnect') {
+        value.manager.disconnect('background');
+      } else if (action === 'restart') {
+        value.manager.restart(OWNER_A);
+      } else {
+        value.manager.destroy();
+      }
+      await flushPromises();
+
+      const expectedTicketCalls = action === 'restart' ? 2 : 1;
+      expect(value.tickets.issueCalls).toBe(expectedTicketCalls);
+      await jest.advanceTimersByTimeAsync(REALTIME_TIMING.errorCloseGraceMs);
+      await flushPromises();
+      expect(value.tickets.issueCalls).toBe(expectedTicketCalls);
+    },
+  );
+
   it('caps exponential backoff and stops after ten attempts', async () => {
     const value = harness();
     value.tickets.defaultIssue = () =>
@@ -391,6 +810,14 @@ describe('WebSocketManager', () => {
     }
 
     expect(value.manager.getSnapshot().status).toBe('disconnected');
+    expect(value.manager.getSnapshot().diagnostics).toMatchObject({
+      phase: 'stopped',
+      reason: 'retry_exhausted',
+      category: 'retry',
+      terminal: true,
+      reconnectAttempt: REALTIME_TIMING.maxReconnectAttempts,
+      retryDelayMs: null,
+    });
     expect(jest.getTimerCount()).toBe(0);
   });
 
@@ -444,6 +871,63 @@ describe('WebSocketManager', () => {
     expect(value.tickets.refreshCalls).toBe(1);
     expect(value.sockets.calls[1]?.protocols[1]).toBe('refresh-1');
   });
+
+  it.each([
+    ['envelope', (socket: { message(data: unknown): void }) => socket.message(JSON.stringify({ type: 'auth_error', code: 'token_expired' })), null],
+    ['close code', (socket: { serverClose(code: number): void }) => socket.serverClose(4002), 4002],
+  ])(
+    'backs off and stops repeated pre-pong token expiry via %s',
+    async (_label, expire, expectedCloseCode) => {
+      const value = harness();
+      const first = await connectOpen(value);
+
+      expire(first);
+      await flushPromises();
+      expect(value.tickets.issueCalls).toBe(1);
+      expect(value.tickets.refreshCalls).toBe(1);
+
+      let unstableSocket = value.sockets.sockets[1];
+      for (
+        let attemptIndex = 0;
+        attemptIndex < REALTIME_TIMING.maxReconnectAttempts;
+        attemptIndex += 1
+      ) {
+        unstableSocket.open();
+        expire(unstableSocket);
+
+        const delay = Math.min(
+          1_000 * 2 ** attemptIndex,
+          REALTIME_TIMING.maxBackoffMs,
+        );
+        await jest.advanceTimersByTimeAsync(delay - 1);
+        expect(value.tickets.refreshCalls).toBe(attemptIndex + 1);
+        await jest.advanceTimersByTimeAsync(1);
+        await flushPromises();
+        expect(value.tickets.refreshCalls).toBe(attemptIndex + 2);
+        unstableSocket = value.sockets.sockets[attemptIndex + 2];
+      }
+
+      unstableSocket.open();
+      expire(unstableSocket);
+
+      expect(value.tickets.issueCalls).toBe(1);
+      expect(value.tickets.refreshCalls).toBe(
+        REALTIME_TIMING.maxReconnectAttempts + 1,
+      );
+      expect(value.manager.getSnapshot()).toMatchObject({
+        status: 'disconnected',
+        diagnostics: {
+          phase: 'stopped',
+          reason: 'retry_exhausted',
+          category: 'retry',
+          terminal: true,
+          closeCode: expectedCloseCode,
+          reconnectAttempt: REALTIME_TIMING.maxReconnectAttempts,
+        },
+      });
+      expect(jest.getTimerCount()).toBe(0);
+    },
+  );
 
   it('retries a throttled refreshed-ticket request through the refresh endpoint', async () => {
     const value = harness();
@@ -522,9 +1006,42 @@ describe('WebSocketManager', () => {
     await flushPromises();
 
     expect(value.manager.getSnapshot().status).toBe('disconnected');
+    expect(value.manager.getSnapshot().diagnostics).toMatchObject({
+      reason: 'authentication_failed',
+      category: 'authentication',
+      terminal: true,
+    });
     expect(value.tickets.issueCalls).toBe(1);
     expect(jest.getTimerCount()).toBe(0);
+    expect(value.manager.retryConnection()).toBe(false);
   });
+
+  it.each(['background', 'offline'] as const)(
+    'preserves authentication hard-stop diagnostics across %s lifecycle transitions',
+    async (reason) => {
+      const value = harness();
+      const socket = await connectOpen(value);
+
+      socket.serverClose(4001);
+      value.manager.disconnect(reason);
+      value.manager.connect(OWNER_A);
+      await flushPromises();
+
+      expect(value.tickets.issueCalls).toBe(1);
+      expect(value.manager.getSnapshot()).toMatchObject({
+        status: 'disconnected',
+        diagnostics: {
+          phase: 'stopped',
+          reason: 'authentication_failed',
+          category: 'authentication',
+          terminal: true,
+          closeCode: 4001,
+          heartbeat: 'inactive',
+        },
+      });
+      expect(jest.getTimerCount()).toBe(0);
+    },
+  );
 
   it('disconnect cancels timers and destroy clears listeners', async () => {
     const value = harness();

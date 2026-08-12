@@ -4,11 +4,15 @@ import {
   screen,
   within,
 } from '@testing-library/react-native';
+import { StyleSheet } from 'react-native';
 import { makeDraftFixture } from '../ai/__fixtures__/drafts';
 import type { ChatMessage } from '../types';
 import { ChatMessageBubble } from '../components/ChatMessageBubble';
 
-jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
+jest.mock('@expo/vector-icons', () => ({
+  FontAwesome6: () => null,
+  Ionicons: () => null,
+}));
 jest.mock('@/features/auth/components/UserAvatar', () => {
   const React = jest.requireActual<typeof import('react')>('react');
   const { View } = jest.requireActual<typeof import('react-native')>('react-native');
@@ -90,11 +94,137 @@ describe('ChatMessageBubble', () => {
     ]);
 
     await fireEvent(bubble, 'longPress');
-    expect(onOpenActions).toHaveBeenCalledWith('message-1');
+    expect(onOpenActions).toHaveBeenCalledWith(
+      'message-1',
+      expect.any(Function),
+    );
     await fireEvent(bubble, 'accessibilityAction', {
       nativeEvent: { actionName: 'openMessageActions' },
     });
     expect(onOpenActions).toHaveBeenCalledTimes(2);
+  });
+
+  it('adds one visible 44pt reaction affordance while preserving long-press actions', async () => {
+    const onOpenActions = jest.fn();
+    await render(
+      <ChatMessageBubble
+        {...props({ onOpenActions, showReactionAffordance: true })}
+      />,
+    );
+
+    const react = screen.getByLabelText('React to this message');
+    expect(react.props.accessibilityHint).toBe(
+      'Opens reactions and other message actions',
+    );
+    expect(
+      StyleSheet.flatten(screen.getByTestId('chat-reaction-affordance-message-1').props.style),
+    ).toMatchObject({ minHeight: 44, width: 44 });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('chat-bubble-action-row-message-1').props.style),
+    ).toMatchObject({ minHeight: 44, flexDirection: 'row' });
+    const peerRow = screen.getByTestId('chat-bubble-action-row-message-1');
+    expect(
+      peerRow.props.children
+        .filter(Boolean)
+        .map((child: { props: { testID: string } }) => child.props.testID),
+    ).toEqual([
+      'chat-message-message-1',
+      'chat-reaction-affordance-message-1',
+    ]);
+
+    await fireEvent.press(react);
+    await fireEvent(screen.getByTestId('chat-message-message-1'), 'longPress');
+    expect(onOpenActions).toHaveBeenNthCalledWith(
+      1,
+      'message-1',
+      expect.any(Function),
+    );
+    expect(onOpenActions).toHaveBeenNthCalledWith(
+      2,
+      'message-1',
+      expect.any(Function),
+    );
+  });
+
+  it('does not expose the visible affordance when the message is busy or selection is active', async () => {
+    const onOpenActions = jest.fn();
+    const rendered = await render(
+      <ChatMessageBubble
+        {...props({
+          onOpenActions,
+          reactionBusy: true,
+          showReactionAffordance: true,
+        })}
+      />,
+    );
+
+    expect(
+      screen.getByLabelText('React to this message').props.accessibilityState,
+    ).toEqual({ disabled: true, busy: true });
+    const bubble = screen.getByTestId('chat-message-message-1');
+    expect(bubble.props.accessibilityActions).toEqual([]);
+    await fireEvent(bubble, 'longPress');
+    expect(onOpenActions).not.toHaveBeenCalled();
+
+    await rendered.rerender(
+      <ChatMessageBubble
+        {...props({ selectionMode: true, showReactionAffordance: true })}
+      />,
+    );
+    expect(screen.queryByLabelText('React to this message')).toBeNull();
+  });
+
+  it('reads an own bubble before its affordance while keeping the action visually first', async () => {
+    await render(
+      <ChatMessageBubble
+        {...props({ isOwn: true, showReactionAffordance: true })}
+      />,
+    );
+
+    const ownRow = screen.getByTestId('chat-bubble-action-row-message-1');
+    expect(
+      ownRow.props.children
+        .filter(Boolean)
+        .map((child: { props: { testID: string } }) => child.props.testID),
+    ).toEqual([
+      'chat-message-message-1',
+      'chat-reaction-affordance-message-1',
+    ]);
+    expect(StyleSheet.flatten(ownRow.props.style)).toMatchObject({
+      flexDirection: 'row-reverse',
+    });
+  });
+
+  it.each([
+    { isOwn: true, label: 'own' },
+    { isOwn: false, label: 'peer' },
+  ])('lets a long $label message shrink beside its reaction affordance', async ({ isOwn }) => {
+    await render(
+      <ChatMessageBubble
+        {...props({
+          isOwn,
+          message: message({ content: 'A'.repeat(500) }),
+          showReactionAffordance: true,
+        })}
+      />,
+    );
+
+    expect(
+      StyleSheet.flatten(
+        screen.getByTestId('chat-column-message-1').props.style,
+      ),
+    ).toMatchObject({ minWidth: 0, flexShrink: 1 });
+    expect(
+      StyleSheet.flatten(
+        screen.getByTestId('chat-bubble-action-row-message-1').props.style,
+      ),
+    ).toMatchObject({ maxWidth: '100%', minHeight: 44 });
+    expect(
+      StyleSheet.flatten(
+        screen.getByTestId('chat-message-message-1').props.style,
+      ),
+    ).toMatchObject({ flexShrink: 1 });
+    expect(screen.getByTestId('chat-reaction-affordance-message-1')).toBeTruthy();
   });
 
   it('labels own messages as You and keeps the content readable', async () => {

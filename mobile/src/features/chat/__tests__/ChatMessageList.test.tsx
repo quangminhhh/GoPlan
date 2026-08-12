@@ -1,5 +1,12 @@
 import { act, fireEvent, render, screen } from '@testing-library/react-native';
-import { Alert, Keyboard, Text } from 'react-native';
+import {
+  Alert,
+  Keyboard,
+  Platform,
+  StyleSheet,
+  Text,
+} from 'react-native';
+import { focusAccessibilityNode } from '../ai/accessibilityFocus';
 import { makeDraftFixture } from '../ai/__fixtures__/drafts';
 import { createAIReconciliationCoordinator } from '../ai/reconciliation';
 import { AIReconciliationCoordinatorProvider } from '../ai/reconciliationContext';
@@ -11,7 +18,13 @@ import {
   toggleChatMessageSelection,
 } from '../components/ChatMessageList';
 
-jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
+jest.mock('@expo/vector-icons', () => ({
+  FontAwesome6: () => null,
+  Ionicons: () => null,
+}));
+jest.mock('../ai/accessibilityFocus', () => ({
+  focusAccessibilityNode: jest.fn(),
+}));
 jest.mock('@/features/auth/components/UserAvatar', () => {
   const React = jest.requireActual<typeof import('react')>('react');
   const { View } = jest.requireActual<typeof import('react-native')>('react-native');
@@ -26,6 +39,7 @@ jest.mock('@/features/auth/components/UserAvatar', () => {
 
 const currentUserId = 'user-me';
 const emptySet = new Set<string>();
+const mockFocusAccessibilityNode = jest.mocked(focusAccessibilityNode);
 
 function message(id: string, overrides: Partial<ChatMessage> = {}): ChatMessage {
   return {
@@ -87,6 +101,7 @@ function props(overrides: Record<string, unknown> = {}) {
 
 describe('ChatMessageList', () => {
   afterEach(() => {
+    mockFocusAccessibilityNode.mockClear();
     jest.restoreAllMocks();
     jest.useRealTimers();
   });
@@ -122,7 +137,11 @@ describe('ChatMessageList', () => {
 
     const list = screen.getByTestId('chat-message-list');
     expect(list.props.inverted).toBe(true);
-    const bubbles = screen.getAllByTestId(/^chat-message-(?!list$)/);
+    expect(list.props.maintainVisibleContentPosition).toEqual({
+      minIndexForVisible: 0,
+      autoscrollToTopThreshold: 80,
+    });
+    const bubbles = screen.getAllByTestId(/^chat-message-(?!list$|footer-)/);
     expect(bubbles.map((bubble) => bubble.props.testID)).toEqual([
       'chat-message-newer',
       'chat-message-older',
@@ -146,7 +165,7 @@ describe('ChatMessageList', () => {
     expect(list.props.data).toEqual([onlyMessage]);
     expect(list.props.ListHeaderComponent).not.toBeNull();
     expect(screen.getByTestId('goplan-ai-typing-interaction-7')).toBeTruthy();
-    expect(screen.getAllByTestId(/^chat-message-(?!list$)/)).toHaveLength(1);
+    expect(screen.getAllByTestId(/^chat-message-(?!list$|footer-)/)).toHaveLength(1);
 
     await rendered.rerender(
       <ChatMessageList
@@ -271,9 +290,51 @@ describe('ChatMessageList', () => {
     await render(<ChatMessageList {...props()} />);
 
     expect(screen.getByText('No messages yet')).toBeTruthy();
+    const emptyStyle = screen.getByTestId('chat-empty-state').props.style;
+    expect(StyleSheet.flatten(emptyStyle)).toMatchObject({
+      flex: 1,
+      transform: [{ scaleY: -1 }],
+    });
+    expect(screen.getByTestId('chat-message-list').props.inverted).toBe(true);
     expect(
       screen.getByText('Composer accessory', { includeHiddenElements: true }),
     ).toBeTruthy();
+  });
+
+  it('gives every confirmed mutable bubble one compact reaction entry point without breaking grouping', async () => {
+    const onOpenMessages = [
+      message('older', { created_at: '2026-08-09T08:30:00.000Z' }),
+      message('newer', { created_at: '2026-08-09T08:31:00.000Z' }),
+      message('pending', {
+        client_message_id: 'client-pending',
+        created_at: '2026-08-09T08:32:00.000Z',
+      }),
+      message('removed', {
+        is_deleted_for_everyone: true,
+        created_at: '2026-08-09T08:33:00.000Z',
+      }),
+    ];
+    await render(
+      <ChatMessageList
+        {...props({
+          messages: onOpenMessages,
+          pendingClientIds: new Set(['client-pending']),
+        })}
+      />,
+    );
+
+    expect(screen.getAllByLabelText('React to this message')).toHaveLength(2);
+    expect(screen.getByTestId('chat-reaction-affordance-older')).toBeTruthy();
+    expect(screen.getByTestId('chat-reaction-affordance-newer')).toBeTruthy();
+    expect(screen.queryByTestId('chat-reaction-affordance-pending')).toBeNull();
+    expect(screen.queryByTestId('chat-reaction-affordance-removed')).toBeNull();
+    for (const id of ['older', 'newer']) {
+      expect(
+        StyleSheet.flatten(screen.getByTestId(`chat-bubble-action-row-${id}`).props.style),
+      ).toMatchObject({ minHeight: 44, flexDirection: 'row' });
+    }
+    expect(screen.getAllByText('Mai')).toHaveLength(1);
+    expect(screen.getAllByLabelText("Mai's profile picture")).toHaveLength(1);
   });
 
   it('never groups nullable deleted senders under one invented identity', async () => {
@@ -539,5 +600,209 @@ describe('ChatMessageList', () => {
     expect(screen.queryByLabelText('Message actions')).toBeNull();
     expect(screen.queryByLabelText(/Retry sending message/)).toBeNull();
     expect(screen.queryByRole('button')).toBeNull();
+  });
+
+  it('restores screen-reader focus to the affordance only after the sheet dismisses', async () => {
+    jest.useFakeTimers();
+    await render(
+      <ChatMessageList {...props({ messages: [message('message-1')] })} />,
+    );
+
+    await fireEvent.press(screen.getByLabelText('React to this message'));
+    const onDismiss = screen.getByTestId('chat-message-actions-modal').parent
+      ?.props.onDismiss;
+    await fireEvent.press(screen.getByLabelText('Close message actions'));
+    expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
+    await act(() => onDismiss?.());
+    expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
+    await act(() => jest.runOnlyPendingTimers());
+
+    expect(mockFocusAccessibilityNode).toHaveBeenCalledWith(
+      expect.objectContaining({
+        props: expect.objectContaining({
+          testID: 'chat-reaction-affordance-message-1',
+        }),
+      }),
+    );
+  });
+
+  it.each(['close', 'requestClose', 'reaction', 'selection'] as const)(
+    'restores Android screen-reader focus after a normal %s dismissal',
+    async (action) => {
+      jest.useFakeTimers();
+      jest.replaceProperty(Platform, 'OS', 'android');
+      await render(
+        <ChatMessageList {...props({ messages: [message('message-1')] })} />,
+      );
+
+      await fireEvent.press(screen.getByLabelText('React to this message'));
+      if (action === 'close') {
+        await fireEvent.press(screen.getByLabelText('Close message actions'));
+      } else if (action === 'requestClose') {
+        const requestClose = screen.getByTestId('chat-message-actions-modal')
+          .parent?.props.onRequestClose;
+        await act(() => requestClose?.());
+      } else if (action === 'reaction') {
+        await fireEvent.press(screen.getByLabelText('React with heart'));
+      } else {
+        await fireEvent.press(screen.getByLabelText('Select messages'));
+      }
+
+      expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
+      await act(() => jest.advanceTimersToNextTimer());
+      expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
+      await act(() => jest.advanceTimersToNextTimer());
+
+      expect(mockFocusAccessibilityNode).toHaveBeenCalledWith(
+        expect.objectContaining({
+          props: expect.objectContaining({
+            testID:
+              action === 'selection'
+                ? 'chat-message-message-1'
+                : 'chat-reaction-affordance-message-1',
+          }),
+        }),
+      );
+    },
+  );
+
+  it('cancels Android focus restoration when another action session opens', async () => {
+    jest.useFakeTimers();
+    jest.replaceProperty(Platform, 'OS', 'android');
+    await render(
+      <ChatMessageList
+        {...props({ messages: [message('message-1'), message('message-2')] })}
+      />,
+    );
+
+    await fireEvent.press(screen.getAllByLabelText('React to this message')[0]);
+    await fireEvent.press(screen.getByLabelText('Close message actions'));
+    await fireEvent.press(screen.getAllByLabelText('React to this message')[1]);
+    await act(() => jest.runOnlyPendingTimers());
+
+    expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
+    expect(screen.getByTestId('chat-message-actions-modal')).toBeTruthy();
+  });
+
+  it('falls back to the originating bubble when selection removes the affordance', async () => {
+    jest.useFakeTimers();
+    await render(
+      <ChatMessageList {...props({ messages: [message('message-1')] })} />,
+    );
+
+    await fireEvent.press(screen.getByLabelText('React to this message'));
+    const onDismiss = screen.getByTestId('chat-message-actions-modal').parent
+      ?.props.onDismiss;
+    await fireEvent.press(screen.getByLabelText('Select messages'));
+    expect(screen.queryByLabelText('React to this message')).toBeNull();
+    await act(() => onDismiss?.());
+    expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
+    await act(() => jest.runOnlyPendingTimers());
+
+    expect(mockFocusAccessibilityNode).toHaveBeenCalledWith(
+      expect.objectContaining({
+        props: expect.objectContaining({ testID: 'chat-message-message-1' }),
+      }),
+    );
+  });
+
+  it('does not restore stale or duplicate focus after the originating row unmounts', async () => {
+    jest.useFakeTimers();
+    const baseProps = props({ messages: [message('message-1')] });
+    const rendered = await render(<ChatMessageList {...baseProps} />);
+
+    await fireEvent(
+      screen.getByTestId('chat-message-message-1'),
+      'longPress',
+    );
+    const onDismiss = screen.getByTestId('chat-message-actions-modal').parent
+      ?.props.onDismiss;
+    await rendered.rerender(
+      <ChatMessageList {...baseProps} messages={[]} />,
+    );
+    await act(() => onDismiss?.());
+    await act(() => onDismiss?.());
+    await act(() => jest.runOnlyPendingTimers());
+
+    expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
+  });
+
+  it('cancels a deferred focus restore when another message action session opens', async () => {
+    jest.useFakeTimers();
+    await render(
+      <ChatMessageList
+        {...props({ messages: [message('message-1'), message('message-2')] })}
+      />,
+    );
+
+    const affordances = screen.getAllByLabelText('React to this message');
+    await fireEvent.press(affordances[0]);
+    const firstDismiss = screen.getByTestId('chat-message-actions-modal').parent
+      ?.props.onDismiss;
+    await fireEvent.press(screen.getByLabelText('Close message actions'));
+    await act(() => firstDismiss?.());
+    expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
+
+    await fireEvent.press(affordances[1]);
+    await act(() => jest.runOnlyPendingTimers());
+
+    expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
+  });
+
+  it('does not focus a row that unmounts after dismissal but before the deferred task', async () => {
+    jest.useFakeTimers();
+    const baseProps = props({ messages: [message('message-1')] });
+    const rendered = await render(<ChatMessageList {...baseProps} />);
+
+    await fireEvent.press(screen.getByLabelText('React to this message'));
+    const onDismiss = screen.getByTestId('chat-message-actions-modal').parent
+      ?.props.onDismiss;
+    await fireEvent.press(screen.getByLabelText('Close message actions'));
+    await act(() => onDismiss?.());
+    await rendered.rerender(<ChatMessageList {...baseProps} messages={[]} />);
+    await act(() => jest.runOnlyPendingTimers());
+
+    expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
+  });
+
+  it('cancels a deferred focus restore when the chat list unmounts', async () => {
+    jest.useFakeTimers();
+    const rendered = await render(
+      <ChatMessageList {...props({ messages: [message('message-1')] })} />,
+    );
+
+    await fireEvent.press(screen.getByLabelText('React to this message'));
+    const onDismiss = screen.getByTestId('chat-message-actions-modal').parent
+      ?.props.onDismiss;
+    await fireEvent.press(screen.getByLabelText('Close message actions'));
+    await act(() => onDismiss?.());
+    await rendered.unmount();
+    await act(() => jest.runOnlyPendingTimers());
+
+    expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
+  });
+
+  it('leaves focus with a native destructive alert instead of reclaiming it', async () => {
+    jest.useFakeTimers();
+    const alert = jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
+    await render(
+      <ChatMessageList {...props({ messages: [message('message-1')] })} />,
+    );
+
+    await fireEvent.press(screen.getByLabelText('React to this message'));
+    const onDismiss = screen.getByTestId('chat-message-actions-modal').parent
+      ?.props.onDismiss;
+    await fireEvent.press(screen.getByLabelText('Hide for me'));
+    expect(alert).not.toHaveBeenCalled();
+    await act(() => onDismiss?.());
+    expect(alert).not.toHaveBeenCalled();
+    await act(() => jest.runOnlyPendingTimers());
+    expect(alert).toHaveBeenCalledWith(
+      'Hide this message?',
+      expect.any(String),
+      expect.any(Array),
+    );
+
+    expect(mockFocusAccessibilityNode).not.toHaveBeenCalled();
   });
 });

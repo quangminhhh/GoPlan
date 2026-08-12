@@ -216,13 +216,53 @@ function BlockingState({
 
 function StatusNotice({
   children,
+  actionLabel,
+  onAction,
   tone = 'neutral',
   testID,
 }: {
   children: string;
+  actionLabel?: string;
+  onAction?: () => void;
   tone?: 'neutral' | 'warning' | 'error';
   testID: string;
 }) {
+  if (onAction && actionLabel) {
+    return (
+      <View
+        style={[
+          styles.actionNotice,
+          tone === 'warning' ? styles.warningNoticeBackground : null,
+          tone === 'error' ? styles.errorNoticeBackground : null,
+        ]}
+        testID={testID}
+      >
+        <Text
+          accessibilityLiveRegion="polite"
+          accessibilityRole="alert"
+          style={[
+            styles.actionNoticeText,
+            tone === 'warning' ? styles.warningNoticeText : null,
+            tone === 'error' ? styles.errorNoticeText : null,
+          ]}
+        >
+          {children}
+        </Text>
+        <Pressable
+          accessibilityLabel={actionLabel}
+          accessibilityRole="button"
+          onPress={onAction}
+          style={({ pressed }) => [
+            styles.noticeActionButton,
+            pressed ? styles.retryButtonPressed : null,
+          ]}
+        >
+          <Text style={styles.noticeActionButtonText}>{actionLabel}</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
   return (
     <Text
       accessibilityLiveRegion="polite"
@@ -262,7 +302,10 @@ export function ChatScreen() {
     deleteMessage: deleteChatMessage,
     hideMessagesForMe,
     loadOlder: loadOlderMessages,
+    retryCatchUp,
+    retryConnection,
     retryInitialLoad,
+    retrySubscription,
     retryPending,
     sendMessage,
     toggleReaction: toggleChatReaction,
@@ -282,12 +325,17 @@ export function ChatScreen() {
   }, [chat.roomError, chat.tripStatus]);
 
   const subscriptionRejected = chat.subscriptionStatus === 'rejected';
+  const terminalActive = terminalMessage !== null;
   const roomResourceKey =
     chat.aiReconciliationCoordinator?.resourceKey ?? tripId;
-  const actionsEnabled = !chat.isReadOnly;
-  const readOnlyMessage = subscriptionRejected
-    ? 'Realtime is unavailable for this room. Chat actions are disabled.'
-    : terminalMessage ?? 'This chat is read-only.';
+  const actionsEnabled = !chat.isReadOnly && !terminalActive;
+  const canRetryReadSync =
+    chat.connectionStatus === 'connected' &&
+    chat.subscriptionStatus === 'subscribed';
+  const readOnlyMessage = terminalMessage ??
+    (subscriptionRejected
+      ? 'Realtime is unavailable for this room. Chat actions are disabled.'
+      : 'This chat is read-only.');
 
   const submitMessage = useCallback(
     async (content: string): Promise<ChatComposerSubmitResult> => {
@@ -396,10 +444,14 @@ export function ChatScreen() {
     !subscriptionRejected &&
     chat.roomError &&
     chat.roomError.errorCode !== 'SUBSCRIPTION_LIMIT_REACHED' &&
-    chat.roomError.errorCode !== 'TRIP_TERMINAL'
+    chat.roomError.errorCode !== 'TRIP_TERMINAL' &&
+    chat.roomError.errorCode !== 'CHAT_SYNC_FAILED' &&
+    chat.roomError.errorCode !== 'GAP_FILL_INCOMPLETE' &&
+    chat.roomError.errorCode !== 'CHANGE_SYNC_INCOMPLETE'
       ? chat.roomError
       : null;
   const visibleMutationError =
+    !terminalActive &&
     chat.mutationError &&
     chat.mutationError.error.errorCode !== 'TRIP_TERMINAL' &&
     !(
@@ -420,26 +472,80 @@ export function ChatScreen() {
         testID="chat-keyboard-layout"
       >
         <ChatConnectionBanner
+          diagnostics={chat.connectionDiagnostics ?? undefined}
+          onRetry={retryConnection}
           status={chat.connectionStatus}
           subscriptionStatus={chat.subscriptionStatus}
         />
         {subscriptionRejected ? (
-          <StatusNotice tone="warning" testID="chat-subscription-rejected">
-            {chat.roomError?.detail ??
-              'Realtime is unavailable for this room. Chat actions are disabled.'}
+          <StatusNotice
+            actionLabel={terminalActive ? 'Retry live updates' : 'Retry live chat'}
+            onAction={retrySubscription}
+            tone="warning"
+            testID="chat-subscription-rejected"
+          >
+            {terminalActive
+              ? 'Live updates could not confirm this room. Retry to receive late messages.'
+              : chat.roomError?.detail ??
+                'Realtime is unavailable for this room. Chat actions are disabled.'}
           </StatusNotice>
         ) : null}
         {terminalMessage ? (
           <StatusNotice testID="chat-terminal-notice">{terminalMessage}</StatusNotice>
         ) : null}
-        {genericRoomError ? (
-          <StatusNotice tone="error" testID="chat-room-error">
-            {genericRoomError.detail}
+        {terminalActive && chat.isLoadingInitial ? (
+          <StatusNotice testID="chat-terminal-history-loading">
+            Loading chat history…
           </StatusNotice>
+        ) : terminalActive && chat.initialLoadError ? (
+          <StatusNotice
+            actionLabel="Retry chat history"
+            onAction={retryInitial}
+            tone="error"
+            testID="chat-terminal-history-error"
+          >
+            {chat.initialLoadError.message}
+          </StatusNotice>
+        ) : null}
+        {chat.readSyncError ? (
+          <StatusNotice
+            actionLabel={
+              canRetryReadSync
+                ? terminalActive
+                  ? 'Retry live updates'
+                  : 'Retry catching up'
+                : undefined
+            }
+            onAction={canRetryReadSync ? retryCatchUp : undefined}
+            tone="error"
+            testID="chat-read-sync-error"
+          >
+            {chat.readSyncError.detail}
+          </StatusNotice>
+        ) : null}
+        {genericRoomError ? (
+          genericRoomError.errorCode === 'CHAT_SYNC_FAILED' ||
+          genericRoomError.errorCode === 'GAP_FILL_INCOMPLETE' ||
+          genericRoomError.errorCode === 'CHANGE_SYNC_INCOMPLETE' ? (
+            <StatusNotice
+              actionLabel="Retry catching up"
+              onAction={retryCatchUp}
+              tone="error"
+              testID="chat-room-error"
+            >
+              {genericRoomError.detail}
+            </StatusNotice>
+          ) : (
+            <StatusNotice tone="error" testID="chat-room-error">
+              {genericRoomError.detail}
+            </StatusNotice>
+          )
         ) : null}
         {chat.isGapFilling || chat.isUpdating ? (
           <StatusNotice testID="chat-catch-up-status">
-            Catching up on messages…
+            {terminalActive
+              ? 'Updating read-only chat history…'
+              : 'Catching up on messages…'}
           </StatusNotice>
         ) : null}
         {visibleMutationError ? (
@@ -514,6 +620,30 @@ const styles = StyleSheet.create({
   },
   warningNotice: { color: colors.warning, backgroundColor: colors.warningSoft },
   errorNotice: { color: colors.danger, backgroundColor: colors.dangerSoft },
+  actionNotice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingLeft: spacing.md,
+    backgroundColor: colors.completedSoft,
+  },
+  actionNoticeText: {
+    ...typography.caption,
+    flex: 1,
+    color: colors.textMuted,
+  },
+  warningNoticeBackground: { backgroundColor: colors.warningSoft },
+  warningNoticeText: { color: colors.warning },
+  errorNoticeBackground: { backgroundColor: colors.dangerSoft },
+  errorNoticeText: { color: colors.danger },
+  noticeActionButton: {
+    minHeight: 44,
+    minWidth: 88,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: spacing.md,
+  },
+  noticeActionButtonText: { ...typography.label, color: colors.primary },
   readOnlyFooter: {
     minHeight: 52,
     alignItems: 'center',

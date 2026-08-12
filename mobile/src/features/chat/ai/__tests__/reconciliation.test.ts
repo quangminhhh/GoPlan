@@ -186,4 +186,31 @@ describe('AI draft cross-surface reconciliation', () => {
     await expect(first).rejects.toBe(failure);
     expect(reconcile).toHaveBeenCalledTimes(1);
   });
+
+  it('routes room authority only to the currently attached reporter', () => {
+    const initialReporter = jest.fn();
+    const replacementReporter = jest.fn();
+    const coordinator = createAIReconciliationCoordinator({
+      resourceKey: 'user:trip-1',
+      tripId: 'trip-1',
+      reportAuthoritativeFailure: initialReporter,
+    });
+    const failure = {
+      kind: 'message' as const,
+      message: 'This trip is read-only.',
+      errorCode: 'TRIP_TERMINAL',
+      status: 409,
+      retryAfterMs: null,
+      fieldErrors: null,
+    };
+
+    coordinator.reportAuthoritativeFailure(failure);
+    coordinator.setAuthoritativeFailureReporter(replacementReporter);
+    coordinator.reportAuthoritativeFailure(failure);
+    coordinator.setAuthoritativeFailureReporter(null);
+    coordinator.reportAuthoritativeFailure(failure);
+
+    expect(initialReporter).toHaveBeenCalledTimes(1);
+    expect(replacementReporter).toHaveBeenCalledTimes(1);
+  });
 });

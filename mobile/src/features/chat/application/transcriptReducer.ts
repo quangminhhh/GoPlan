@@ -34,12 +34,29 @@ export interface TranscriptAIDraftOverlay {
   readonly lastAuthoritativeSequence: number;
 }
 
+interface DeferredFullMessagePatch {
+  readonly message: ChatMessage;
+  readonly live: boolean;
+}
+
+interface DeferredReactionPatch {
+  readonly reactions: readonly ReactionSummary[];
+  readonly changeSequence: number;
+  readonly updatedAt: string;
+}
+
+interface DeferredAuthoritativePatch {
+  readonly fullMessage: DeferredFullMessagePatch | null;
+  readonly reaction: DeferredReactionPatch | null;
+}
+
 export interface TranscriptState {
   readonly resourceKey: string;
   /** Shared logical clock captured before starting REST requests. */
   readonly version: number;
   readonly roomStatus: ChatRoomStatus;
   readonly roomError: ChatApiFailure | null;
+  readonly isLoadingInitial: boolean;
   readonly confirmed: ReadonlyMap<string, ChatMessage>;
   /** Last transcript mutation version for each confirmed server id. */
   readonly messageVersions: ReadonlyMap<string, number>;
@@ -70,6 +87,11 @@ export interface TranscriptState {
   readonly aiDraftOverlays: ReadonlyMap<
     string,
     ReadonlyMap<string, TranscriptAIDraftOverlay>
+  >;
+  /** Newer authority retained until an unloaded paginated row materializes. */
+  readonly deferredAuthoritativePatches: ReadonlyMap<
+    string,
+    DeferredAuthoritativePatch
   >;
   readonly hasMoreOlder: boolean;
   readonly nextOlderCursor: string | null;
@@ -243,6 +265,7 @@ export function createTranscriptState(resourceKey: string): TranscriptState {
     version: 0,
     roomStatus: 'idle',
     roomError: null,
+    isLoadingInitial: false,
     confirmed: new Map(),
     messageVersions: new Map(),
     reactionBaseVersions: new Map(),
@@ -256,6 +279,7 @@ export function createTranscriptState(resourceKey: string): TranscriptState {
     reactionBase: new Map(),
     reactionOverlays: new Map(),
     aiDraftOverlays: new Map(),
+    deferredAuthoritativePatches: new Map(),
     hasMoreOlder: false,
     nextOlderCursor: null,
     isLoadingOlder: false,
@@ -271,6 +295,103 @@ export function createTranscriptState(resourceKey: string): TranscriptState {
 }
 
 type MergeMode = 'upsert' | 'patch-known';
+
+function shouldReplaceFullMessage(
+  current: ChatMessage,
+  incoming: ChatMessage,
+): boolean {
+  if (current.is_deleted_for_everyone && !incoming.is_deleted_for_everyone) {
+    return false;
+  }
+  return (
+    incoming.change_sequence > current.change_sequence ||
+    (incoming.change_sequence === current.change_sequence &&
+      incoming.is_deleted_for_everyone &&
+      !current.is_deleted_for_everyone)
+  );
+}
+
+/** Returns the deferred full row only when it will supersede this raw page row. */
+export function selectDeferredFullAuthorityForMaterialization(
+  state: TranscriptState,
+  incoming: ChatMessage,
+): ChatMessage | null {
+  const deferred = state.deferredAuthoritativePatches.get(incoming.id)
+    ?.fullMessage?.message;
+  return deferred !== undefined && shouldReplaceFullMessage(incoming, deferred)
+    ? deferred
+    : null;
+}
+
+function retainDeferredFullMessage(
+  current: DeferredAuthoritativePatch | undefined,
+  message: ChatMessage,
+  live: boolean,
+): DeferredAuthoritativePatch | null {
+  const currentFullMessage = current?.fullMessage?.message;
+  if (
+    currentFullMessage !== undefined &&
+    !shouldReplaceFullMessage(currentFullMessage, message)
+  ) {
+    return null;
+  }
+  return {
+    fullMessage: { message, live },
+    reaction: message.is_deleted_for_everyone ? null : current?.reaction ?? null,
+  };
+}
+
+function retainDeferredReaction(
+  current: DeferredAuthoritativePatch | undefined,
+  reaction: DeferredReactionPatch,
+): DeferredAuthoritativePatch | null {
+  if (
+    current?.fullMessage?.message.is_deleted_for_everyone ||
+    (current?.fullMessage !== null &&
+      current?.fullMessage !== undefined &&
+      current.fullMessage.message.change_sequence >= reaction.changeSequence) ||
+    (current?.reaction !== null &&
+      current?.reaction !== undefined &&
+      current.reaction.changeSequence >= reaction.changeSequence)
+  ) {
+    return null;
+  }
+  return {
+    fullMessage: current?.fullMessage ?? null,
+    reaction,
+  };
+}
+
+function materializeDeferredPatch(
+  message: ChatMessage,
+  deferred: DeferredAuthoritativePatch,
+): { readonly message: ChatMessage; readonly live: boolean } {
+  let resolved = message;
+  let live = false;
+  const fullMessage = deferred.fullMessage;
+  if (
+    fullMessage !== null &&
+    shouldReplaceFullMessage(resolved, fullMessage.message)
+  ) {
+    resolved = fullMessage.message;
+    live = fullMessage.live;
+  }
+  const reaction = deferred.reaction;
+  if (
+    reaction !== null &&
+    !resolved.is_deleted_for_everyone &&
+    reaction.changeSequence > resolved.change_sequence
+  ) {
+    resolved = {
+      ...resolved,
+      reactions: reaction.reactions,
+      change_sequence: reaction.changeSequence,
+      updated_at: reaction.updatedAt,
+    };
+    live = true;
+  }
+  return { message: resolved, live };
+}
 
 function parsedDraftById(
   message: ChatMessage,
@@ -319,30 +440,67 @@ function mergeMessages(
   mode: MergeMode,
   _requestVersion: number | undefined,
 ): TranscriptState {
-  const eligible = new Map<string, ChatMessage>();
+  const eligible = new Map<
+    string,
+    { readonly message: ChatMessage; readonly live: boolean }
+  >();
+  let deferredAuthoritativePatches = state.deferredAuthoritativePatches;
+  let deferredChanged = false;
 
-  for (const message of messages) {
-    if (state.hidden.has(message.id)) {
+  const mutableDeferredPatches = () => {
+    if (!deferredChanged) {
+      deferredAuthoritativePatches = new Map(deferredAuthoritativePatches);
+      deferredChanged = true;
+    }
+    return deferredAuthoritativePatches as Map<
+      string,
+      DeferredAuthoritativePatch
+    >;
+  };
+
+  for (const incoming of messages) {
+    if (state.hidden.has(incoming.id)) {
       continue;
     }
-    if (mode === 'patch-known' && !state.confirmed.has(message.id)) {
+    const current = state.confirmed.get(incoming.id);
+    if (mode === 'patch-known' && current === undefined) {
+      const retained = retainDeferredFullMessage(
+        deferredAuthoritativePatches.get(incoming.id),
+        incoming,
+        _requestVersion === undefined,
+      );
+      if (retained !== null) {
+        mutableDeferredPatches().set(incoming.id, retained);
+      }
       continue;
     }
 
-    const current = state.confirmed.get(message.id);
+    let message = incoming;
+    let live = _requestVersion === undefined;
+    const deferred = deferredAuthoritativePatches.get(message.id);
+    if (current === undefined && deferred !== undefined) {
+      const materialized = materializeDeferredPatch(message, deferred);
+      message = materialized.message;
+      live = live || materialized.live;
+      mutableDeferredPatches().delete(message.id);
+    }
     if (
       current !== undefined &&
-      (message.change_sequence <= current.change_sequence ||
-        (current.is_deleted_for_everyone &&
-          !message.is_deleted_for_everyone))
+      !shouldReplaceFullMessage(current, message)
     ) {
       continue;
     }
-    eligible.set(message.id, message);
+    eligible.set(message.id, { message, live });
   }
 
   if (eligible.size === 0) {
-    return state;
+    return deferredChanged
+      ? {
+          ...state,
+          version: state.version + 1,
+          deferredAuthoritativePatches,
+        }
+      : state;
   }
 
   const nextVersion = state.version + 1;
@@ -362,12 +520,12 @@ function mergeMessages(
     state.pendingReactionMessageIds,
   );
 
-  for (const message of eligible.values()) {
+  for (const { message, live } of eligible.values()) {
     confirmed.set(message.id, message);
     messageVersions.set(message.id, nextVersion);
     reactionBase.set(message.id, message.reactions);
     reactionBaseVersions.set(message.id, nextVersion);
-    if (_requestVersion === undefined) {
+    if (live) {
       reactionLiveVersions.set(message.id, nextVersion);
     }
 
@@ -414,6 +572,7 @@ function mergeMessages(
     reactionBase,
     reactionOverlays,
     aiDraftOverlays,
+    deferredAuthoritativePatches,
     pendingReactionMessageIds,
   };
 }
@@ -546,7 +705,18 @@ export function transcriptReducer(
 
   switch (action.type) {
     case 'INIT_START':
-      return { ...state, roomStatus: 'loading', roomError: null };
+      if (state.isLoadingInitial) {
+        return state;
+      }
+      if (state.terminalLocked) {
+        return { ...state, isLoadingInitial: true, roomError: null };
+      }
+      return {
+        ...state,
+        roomStatus: 'loading',
+        roomError: null,
+        isLoadingInitial: true,
+      };
 
     case 'INIT_RESOLVED': {
       const merged = mergeMessages(
@@ -559,15 +729,32 @@ export function transcriptReducer(
         ...merged,
         roomStatus: 'ready',
         roomError: null,
+        isLoadingInitial: false,
         nextOlderCursor: action.nextCursor,
         hasMoreOlder: action.nextCursor !== null,
       };
     }
 
     case 'INIT_FAILED':
-      return { ...state, roomStatus: 'error', roomError: action.error };
+      if (state.terminalLocked) {
+        return {
+          ...state,
+          roomStatus: 'ready',
+          roomError: action.error,
+          isLoadingInitial: false,
+        };
+      }
+      return {
+        ...state,
+        roomStatus: 'error',
+        roomError: action.error,
+        isLoadingInitial: false,
+      };
 
     case 'OLDER_START':
+      if (state.isLoadingOlder) {
+        return state;
+      }
       return {
         ...state,
         isLoadingOlder: true,
@@ -663,8 +850,32 @@ export function transcriptReducer(
 
     case 'REACTION_PATCH': {
       const message = state.confirmed.get(action.messageId);
+      if (message === undefined) {
+        if (state.hidden.has(action.messageId)) {
+          return state;
+        }
+        const retained = retainDeferredReaction(
+          state.deferredAuthoritativePatches.get(action.messageId),
+          {
+            reactions: action.reactions,
+            changeSequence: action.changeSequence,
+            updatedAt: action.updatedAt,
+          },
+        );
+        if (retained === null) {
+          return state;
+        }
+        const deferredAuthoritativePatches = new Map(
+          state.deferredAuthoritativePatches,
+        );
+        deferredAuthoritativePatches.set(action.messageId, retained);
+        return {
+          ...state,
+          version: state.version + 1,
+          deferredAuthoritativePatches,
+        };
+      }
       if (
-        message === undefined ||
         message.is_deleted_for_everyone ||
         state.hidden.has(action.messageId) ||
         action.changeSequence <= message.change_sequence
@@ -808,6 +1019,9 @@ export function transcriptReducer(
       const reactionBase = new Map(state.reactionBase);
       const reactionOverlays = new Map(state.reactionOverlays);
       const aiDraftOverlays = new Map(state.aiDraftOverlays);
+      const deferredAuthoritativePatches = new Map(
+        state.deferredAuthoritativePatches,
+      );
       const pendingReactionMessageIds = new Set(
         state.pendingReactionMessageIds,
       );
@@ -822,6 +1036,7 @@ export function transcriptReducer(
         reactionBase.delete(messageId);
         reactionOverlays.delete(messageId);
         aiDraftOverlays.delete(messageId);
+        deferredAuthoritativePatches.delete(messageId);
         pendingReactionMessageIds.delete(messageId);
         pendingDeleteMessageIds.delete(messageId);
 
@@ -853,6 +1068,7 @@ export function transcriptReducer(
         reactionBase,
         reactionOverlays,
         aiDraftOverlays,
+        deferredAuthoritativePatches,
         pendingReactionMessageIds,
         pendingDeleteMessageIds,
         mutationError: null,
@@ -871,6 +1087,7 @@ export function transcriptReducer(
     case 'TERMINAL_LOCK': {
       if (
         state.terminalLocked &&
+        state.roomStatus === 'ready' &&
         state.pending.size === 0 &&
         state.reactionOverlays.size === 0 &&
         state.pendingDeleteMessageIds.size === 0 &&
@@ -894,9 +1111,11 @@ export function transcriptReducer(
         failedClientIds: new Set(),
         failedByClientId: new Map(),
         reactionOverlays: new Map(),
+        roomStatus: 'ready',
         terminalLocked: true,
         pendingReactionMessageIds: new Set(),
         pendingDeleteMessageIds: new Set(),
+        olderLoadError: null,
         isHidingMessages: false,
         mutationError: null,
       };
@@ -915,6 +1134,7 @@ export function transcriptReducer(
       const hadBusyState =
         activeSendClientIds.length > 0 ||
         interruptedMutation ||
+        state.isLoadingInitial ||
         state.isLoadingOlder ||
         state.isGapFilling ||
         state.isUpdating;
@@ -951,6 +1171,7 @@ export function transcriptReducer(
         reactionOverlays: new Map(),
         pendingReactionMessageIds: new Set(),
         pendingDeleteMessageIds: new Set(),
+        isLoadingInitial: false,
         isLoadingOlder: false,
         isGapFilling: false,
         isUpdating: false,

@@ -11,6 +11,7 @@ import {
   getAIActionDraft,
   normalizeAIActionDraftApiError,
   patchAIActionDraft,
+  type AIActionDraftApiFailure,
 } from '../api';
 import {
   checkConfirmStatus,
@@ -88,6 +89,21 @@ function isTerminalDraft(draft: AIActionDraft): boolean {
     draft.status === 'CANCELLED' ||
     draft.status === 'EXPIRED' ||
     draft.status === 'FAILED'
+  );
+}
+
+const ROOM_AUTHORITY_ERROR_CODES = new Set([
+  'TRIP_TERMINAL',
+  'TRIP_NOT_FOUND',
+  'FORBIDDEN',
+]);
+
+function isRoomAuthoritativeFailure(
+  failure: AIActionDraftApiFailure,
+): boolean {
+  return (
+    failure.errorCode !== null &&
+    ROOM_AUTHORITY_ERROR_CODES.has(failure.errorCode)
   );
 }
 
@@ -210,6 +226,9 @@ const DETACHED_CONFIRM_FEEDBACK =
 const INTERRUPTED_CONFIRM_FEEDBACK =
   'The confirmation outcome is unknown because newer draft information arrived before confirmation completed. Use Check status; do not confirm again.';
 
+const INTERACTION_DISABLED_CONFIRM_FEEDBACK =
+  'The confirmation outcome is unknown because draft actions became unavailable before confirmation completed. When available, use Check status; do not confirm again.';
+
 function failClosedConfirm(
   state: AIActionDraftControllerLocalState,
   feedback: string,
@@ -235,6 +254,9 @@ function failClosedDetachedConfirm(
 
 const DETACHED_PATCH_FEEDBACK =
   'The draft update was interrupted when this card left the visible list. Review the saved local values before trying again.';
+
+const INTERACTION_DISABLED_PATCH_FEEDBACK =
+  'The draft update was interrupted because draft actions became unavailable. Review the saved local values before trying again.';
 
 function controllerResourceKey(tripId: string, draft: AIActionDraft): string {
   return JSON.stringify([
@@ -309,6 +331,9 @@ function AIActionDraftCardControllerResource({
   const interactionDisabledRef = useRef(interactionDisabled);
   const generationRef = useRef(0);
   const activeControllerRef = useRef<AbortController | null>(null);
+  const reportedRoomAuthorityScopesRef = useRef(
+    new WeakSet<OperationScope>(),
+  );
   const incomingSourceIdentity =
     aiActionDraftMutationSnapshotIdentity(incomingDraft);
   const previousIncomingDraftRef = useRef(incomingDraft);
@@ -445,10 +470,6 @@ function AIActionDraftCardControllerResource({
     setEditorState(nextSession.editor);
   }, [incomingDraft, incomingSourceIdentity, persistSession, tripId]);
 
-  useLayoutEffect(() => {
-    interactionDisabledRef.current = interactionDisabled;
-  }, [interactionDisabled]);
-
   const ownsScope = (scope: OperationScope): boolean =>
     mountedRef.current &&
     generationRef.current === scope.generation &&
@@ -479,6 +500,41 @@ function AIActionDraftCardControllerResource({
     [incomingDraft, persistSession],
   );
 
+  useLayoutEffect(() => {
+    const becameDisabled =
+      interactionDisabled && !interactionDisabledRef.current;
+    interactionDisabledRef.current = interactionDisabled;
+    if (!becameDisabled) {
+      return;
+    }
+
+    const interruptedOperation = pendingRef.current;
+    if (
+      interruptedOperation === null ||
+      interruptedOperation === 'check'
+    ) {
+      return;
+    }
+
+    generationRef.current += 1;
+    activeControllerRef.current?.abort();
+    activeControllerRef.current = null;
+    busyRef.current = false;
+    pendingRef.current = null;
+    setPending(null);
+
+    if (interruptedOperation === 'confirm') {
+      updateCurrentState((state) =>
+        failClosedConfirm(state, INTERACTION_DISABLED_CONFIRM_FEEDBACK),
+      );
+    } else if (interruptedOperation === 'patch') {
+      updateCurrentState((state) => ({
+        ...state,
+        feedback: INTERACTION_DISABLED_PATCH_FEEDBACK,
+      }));
+    }
+  }, [interactionDisabled, updateCurrentState]);
+
   const reconcileConfirmedOnce = useCallback(
     (
       previousStatus: AIActionDraft['status'],
@@ -506,6 +562,42 @@ function AIActionDraftCardControllerResource({
       feedback: 'The AI action draft server returned an invalid response.',
     }));
   };
+
+  const reportRoomAuthority = (
+    failure: AIActionDraftApiFailure | null,
+    scope: OperationScope,
+  ): void => {
+    if (
+      failure !== null &&
+      isLiveScope(scope) &&
+      isRoomAuthoritativeFailure(failure) &&
+      !reportedRoomAuthorityScopesRef.current.has(scope)
+    ) {
+      reportedRoomAuthorityScopesRef.current.add(scope);
+      reconciliationCoordinator.reportAuthoritativeFailure(failure);
+    }
+  };
+
+  const confirmDependenciesForScope = (
+    scope: OperationScope,
+  ): ConfirmControllerDependencies => ({
+    ...confirmDependencies,
+    normalizeError: (error, operation, requestedDraftId) => {
+      const failure = confirmDependencies.normalizeError(
+        error,
+        operation,
+        requestedDraftId,
+      );
+      reportRoomAuthority(failure, scope);
+      return failure;
+    },
+    reconcile: async (options) => {
+      if (!isLiveScope(scope)) {
+        return;
+      }
+      await confirmDependencies.reconcile(options);
+    },
+  });
 
   const applyDraft = (
     next: AIActionDraft,
@@ -636,6 +728,7 @@ function AIActionDraftCardControllerResource({
         Date.now(),
         current.id,
       );
+      reportRoomAuthority(failure, scope);
       if (failure.draft !== null) {
         let matchingFailureDraft: AIActionDraft;
         try {
@@ -778,6 +871,7 @@ function AIActionDraftCardControllerResource({
         Date.now(),
         current.id,
       );
+      reportRoomAuthority(failure, scope);
       let failureDraft: AIActionDraft | null = null;
       if (failure.draft !== null) {
         try {
@@ -851,11 +945,12 @@ function AIActionDraftCardControllerResource({
           ? { ...confirmState, draft: authoritative }
           : createConfirmAmbiguityState(authoritative);
       const next = await confirmDraftAfterExplicitApproval({
-        dependencies: confirmDependencies,
+        dependencies: confirmDependenciesForScope(scope),
         tripId,
         state,
         signal: scope.controller.signal,
       });
+      reportRoomAuthority(next.failure, scope);
       applyConfirmState(next, authoritative.id, scope);
     } finally {
       finish(scope);
@@ -932,6 +1027,7 @@ function AIActionDraftCardControllerResource({
         Date.now(),
         current.id,
       );
+      reportRoomAuthority(failure, scope);
       if (failure.draft !== null) {
         applyDraft(failure.draft, current.id, scope);
       }
@@ -951,11 +1047,12 @@ function AIActionDraftCardControllerResource({
     }
     try {
       const next = await checkConfirmStatus({
-        dependencies: confirmDependencies,
+        dependencies: confirmDependenciesForScope(scope),
         tripId,
         state: confirmState,
         signal: scope.controller.signal,
       });
+      reportRoomAuthority(next.failure, scope);
       applyConfirmState(next, confirmState.draft.id, scope);
     } finally {
       finish(scope);

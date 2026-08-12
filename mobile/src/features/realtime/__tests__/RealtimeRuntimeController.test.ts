@@ -127,6 +127,22 @@ describe('RealtimeRuntimeController', () => {
     ]);
   });
 
+  it('does not recycle the socket for indeterminate type noise around a known online path', async () => {
+    const value = makeHarness(ACTIVE_AUTH, 'active', {
+      availability: 'online',
+      type: 'WIFI',
+    });
+    value.controller.start();
+    await flushPromises();
+
+    value.network.emit({ availability: 'unknown', type: null });
+    value.network.emit({ availability: 'online', type: null });
+    value.network.emit({ availability: 'online', type: 'WIFI' });
+
+    expect(value.manager.restartCalls).toHaveLength(0);
+    expect(value.manager.disconnectCalls).not.toContain('offline');
+  });
+
   it('ignores a stale initial network read after a newer listener event', async () => {
     const value = makeHarness();
     const initial = deferred<ConnectivitySnapshot>();

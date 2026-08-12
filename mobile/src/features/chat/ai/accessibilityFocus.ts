@@ -1,18 +1,17 @@
-import { AccessibilityInfo, findNodeHandle } from 'react-native';
+import { AccessibilityInfo, type HostInstance } from 'react-native';
 
-export type AccessibilityFocusTarget = Parameters<typeof findNodeHandle>[0];
+export type AccessibilityFocusTarget = HostInstance | null;
 
 export interface AccessibilityFocusDependencies {
-  readonly findNodeHandle: (
-    node: AccessibilityFocusTarget,
-  ) => number | null;
-  readonly setAccessibilityFocus: (handle: number) => void;
+  readonly sendAccessibilityEvent: (
+    node: HostInstance,
+    eventType: 'focus',
+  ) => void;
 }
 
 const DEFAULT_ACCESSIBILITY_FOCUS_DEPENDENCIES: AccessibilityFocusDependencies = {
-  findNodeHandle: (node) => findNodeHandle(node),
-  setAccessibilityFocus: (handle) =>
-    AccessibilityInfo.setAccessibilityFocus(handle),
+  sendAccessibilityEvent: (node, eventType) =>
+    AccessibilityInfo.sendAccessibilityEvent(node, eventType),
 };
 
 export function focusAccessibilityNode(
@@ -23,10 +22,6 @@ export function focusAccessibilityNode(
   if (node === null) {
     return false;
   }
-  const handle = dependencies.findNodeHandle(node);
-  if (handle === null) {
-    return false;
-  }
-  dependencies.setAccessibilityFocus(handle);
+  dependencies.sendAccessibilityEvent(node, 'focus');
   return true;
 }

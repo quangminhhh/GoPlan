@@ -14,7 +14,10 @@ import {
   useRealtimeSnapshot,
   useRealtimeTransport,
 } from '@/features/realtime/application/RealtimeProvider';
-import type { RealtimeStatus } from '@/features/realtime/types';
+import type {
+  RealtimeDiagnostics,
+  RealtimeStatus,
+} from '@/features/realtime/types';
 import { useTripDetail } from '@/features/trips/hooks/useTripDetail';
 import type { TripStatus } from '@/features/trips/types';
 import {
@@ -47,9 +50,11 @@ import {
   selectMessageById,
   selectMessageVersion,
   selectPendingByClientId,
+  selectDeferredFullAuthorityForMaterialization,
   selectTranscriptMessages,
   transcriptReducer,
   type ChatRoomStatus,
+  type ChangeSyncCursor,
   type TranscriptState,
   type TranscriptAction,
 } from '../application/transcriptReducer';
@@ -66,6 +71,9 @@ import type {
 const HISTORY_PAGE_SIZE = 30;
 const RECONCILIATION_PAGE_SIZE = 100;
 const RECONCILIATION_MAX_PAGES = 50;
+export const CHAT_SUBSCRIPTION_ACK_TIMEOUT_MS = 4_000;
+export const CHAT_SUBSCRIPTION_RETRY_DELAY_MS = 500;
+export const CHAT_SUBSCRIPTION_MAX_ATTEMPTS = 3;
 const TERMINAL_ERROR_CODE = 'TRIP_TERMINAL';
 const SUBSCRIPTION_LIMIT_ERROR_CODE = 'SUBSCRIPTION_LIMIT_REACHED';
 const CHAT_ACCESS_UNCERTAIN_ERROR_CODE = 'CHAT_ACCESS_UNCERTAIN';
@@ -152,6 +160,10 @@ export interface UseTripChatResult {
   readonly roomStatus: ChatRoomViewStatus;
   readonly subscriptionStatus: ChatSubscriptionStatus;
   readonly roomError: ChatRoomError | null;
+  /** Recoverable read-plane synchronization failure, including read-only rooms. */
+  readonly readSyncError: ChatRoomError | null;
+  readonly initialLoadError: ChatApiFailure | null;
+  readonly isLoadingInitial: boolean;
   /** Ascending by `(created_at, id)`; reverse before feeding an inverted list. */
   readonly messages: readonly ChatMessage[];
   readonly pendingClientIds: ReadonlySet<string>;
@@ -169,10 +181,14 @@ export interface UseTripChatResult {
   readonly mutationError: ChatMutationError | null;
   readonly aiTypingState: AITypingState;
   readonly connectionStatus: RealtimeStatus;
+  readonly connectionDiagnostics: RealtimeDiagnostics | null;
   readonly connectionEpoch: number;
   readonly aiReconciliationCoordinator: AIReconciliationCoordinator;
   readonly ambiguousAIDraftIds: ReadonlySet<string>;
   readonly retryInitialLoad: () => Promise<void>;
+  readonly retryConnection: () => boolean;
+  readonly retrySubscription: () => void;
+  readonly retryCatchUp: () => void;
   readonly loadOlder: () => Promise<void>;
   readonly sendMessage: (content: string) => Promise<ChatSendOutcome>;
   readonly retryPending: (clientMessageId: string) => Promise<ChatSendOutcome>;
@@ -197,6 +213,20 @@ interface CatchUpRun {
   readonly focusGeneration: number;
   readonly connectionEpoch: number;
   readonly controller: AbortController;
+}
+
+interface CatchUpBaseline {
+  readonly latestMessageId: string | null;
+  readonly changeCursor: ChangeSyncCursor | null;
+}
+
+interface CatchUpRetryIntent {
+  readonly connectionEpoch: number;
+  readonly baseline: CatchUpBaseline;
+}
+
+interface SubscriptionRecoveryTimeout {
+  handle: ReturnType<typeof setTimeout> | null;
 }
 
 interface LiveReactionProof {
@@ -439,6 +469,23 @@ function latestChangeCursorFromMessages(
   return latest;
 }
 
+function catchUpBaselineFromMessages(
+  messages: readonly ChatMessage[],
+): CatchUpBaseline {
+  const latestMessage = [...messages].sort(compareMessages).at(-1) ?? null;
+  return {
+    latestMessageId: latestMessage?.id ?? null,
+    changeCursor: latestChangeCursorFromMessages(messages),
+  };
+}
+
+function catchUpBaselineFromState(state: TranscriptState): CatchUpBaseline {
+  return {
+    latestMessageId: selectLatestConfirmed(state)?.id ?? null,
+    changeCursor: selectLatestChangeCursor(state),
+  };
+}
+
 export function createChatClientMessageId(): string {
   if (typeof globalThis.crypto?.randomUUID === 'function') {
     return globalThis.crypto.randomUUID();
@@ -562,6 +609,8 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     useState<ChatSubscriptionStatus>('inactive');
   const [currentRoomError, setCurrentRoomError] =
     useState<ChatRoomError | null>(null);
+  const [readSyncError, setReadSyncError] =
+    useState<ResourceScopedChatRoomError | null>(null);
   const [aiReconciliationError, setAIReconciliationError] =
     useState<ResourceScopedChatRoomError | null>(null);
   const [aiTypingPresentation, setAITypingPresentation] =
@@ -571,10 +620,17 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       current?.errorCode === TERMINAL_ERROR_CODE ? current : null,
     );
   }, []);
-
   const activeResourceKeyRef = useRef(resourceKey);
   const stateRef = useRef(state);
   const snapshotRef = useRef(realtimeSnapshot);
+  const setNonterminalRoomError = useCallback((error: ChatRoomError) => {
+    if (stateRef.current.terminalLocked) {
+      return;
+    }
+    setCurrentRoomError((current) =>
+      current?.errorCode === TERMINAL_ERROR_CODE ? current : error,
+    );
+  }, []);
   const accessGranted = Boolean(
     tripId &&
     sessionStatus === 'signedIn' &&
@@ -603,8 +659,22 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
   const sentEpochRef = useRef<number | null>(null);
   const ackedEpochRef = useRef<number | null>(null);
   const rejectedEpochRef = useRef<number | null>(null);
+  const subscriptionAttemptEpochRef = useRef<number | null>(null);
+  const subscriptionAttemptCountRef = useRef(0);
+  const subscriptionRecoveryTimerRef =
+    useRef<SubscriptionRecoveryTimeout | null>(null);
+  const attemptSubscribeRef = useRef<() => void>(() => undefined);
   const catchUpRequestedEpochRef = useRef<number | null>(null);
+  const catchUpRetryIntentRef = useRef<CatchUpRetryIntent | null>(null);
+  const runCatchUpRef = useRef<(connectionEpoch: number) => void>(
+    () => undefined,
+  );
+  // A partial or interrupted reconcile must resume from the exact transcript
+  // floor that existed before gap-fill began. Live/high-sequence rows may have
+  // arrived meanwhile and are never authority to advance this watermark.
+  const unresolvedCatchUpBaselineRef = useRef<CatchUpBaseline | null>(null);
   const catchUpRunRef = useRef<CatchUpRun | null>(null);
+  const initialHistoryLoadedRef = useRef(false);
   const initialLoadControllerRef = useRef<AbortController | null>(null);
   const olderLoadControllerRef = useRef<AbortController | null>(null);
   const requestControllersRef = useRef(new Set<AbortController>());
@@ -643,11 +713,40 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       let reconciliation = Promise.resolve();
       let observationMode: 'seed-new' | 'transition' | 'silent' | null = null;
       let affectedMessageIds: readonly string[] = [];
+      const deferredTransitionDraftIds = new Set<string>();
       switch (action.type) {
         case 'INIT_RESOLVED':
         case 'OLDER_RESOLVED':
           observationMode = 'seed-new';
           affectedMessageIds = action.messages.map((message) => message.id);
+          for (const message of action.messages) {
+            const deferredFullMessage =
+              selectDeferredFullAuthorityForMaterialization(
+                previousState,
+                message,
+              );
+            if (deferredFullMessage === null) {
+              continue;
+            }
+            const rawStatusByDraftId = new Map<
+              string,
+              AIActionDraft['status']
+            >();
+            for (const candidate of message.action_drafts) {
+              const parsed = parseAIActionDraft(candidate);
+              if (parsed !== null) {
+                rawStatusByDraftId.set(parsed.id, parsed.status);
+              }
+            }
+            for (const draft of effectiveAIDraftsForMessage(
+              nextState,
+              message.id,
+            )) {
+              if (rawStatusByDraftId.get(draft.id) !== 'CONFIRMED') {
+                deferredTransitionDraftIds.add(draft.id);
+              }
+            }
+          }
           break;
         case 'UPSERT':
         case 'PATCH_KNOWN':
@@ -708,7 +807,11 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
             aiReconciliationCoordinator.seedConfirmedDrafts([nextDraft]);
             continue;
           }
-          if (observationMode === 'seed-new' && previousDraft === null) {
+          if (
+            observationMode === 'seed-new' &&
+            previousDraft === null &&
+            !deferredTransitionDraftIds.has(draftId)
+          ) {
             aiReconciliationCoordinator.seedConfirmedDrafts([nextDraft]);
             continue;
           }
@@ -757,6 +860,40 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       activeResourceKeyRef.current === expectedResourceKey,
     [],
   );
+
+  const scheduleRequestedCatchUp = useCallback(() => {
+    const connectionEpoch = catchUpRequestedEpochRef.current;
+    const snapshot = snapshotRef.current;
+    if (
+      connectionEpoch === null ||
+      initialLoadControllerRef.current !== null ||
+      !initialHistoryLoadedRef.current ||
+      activeResourceKeyRef.current !== resourceKey ||
+      stateRef.current.resourceKey !== resourceKey ||
+      stateRef.current.roomStatus !== 'ready' ||
+      !focusedRef.current ||
+      !accessGrantedRef.current ||
+      kickedRef.current ||
+      snapshot.status !== 'connected' ||
+      snapshot.connectionEpoch !== connectionEpoch ||
+      ackedEpochRef.current !== connectionEpoch
+    ) {
+      return;
+    }
+    runCatchUpRef.current(connectionEpoch);
+  }, [resourceKey]);
+
+  const requestCurrentReadCatchUp = useCallback(() => {
+    const snapshot = snapshotRef.current;
+    if (
+      snapshot.status !== 'connected' ||
+      ackedEpochRef.current !== snapshot.connectionEpoch
+    ) {
+      return;
+    }
+    catchUpRequestedEpochRef.current = snapshot.connectionEpoch;
+    queueMicrotask(scheduleRequestedCatchUp);
+  }, [scheduleRequestedCatchUp]);
 
   const disposeAITypingVisual = useCallback(() => {
     const disposalGeneration = aiTypingDisposalGenerationRef.current + 1;
@@ -885,6 +1022,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     }
     requestControllersRef.current.clear();
     catchUpRunRef.current = null;
+    catchUpRetryIntentRef.current = null;
   }, []);
 
   const invalidateMutationOwnership = useCallback(() => {
@@ -900,23 +1038,48 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     liveDeleteProofsRef.current.clear();
   }, []);
 
-  const resetTransientSubscriptionOwnership = useCallback(() => {
-    const snapshot = snapshotRef.current;
-    focusGenerationRef.current += 1;
-    if (
-      focusedRef.current &&
-      snapshot.status === 'connected' &&
-      sentEpochRef.current === snapshot.connectionEpoch
-    ) {
-      realtime.send({ type: 'chat.unsubscribe', trip_id: tripId });
+  const clearSubscriptionRecoveryTimer = useCallback(() => {
+    const timeout = subscriptionRecoveryTimerRef.current;
+    subscriptionRecoveryTimerRef.current = null;
+    if (timeout !== null && timeout.handle !== null) {
+      clearTimeout(timeout.handle);
     }
+  }, []);
+
+  const resetSubscriptionAttemptTracking = useCallback(() => {
+    clearSubscriptionRecoveryTimer();
+    subscriptionAttemptEpochRef.current = null;
+    subscriptionAttemptCountRef.current = 0;
+  }, [clearSubscriptionRecoveryTimer]);
+
+  const leaveOwnedSubscription = useCallback(() => {
+    const snapshot = snapshotRef.current;
+    if (
+      snapshot.status !== 'connected' ||
+      sentEpochRef.current !== snapshot.connectionEpoch
+    ) {
+      return false;
+    }
+
+    // Claim the leave before sending so repeated cleanup paths are idempotent,
+    // including if the transport synchronously publishes another event.
+    sentEpochRef.current = null;
+    realtime.send({ type: 'chat.unsubscribe', trip_id: tripId });
+    return true;
+  }, [realtime, tripId]);
+
+  const resetTransientSubscriptionOwnership = useCallback(() => {
+    focusGenerationRef.current += 1;
+    leaveOwnedSubscription();
     abortAllRequests();
     invalidateMutationOwnership();
     disposeAITypingVisual();
+    resetSubscriptionAttemptTracking();
     sentEpochRef.current = null;
     ackedEpochRef.current = null;
     rejectedEpochRef.current = null;
     catchUpRequestedEpochRef.current = null;
+    catchUpRetryIntentRef.current = null;
     setSubscriptionStatus('inactive');
     if (stateRef.current.resourceKey === resourceKey) {
       dispatch({
@@ -937,20 +1100,29 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     dispatch,
     disposeAITypingVisual,
     invalidateMutationOwnership,
-    realtime,
+    leaveOwnedSubscription,
+    resetSubscriptionAttemptTracking,
     resourceKey,
-    tripId,
   ]);
 
   const kickRoom = useCallback(
     (detail: string, errorCode = 'FORBIDDEN') => {
+      leaveOwnedSubscription();
       kickedRef.current = true;
       focusGenerationRef.current += 1;
       abortAllRequests();
       invalidateMutationOwnership();
       disposeAITypingVisual();
+      resetSubscriptionAttemptTracking();
+      sentEpochRef.current = null;
+      ackedEpochRef.current = null;
+      rejectedEpochRef.current = null;
+      catchUpRequestedEpochRef.current = null;
+      catchUpRetryIntentRef.current = null;
+      unresolvedCatchUpBaselineRef.current = null;
       setSubscriptionStatus('inactive');
       setCurrentRoomError(roomError(errorCode, detail));
+      setReadSyncError(null);
       dispatch({ type: 'KICKED', resourceKey });
     },
     [
@@ -958,12 +1130,18 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       dispatch,
       disposeAITypingVisual,
       invalidateMutationOwnership,
+      leaveOwnedSubscription,
+      resetSubscriptionAttemptTracking,
       resourceKey,
     ],
   );
 
   const applyAuthoritativeFailure = useCallback(
-    (error: ChatApiFailure, messageId: string | null = null) => {
+    (
+      error: ChatApiFailure,
+      messageId: string | null = null,
+      requestReadCatchUp = true,
+    ) => {
       if (error.errorCode === TERMINAL_ERROR_CODE) {
         invalidateMutationOwnership();
         dispatch({
@@ -973,8 +1151,13 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           requestVersion: stateRef.current.version,
         });
         setCurrentRoomError(roomError(TERMINAL_ERROR_CODE, error.message));
+        if (requestReadCatchUp) {
+          requestCurrentReadCatchUp();
+        }
+        return;
       } else if (isAccessLost(error)) {
         kickRoom(error.message, error.errorCode ?? 'FORBIDDEN');
+        return;
       }
       dispatch({
         type: 'SET_MUTATION_ERROR',
@@ -983,22 +1166,52 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         error,
       });
     },
-    [dispatch, invalidateMutationOwnership, kickRoom, resourceKey],
+    [
+      dispatch,
+      invalidateMutationOwnership,
+      kickRoom,
+      requestCurrentReadCatchUp,
+      resourceKey,
+    ],
   );
+
+  useLayoutEffect(() => {
+    const reportAuthoritativeFailure = (failure: ChatApiFailure) => {
+      if (
+        activeResourceKeyRef.current !== resourceKey ||
+        stateRef.current.resourceKey !== resourceKey ||
+        kickedRef.current
+      ) {
+        return;
+      }
+      applyAuthoritativeFailure(failure);
+    };
+    aiReconciliationCoordinator.setAuthoritativeFailureReporter(
+      reportAuthoritativeFailure,
+    );
+    return () => {
+      aiReconciliationCoordinator.setAuthoritativeFailureReporter(null);
+    };
+  }, [aiReconciliationCoordinator, applyAuthoritativeFailure, resourceKey]);
 
   useEffect(() => {
     let cancelled = false;
     invalidateMutationOwnership();
     disposeAITypingVisual();
+    resetSubscriptionAttemptTracking();
     kickedRef.current = false;
     sentEpochRef.current = null;
     ackedEpochRef.current = null;
     rejectedEpochRef.current = null;
     catchUpRequestedEpochRef.current = null;
+    catchUpRetryIntentRef.current = null;
+    unresolvedCatchUpBaselineRef.current = null;
+    initialHistoryLoadedRef.current = false;
     dispatch({ type: 'RESET', resourceKey });
     queueMicrotask(() => {
       if (!cancelled) {
         setCurrentRoomError(null);
+        setReadSyncError(null);
         setAIReconciliationError(null);
       }
     });
@@ -1008,19 +1221,21 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       abortAllRequests();
       invalidateMutationOwnership();
       disposeAITypingVisual();
+      resetSubscriptionAttemptTracking();
     };
   }, [
     abortAllRequests,
     dispatch,
     disposeAITypingVisual,
     invalidateMutationOwnership,
+    resetSubscriptionAttemptTracking,
     resourceKey,
   ]);
 
   const loadInitialHistory = useCallback(async () => {
     if (
       initialLoadControllerRef.current !== null ||
-      stateRef.current.roomStatus === 'ready' ||
+      initialHistoryLoadedRef.current ||
       kickedRef.current ||
       !tripId
     ) {
@@ -1028,11 +1243,11 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     }
     const controller = registerController();
     initialLoadControllerRef.current = controller;
+    dispatch({ type: 'INIT_START', resourceKey });
     const requestVersion =
       stateRef.current.resourceKey === resourceKey
         ? stateRef.current.version
         : 0;
-    dispatch({ type: 'INIT_START', resourceKey });
     try {
       const response = await listChatHistory(
         tripId,
@@ -1046,6 +1261,10 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       ) {
         return;
       }
+      unresolvedCatchUpBaselineRef.current = catchUpBaselineFromMessages(
+        response.results,
+      );
+      initialHistoryLoadedRef.current = true;
       dispatch({
         type: 'INIT_RESOLVED',
         resourceKey,
@@ -1054,6 +1273,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         requestVersion,
       });
       clearNonterminalRoomError();
+      queueMicrotask(scheduleRequestedCatchUp);
     } catch (caught: unknown) {
       if (controller.signal.aborted || !isResourceCurrent(resourceKey)) {
         return;
@@ -1063,9 +1283,15 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         kickRoom(error.message, error.errorCode ?? 'FORBIDDEN');
         return;
       }
-      setCurrentRoomError(
-        roomError(error.errorCode ?? 'CHAT_INITIAL_LOAD_FAILED', error.message),
-      );
+      const terminalAlreadyKnown = stateRef.current.terminalLocked;
+      if (!terminalAlreadyKnown) {
+        setNonterminalRoomError(
+          roomError(
+            error.errorCode ?? 'CHAT_INITIAL_LOAD_FAILED',
+            error.message,
+          ),
+        );
+      }
       dispatch({
         type: 'INIT_FAILED',
         resourceKey,
@@ -1086,6 +1312,8 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     registerController,
     releaseController,
     resourceKey,
+    scheduleRequestedCatchUp,
+    setNonterminalRoomError,
     tripId,
   ]);
 
@@ -1161,9 +1389,11 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       ),
       requestVersion: state.version,
     });
+    requestCurrentReadCatchUp();
   }, [
     dispatch,
     invalidateMutationOwnership,
+    requestCurrentReadCatchUp,
     resourceKey,
     state.resourceKey,
     state.roomStatus,
@@ -1174,6 +1404,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
 
   const isCatchUpCurrent = useCallback(
     (run: CatchUpRun) =>
+      catchUpRunRef.current === run &&
       !run.controller.signal.aborted &&
       isResourceCurrent(run.resourceKey) &&
       focusedRef.current &&
@@ -1186,11 +1417,20 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
   );
 
   const runCatchUp = useCallback(
-    async (connectionEpoch: number) => {
+    async (
+      connectionEpoch: number,
+      baselineOverride?: CatchUpBaseline,
+    ) => {
       if (
         catchUpRunRef.current !== null ||
         stateRef.current.resourceKey !== resourceKey ||
-        stateRef.current.roomStatus !== 'ready'
+        stateRef.current.roomStatus !== 'ready' ||
+        !focusedRef.current ||
+        !accessGrantedRef.current ||
+        kickedRef.current ||
+        snapshotRef.current.status !== 'connected' ||
+        snapshotRef.current.connectionEpoch !== connectionEpoch ||
+        ackedEpochRef.current !== connectionEpoch
       ) {
         return;
       }
@@ -1203,13 +1443,36 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       };
       catchUpRunRef.current = run;
       catchUpRequestedEpochRef.current = null;
-      let changeCursor = selectLatestChangeCursor(stateRef.current);
+      const baseline =
+        baselineOverride ??
+        unresolvedCatchUpBaselineRef.current ??
+        catchUpBaselineFromState(stateRef.current);
+      unresolvedCatchUpBaselineRef.current = baseline;
+      let changeCursor = baseline.changeCursor;
+      let reconciledChangeCursor = baseline.changeCursor;
       let firstUpdateRequestVersionFloor: number | null = null;
-      let latest = selectLatestConfirmed(stateRef.current);
+      let latestMessageId = baseline.latestMessageId;
+      let reconciledLatestMessageId = baseline.latestMessageId;
+      let retryBaseline = baseline;
+      const armCatchUpRetry = (
+        errorCode:
+          | 'CHAT_SYNC_FAILED'
+          | 'GAP_FILL_INCOMPLETE'
+          | 'CHANGE_SYNC_INCOMPLETE',
+        detail: string,
+      ) => {
+        catchUpRetryIntentRef.current = {
+          connectionEpoch: run.connectionEpoch,
+          baseline: retryBaseline,
+        };
+        const error = roomError(errorCode, detail);
+        setReadSyncError({ resourceKey, error });
+        setNonterminalRoomError(error);
+      };
       dispatch({ type: 'CATCHUP_PHASE', resourceKey, phase: 'gap' });
 
       try {
-        if (latest === null) {
+        if (latestMessageId === null) {
           const requestVersion = stateRef.current.version;
           const history = await listChatHistory(
             tripId,
@@ -1224,13 +1487,21 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
             nextCursor: history.next_cursor,
             requestVersion,
           });
-          latest = [...history.results].sort(compareMessages).at(-1) ?? null;
-          changeCursor ??= latestChangeCursorFromMessages(history.results);
+          const historyBaseline = catchUpBaselineFromMessages(history.results);
+          latestMessageId = historyBaseline.latestMessageId;
+          changeCursor ??= historyBaseline.changeCursor;
+          reconciledLatestMessageId = latestMessageId;
+          reconciledChangeCursor = changeCursor;
+          retryBaseline = {
+            latestMessageId: reconciledLatestMessageId,
+            changeCursor: reconciledChangeCursor,
+          };
+          unresolvedCatchUpBaselineRef.current = retryBaseline;
           if (history.results.length > 0) {
             firstUpdateRequestVersionFloor = stateRef.current.version;
           }
         } else {
-          let since = latest.id;
+          let since = latestMessageId;
           let completed = false;
           for (let page = 0; page < RECONCILIATION_MAX_PAGES; page += 1) {
             const requestVersion = stateRef.current.version;
@@ -1247,19 +1518,29 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
               requestVersion,
             });
             const last = response.results.at(-1);
-            if (!response.has_more || last === undefined) {
+            if (last !== undefined) {
+              since = last.id;
+              reconciledLatestMessageId = last.id;
+              retryBaseline = {
+                latestMessageId: reconciledLatestMessageId,
+                changeCursor: baseline.changeCursor,
+              };
+              unresolvedCatchUpBaselineRef.current = retryBaseline;
+            }
+            if (!response.has_more) {
               completed = true;
               break;
             }
-            since = last.id;
+            if (last === undefined) {
+              break;
+            }
           }
           if (!completed) {
-            setCurrentRoomError(
-              roomError(
-                'GAP_FILL_INCOMPLETE',
-                'Chat recovery reached its safety limit. Reopen chat to retry.',
-              ),
+            armCatchUpRetry(
+              'GAP_FILL_INCOMPLETE',
+              'Chat recovery reached its safety limit. Tap Retry catching up to continue.',
             );
+            return;
           }
         }
 
@@ -1291,31 +1572,60 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
               requestVersion,
             });
             const last = response.results.at(-1);
-            if (!response.has_more || last === undefined) {
+            if (last !== undefined) {
+              changedSince = last.change_sequence;
+              changedSinceId = last.id;
+              reconciledChangeCursor = {
+                changeSequence: last.change_sequence,
+                id: last.id,
+              };
+              retryBaseline = {
+                latestMessageId: reconciledLatestMessageId,
+                changeCursor: reconciledChangeCursor,
+              };
+              unresolvedCatchUpBaselineRef.current = retryBaseline;
+            }
+            if (!response.has_more) {
               completed = true;
               break;
             }
-            changedSince = last.change_sequence;
-            changedSinceId = last.id;
+            if (last === undefined) {
+              break;
+            }
           }
           if (!completed) {
-            setCurrentRoomError(
-              roomError(
-                'CHANGE_SYNC_INCOMPLETE',
-                'Chat updates could not be fully synchronized. Reopen chat to retry.',
-              ),
+            armCatchUpRetry(
+              'CHANGE_SYNC_INCOMPLETE',
+              'Chat updates could not be fully synchronized. Tap Retry catching up to continue.',
             );
+            return;
           }
         }
+        unresolvedCatchUpBaselineRef.current = {
+          latestMessageId: reconciledLatestMessageId,
+          changeCursor: reconciledChangeCursor,
+        };
+        catchUpRetryIntentRef.current = null;
+        setReadSyncError((current) =>
+          current?.resourceKey === resourceKey ? null : current,
+        );
+        setCurrentRoomError((current) =>
+          current?.errorCode === 'CHAT_SYNC_FAILED' ||
+          current?.errorCode === 'GAP_FILL_INCOMPLETE' ||
+          current?.errorCode === 'CHANGE_SYNC_INCOMPLETE'
+            ? null
+            : current,
+        );
       } catch (caught: unknown) {
         if (!isCatchUpCurrent(run)) return;
         const error = normalizeChatApiError(caught);
         if (isAccessLost(error)) {
           kickRoom(error.message, error.errorCode ?? 'FORBIDDEN');
+        } else if (error.errorCode === TERMINAL_ERROR_CODE) {
+          applyAuthoritativeFailure(error, null, false);
+          armCatchUpRetry('CHAT_SYNC_FAILED', error.message);
         } else {
-          setCurrentRoomError(
-            roomError(error.errorCode ?? 'CHAT_SYNC_FAILED', error.message),
-          );
+          armCatchUpRetry('CHAT_SYNC_FAILED', error.message);
         }
       } finally {
         releaseController(run.controller);
@@ -1326,9 +1636,13 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         if (stillOwnsCatchUp && isResourceCurrent(resourceKey)) {
           dispatch({ type: 'CATCHUP_PHASE', resourceKey, phase: null });
         }
+        if (stillOwnsCatchUp) {
+          queueMicrotask(scheduleRequestedCatchUp);
+        }
       }
     },
     [
+      applyAuthoritativeFailure,
       dispatch,
       isCatchUpCurrent,
       isResourceCurrent,
@@ -1336,8 +1650,103 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       registerController,
       releaseController,
       resourceKey,
+      scheduleRequestedCatchUp,
+      setNonterminalRoomError,
       tripId,
     ],
+  );
+
+  useLayoutEffect(() => {
+    runCatchUpRef.current = (connectionEpoch) => {
+      void runCatchUp(connectionEpoch);
+    };
+  }, [runCatchUp]);
+
+  const retryCatchUp = useCallback(() => {
+    const retryIntent = catchUpRetryIntentRef.current;
+    const snapshot = snapshotRef.current;
+    if (
+      retryIntent === null ||
+      catchUpRunRef.current !== null ||
+      !focusedRef.current ||
+      !accessGrantedRef.current ||
+      kickedRef.current ||
+      snapshot.status !== 'connected' ||
+      snapshot.connectionEpoch !== retryIntent.connectionEpoch ||
+      ackedEpochRef.current !== retryIntent.connectionEpoch ||
+      stateRef.current.resourceKey !== resourceKey ||
+      stateRef.current.roomStatus !== 'ready'
+    ) {
+      return;
+    }
+
+    catchUpRetryIntentRef.current = null;
+    setReadSyncError((current) =>
+      current?.resourceKey === resourceKey ? null : current,
+    );
+    setCurrentRoomError((current) =>
+      current?.errorCode === 'CHAT_SYNC_FAILED' ||
+      current?.errorCode === 'GAP_FILL_INCOMPLETE' ||
+      current?.errorCode === 'CHANGE_SYNC_INCOMPLETE'
+        ? null
+        : current,
+    );
+    void runCatchUp(retryIntent.connectionEpoch, retryIntent.baseline);
+  }, [resourceKey, runCatchUp]);
+
+  const scheduleSubscriptionRecovery = useCallback(
+    (
+      connectionEpoch: number,
+      focusGeneration: number,
+      delayMs: number,
+    ) => {
+      clearSubscriptionRecoveryTimer();
+      const timeout: SubscriptionRecoveryTimeout = { handle: null };
+      subscriptionRecoveryTimerRef.current = timeout;
+      timeout.handle = setTimeout(() => {
+        if (subscriptionRecoveryTimerRef.current !== timeout) {
+          return;
+        }
+        subscriptionRecoveryTimerRef.current = null;
+        const snapshot = snapshotRef.current;
+        if (
+          activeResourceKeyRef.current !== resourceKey ||
+          !focusedRef.current ||
+          focusGenerationRef.current !== focusGeneration ||
+          !accessGrantedRef.current ||
+          kickedRef.current ||
+          snapshot.status !== 'connected' ||
+          snapshot.connectionEpoch !== connectionEpoch ||
+          subscriptionAttemptEpochRef.current !== connectionEpoch ||
+          ackedEpochRef.current === connectionEpoch ||
+          rejectedEpochRef.current === connectionEpoch
+        ) {
+          return;
+        }
+
+        if (
+          subscriptionAttemptCountRef.current >=
+          CHAT_SUBSCRIPTION_MAX_ATTEMPTS
+        ) {
+          rejectedEpochRef.current = connectionEpoch;
+          setSubscriptionStatus('rejected');
+          setCurrentRoomError((current) =>
+            current?.errorCode === TERMINAL_ERROR_CODE
+              ? current
+              : roomError(
+                  'CHAT_SUBSCRIPTION_TIMEOUT',
+                  'Live chat could not confirm this room after several attempts. Tap Retry live chat or reopen chat.',
+                ),
+          );
+          return;
+        }
+
+        sentEpochRef.current = null;
+        setSubscriptionStatus('waiting');
+        attemptSubscribeRef.current();
+      }, delayMs);
+    },
+    [clearSubscriptionRecoveryTimer, resourceKey],
   );
 
   const attemptSubscribe = useCallback(() => {
@@ -1348,26 +1757,105 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       kickedRef.current ||
       snapshot.status !== 'connected' ||
       sentEpochRef.current === snapshot.connectionEpoch ||
+      ackedEpochRef.current === snapshot.connectionEpoch ||
       rejectedEpochRef.current === snapshot.connectionEpoch
     ) {
       return;
     }
+
+    if (subscriptionAttemptEpochRef.current !== snapshot.connectionEpoch) {
+      clearSubscriptionRecoveryTimer();
+      subscriptionAttemptEpochRef.current = snapshot.connectionEpoch;
+      subscriptionAttemptCountRef.current = 0;
+      sentEpochRef.current = null;
+      ackedEpochRef.current = null;
+      rejectedEpochRef.current = null;
+    }
+    if (
+      subscriptionAttemptCountRef.current >= CHAT_SUBSCRIPTION_MAX_ATTEMPTS
+    ) {
+      return;
+    }
+
+    const focusGeneration = focusGenerationRef.current;
+    subscriptionAttemptCountRef.current += 1;
     const sent = realtime.send({ type: 'chat.subscribe', trip_id: tripId });
     if (sent) {
       sentEpochRef.current = snapshot.connectionEpoch;
       setSubscriptionStatus('subscribing');
+      scheduleSubscriptionRecovery(
+        snapshot.connectionEpoch,
+        focusGeneration,
+        CHAT_SUBSCRIPTION_ACK_TIMEOUT_MS,
+      );
     } else {
+      sentEpochRef.current = null;
       setSubscriptionStatus('waiting');
+      scheduleSubscriptionRecovery(
+        snapshot.connectionEpoch,
+        focusGeneration,
+        CHAT_SUBSCRIPTION_RETRY_DELAY_MS,
+      );
     }
-  }, [realtime, tripId]);
+  }, [
+    clearSubscriptionRecoveryTimer,
+    realtime,
+    scheduleSubscriptionRecovery,
+    tripId,
+  ]);
+
+  useLayoutEffect(() => {
+    attemptSubscribeRef.current = attemptSubscribe;
+  }, [attemptSubscribe]);
+
+  const retrySubscription = useCallback(() => {
+    if (
+      !focusedRef.current ||
+      !accessGrantedRef.current ||
+      kickedRef.current
+    ) {
+      return;
+    }
+
+    resetSubscriptionAttemptTracking();
+    sentEpochRef.current = null;
+    ackedEpochRef.current = null;
+    rejectedEpochRef.current = null;
+    catchUpRequestedEpochRef.current = null;
+    catchUpRetryIntentRef.current = null;
+    setReadSyncError((current) =>
+      current?.resourceKey === resourceKey ? null : current,
+    );
+    clearNonterminalRoomError();
+    setSubscriptionStatus('waiting');
+    attemptSubscribe();
+  }, [
+    attemptSubscribe,
+    clearNonterminalRoomError,
+    resetSubscriptionAttemptTracking,
+    resourceKey,
+  ]);
+
+  const retryConnection = useCallback(
+    () => realtime.retryConnection(),
+    [realtime],
+  );
 
   useFocusEffect(
     useCallback(() => {
       focusedRef.current = true;
       focusGenerationRef.current += 1;
       disposeAITypingVisual();
+      resetSubscriptionAttemptTracking();
+      sentEpochRef.current = null;
+      ackedEpochRef.current = null;
+      rejectedEpochRef.current = null;
+      catchUpRequestedEpochRef.current = null;
+      catchUpRetryIntentRef.current = null;
       setSubscriptionStatus(
-        snapshotRef.current.status === 'connected' ? 'subscribing' : 'waiting',
+        snapshotRef.current.status === 'connected'
+          ? 'subscribing'
+          : 'waiting',
       );
       attemptSubscribe();
 
@@ -1375,6 +1863,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         focusedRef.current = false;
         focusGenerationRef.current += 1;
         disposeAITypingVisual();
+        clearSubscriptionRecoveryTimer();
         const activeCatchUp = catchUpRunRef.current;
         activeCatchUp?.controller.abort();
         if (activeCatchUp !== null && catchUpRunRef.current === activeCatchUp) {
@@ -1387,26 +1876,24 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
             });
           }
         }
-        const snapshot = snapshotRef.current;
-        if (
-          snapshot.status === 'connected' &&
-          sentEpochRef.current === snapshot.connectionEpoch
-        ) {
-          realtime.send({ type: 'chat.unsubscribe', trip_id: tripId });
-        }
+        leaveOwnedSubscription();
         sentEpochRef.current = null;
         ackedEpochRef.current = null;
         rejectedEpochRef.current = null;
+        subscriptionAttemptEpochRef.current = null;
+        subscriptionAttemptCountRef.current = 0;
         catchUpRequestedEpochRef.current = null;
+        catchUpRetryIntentRef.current = null;
         setSubscriptionStatus('inactive');
       };
     }, [
       attemptSubscribe,
+      clearSubscriptionRecoveryTimer,
       dispatch,
       disposeAITypingVisual,
       isResourceCurrent,
-      realtime,
-      tripId,
+      leaveOwnedSubscription,
+      resetSubscriptionAttemptTracking,
     ]),
   );
 
@@ -1435,12 +1922,35 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       }
     }
 
-    if (!focusedRef.current || kickedRef.current || !accessGranted) {
+    if (
+      !focusedRef.current ||
+      kickedRef.current ||
+      !accessGranted
+    ) {
       return;
     }
     if (realtimeSnapshot.status !== 'connected') {
+      clearSubscriptionRecoveryTimer();
+      sentEpochRef.current = null;
       ackedEpochRef.current = null;
-      return;
+      rejectedEpochRef.current = null;
+      subscriptionAttemptEpochRef.current = null;
+      subscriptionAttemptCountRef.current = 0;
+      catchUpRequestedEpochRef.current = null;
+      catchUpRetryIntentRef.current = null;
+      let cancelled = false;
+      queueMicrotask(() => {
+        if (
+          !cancelled &&
+          focusedRef.current &&
+          snapshotRef.current.status !== 'connected'
+        ) {
+          setSubscriptionStatus('waiting');
+        }
+      });
+      return () => {
+        cancelled = true;
+      };
     }
     let cancelled = false;
     void Promise.resolve().then(() => {
@@ -1454,6 +1964,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
   }, [
     accessGranted,
     attemptSubscribe,
+    clearSubscriptionRecoveryTimer,
     dispatch,
     disposeAITypingVisual,
     realtimeSnapshot,
@@ -1467,9 +1978,9 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       ackedEpochRef.current !== null &&
       catchUpRequestedEpochRef.current === ackedEpochRef.current
     ) {
-      void runCatchUp(ackedEpochRef.current);
+      scheduleRequestedCatchUp();
     }
-  }, [runCatchUp, state.roomStatus, subscriptionStatus]);
+  }, [scheduleRequestedCatchUp, state.roomStatus, subscriptionStatus]);
 
   useEffect(() => {
     if (!accessGranted) {
@@ -1492,25 +2003,33 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           if (
             !focusedRef.current ||
             snapshot.status !== 'connected' ||
-            sentEpochRef.current !== snapshot.connectionEpoch
+            subscriptionAttemptEpochRef.current !==
+              snapshot.connectionEpoch ||
+            subscriptionAttemptCountRef.current === 0
           ) {
             return;
           }
+          clearSubscriptionRecoveryTimer();
+          const alreadyAcknowledged =
+            ackedEpochRef.current === snapshot.connectionEpoch;
           ackedEpochRef.current = snapshot.connectionEpoch;
           rejectedEpochRef.current = null;
-          catchUpRequestedEpochRef.current = snapshot.connectionEpoch;
           setSubscriptionStatus('subscribed');
-          clearNonterminalRoomError();
-          ensureAITypingVisual(snapshot.connectionEpoch);
-          if (stateRef.current.roomStatus === 'ready') {
-            void runCatchUp(snapshot.connectionEpoch);
+          if (alreadyAcknowledged) {
+            return;
           }
+          clearNonterminalRoomError();
+          catchUpRequestedEpochRef.current = snapshot.connectionEpoch;
+          catchUpRetryIntentRef.current = null;
+          ensureAITypingVisual(snapshot.connectionEpoch);
+          scheduleRequestedCatchUp();
           return;
         }
         case 'chat.unsubscribed': {
           const snapshot = snapshotRef.current;
           const rejectedCurrentAttempt =
             rejectedEpochRef.current === snapshot.connectionEpoch;
+          clearSubscriptionRecoveryTimer();
           const activeCatchUp = catchUpRunRef.current;
           if (activeCatchUp !== null) {
             activeCatchUp.controller.abort();
@@ -1521,14 +2040,17 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
           }
           ackedEpochRef.current = null;
           catchUpRequestedEpochRef.current = null;
+          catchUpRetryIntentRef.current = null;
           disposeAITypingVisual();
-          if (focusedRef.current && !rejectedCurrentAttempt) {
-            if (sentEpochRef.current === snapshot.connectionEpoch) {
-              setSubscriptionStatus('subscribing');
-            } else {
-              setSubscriptionStatus('waiting');
-              attemptSubscribe();
-            }
+          if (
+            focusedRef.current &&
+            !rejectedCurrentAttempt
+          ) {
+            sentEpochRef.current = null;
+            subscriptionAttemptEpochRef.current = null;
+            subscriptionAttemptCountRef.current = 0;
+            setSubscriptionStatus('waiting');
+            attemptSubscribe();
           }
           return;
         }
@@ -1597,24 +2119,34 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
               TERMINAL_ERROR_CODE,
               409,
             );
-            invalidateMutationOwnership();
-            dispatch({
-              type: 'TERMINAL_LOCK',
-              resourceKey,
-              error,
-              requestVersion: stateRef.current.version,
-            });
+            applyAuthoritativeFailure(error);
+            return;
           }
-          setCurrentRoomError(roomError(event.error_code, event.detail));
+          setNonterminalRoomError(
+            roomError(event.error_code, event.detail),
+          );
           const snapshot = snapshotRef.current;
           const pendingCurrentAttempt =
             focusedRef.current &&
             snapshot.status === 'connected' &&
-            sentEpochRef.current === snapshot.connectionEpoch &&
+            subscriptionAttemptEpochRef.current ===
+              snapshot.connectionEpoch &&
+            subscriptionAttemptCountRef.current > 0 &&
             ackedEpochRef.current !== snapshot.connectionEpoch;
           if (pendingCurrentAttempt) {
-            rejectedEpochRef.current = snapshot.connectionEpoch;
-            setSubscriptionStatus('rejected');
+            if (event.error_code === SUBSCRIPTION_LIMIT_ERROR_CODE) {
+              clearSubscriptionRecoveryTimer();
+              rejectedEpochRef.current = snapshot.connectionEpoch;
+              setSubscriptionStatus('rejected');
+            } else {
+              sentEpochRef.current = null;
+              setSubscriptionStatus('waiting');
+              scheduleSubscriptionRecovery(
+                snapshot.connectionEpoch,
+                focusGenerationRef.current,
+                CHAT_SUBSCRIPTION_RETRY_DELAY_MS,
+              );
+            }
           }
           return;
         }
@@ -1659,7 +2191,9 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     });
   }, [
     accessGranted,
+    applyAuthoritativeFailure,
     attemptSubscribe,
+    clearSubscriptionRecoveryTimer,
     clearNonterminalRoomError,
     dispatch,
     disposeAITypingVisual,
@@ -1670,57 +2204,76 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     realtime,
     resourceKey,
     runCatchUp,
+    scheduleRequestedCatchUp,
+    scheduleSubscriptionRecovery,
+    setNonterminalRoomError,
     tripId,
   ]);
 
   const mutationBlockedFailure = useCallback((): ChatApiFailure | null => {
+    const current = stateRef.current;
     if (
       activeResourceKeyRef.current !== resourceKey ||
-      stateRef.current.resourceKey !== resourceKey
+      current.resourceKey !== resourceKey
     ) {
       return localFailure(
         'Chat is switching trips. Wait for the new conversation to load.',
         'CHAT_NOT_READY',
       );
     }
-    if (accessStatus !== 'granted' || state.roomStatus === 'kicked') {
+    if (
+      !accessGrantedRef.current ||
+      kickedRef.current ||
+      current.roomStatus === 'kicked'
+    ) {
       return localFailure(
         'You no longer have access to this trip chat.',
         'FORBIDDEN',
         403,
       );
     }
-    if (subscriptionStatus === 'rejected') {
-      return localFailure(
-        currentRoomError?.detail ?? 'This chat room is not subscribed.',
-        currentRoomError?.errorCode ?? SUBSCRIPTION_LIMIT_ERROR_CODE,
-      );
-    }
-    if (state.roomStatus !== 'ready') {
-      return localFailure(
-        'Chat is not ready yet.',
-        'CHAT_NOT_READY',
-      );
-    }
     if (
-      state.terminalLocked ||
+      current.terminalLocked ||
       tripDetail.detail?.trip.status === 'COMPLETED' ||
       tripDetail.detail?.trip.status === 'CANCELLED'
     ) {
       return localFailure('This trip chat is read-only.', TERMINAL_ERROR_CODE, 409);
     }
+    const snapshot = snapshotRef.current;
+    const currentEpochRejected =
+      snapshot.status === 'connected' &&
+      rejectedEpochRef.current === snapshot.connectionEpoch;
+    if (subscriptionStatus === 'rejected' || currentEpochRejected) {
+      return localFailure(
+        currentRoomError?.detail ?? 'This chat room is not subscribed.',
+        currentRoomError?.errorCode ?? SUBSCRIPTION_LIMIT_ERROR_CODE,
+      );
+    }
+    if (current.roomStatus !== 'ready') {
+      return localFailure(
+        'Chat is not ready yet.',
+        'CHAT_NOT_READY',
+      );
+    }
     return null;
   }, [
-    accessStatus,
     currentRoomError,
     resourceKey,
-    state.roomStatus,
-    state.terminalLocked,
     subscriptionStatus,
     tripDetail.detail?.trip.status,
   ]);
 
   const retryInitialLoad = useCallback(async () => {
+    if (
+      (stateRef.current.terminalLocked ||
+        tripStatus === 'COMPLETED' ||
+        tripStatus === 'CANCELLED') &&
+      accessStatus === 'granted' &&
+      !initialHistoryLoadedRef.current
+    ) {
+      await loadInitialHistory();
+      return;
+    }
     if (accessStatus === 'error') {
       clearNonterminalRoomError();
       await refreshTripDetail('initial');
@@ -1737,6 +2290,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     clearNonterminalRoomError,
     loadInitialHistory,
     refreshTripDetail,
+    tripStatus,
   ]);
 
   const loadOlder = useCallback(async () => {
@@ -2426,6 +2980,10 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
       (visibleState ? currentRoomError : null) ??
       visibleAIReconciliationError ??
       transcriptRoomError,
+    readSyncError:
+      readSyncError?.resourceKey === resourceKey ? readSyncError.error : null,
+    initialLoadError: visibleState ? state.roomError : null,
+    isLoadingInitial: visibleState && state.isLoadingInitial,
     messages,
     pendingClientIds: visibleState ? state.pendingClientIds : EMPTY_ID_SET,
     failedClientIds: visibleState ? state.failedClientIds : EMPTY_ID_SET,
@@ -2446,6 +3004,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     mutationError: visibleState ? state.mutationError : null,
     aiTypingState: visibleAITypingState,
     connectionStatus: realtimeSnapshot.status,
+    connectionDiagnostics: realtimeSnapshot.diagnostics ?? null,
     connectionEpoch: realtimeSnapshot.connectionEpoch,
     aiReconciliationCoordinator,
     ambiguousAIDraftIds: visibleState
@@ -2453,6 +3012,9 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
         EMPTY_ID_SET)
       : EMPTY_ID_SET,
     retryInitialLoad,
+    retryConnection,
+    retrySubscription,
+    retryCatchUp,
     loadOlder,
     sendMessage,
     retryPending,
