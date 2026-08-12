@@ -11,6 +11,10 @@ from django.test import TransactionTestCase, override_settings
 from django.urls import re_path
 from django.utils import timezone
 
+from configs.asgi import (
+    application as production_asgi_application,
+    build_asgi_application,
+)
 from realtime.consumers import RealtimeConsumer
 from realtime.middleware import WebSocketAuthMiddleware
 from realtime.services import issue_ws_ticket
@@ -40,6 +44,35 @@ def _make_communicator(ticket=None):
     return WebsocketCommunicator(
         _build_application(),
         "ws/realtime",
+        subprotocols=subprotocols,
+    )
+
+
+def _make_configured_production_communicator(
+    ticket,
+    origin=None,
+    *,
+    allowed_origins,
+):
+    subprotocols = [settings.WS_SUBPROTOCOL, ticket]
+    with override_settings(CORS_ALLOWED_ORIGINS=allowed_origins):
+        application = build_asgi_application()
+    headers = [] if origin is None else [(b"origin", origin.encode("ascii"))]
+    return WebsocketCommunicator(
+        application,
+        "ws/realtime",
+        headers=headers,
+        subprotocols=subprotocols,
+    )
+
+
+def _make_production_communicator(ticket, origin=None):
+    subprotocols = [settings.WS_SUBPROTOCOL, ticket]
+    headers = [] if origin is None else [(b"origin", origin.encode("ascii"))]
+    return WebsocketCommunicator(
+        production_asgi_application,
+        "ws/realtime",
+        headers=headers,
         subprotocols=subprotocols,
     )
 
@@ -91,6 +124,95 @@ class WebSocketAuthMiddlewareTests(TransactionTestCase):
 
         self.assertTrue(connected)
         await communicator.disconnect()
+
+    async def test_configured_origins_reach_production_ticket_authentication(self):
+        browser_origin = "http://localhost:3000"
+        native_origin = "http://127.0.0.1:8000"
+        allowed_origins = [browser_origin, native_origin]
+
+        for index, origin in enumerate(allowed_origins):
+            with self.subTest(origin=origin):
+                user = await _create_user(email=f"allowed-origin-{index}@example.com")
+                ticket = await _issue_ws_ticket(user)
+                communicator = _make_configured_production_communicator(
+                    ticket,
+                    origin,
+                    allowed_origins=allowed_origins,
+                )
+                connected, subprotocol = await communicator.connect()
+
+                self.assertTrue(connected)
+                self.assertEqual(subprotocol, settings.WS_SUBPROTOCOL)
+                await communicator.disconnect()
+
+    async def test_missing_origin_is_rejected_without_consuming_ticket(self):
+        user = await _create_user(email="missing-origin@example.com")
+        ticket = await _issue_ws_ticket(user)
+
+        native_origin = "http://127.0.0.1:8000"
+        allowed_origins = [native_origin]
+        rejected = _make_configured_production_communicator(
+            ticket,
+            allowed_origins=allowed_origins,
+        )
+        connected, _ = await rejected.connect()
+
+        self.assertFalse(connected)
+
+        accepted = _make_configured_production_communicator(
+            ticket,
+            native_origin,
+            allowed_origins=allowed_origins,
+        )
+        connected, _ = await accepted.connect()
+        self.assertTrue(connected)
+        await accepted.send_json_to({"type": "ping"})
+        self.assertEqual(await accepted.receive_json_from(), {"type": "pong"})
+        await accepted.disconnect()
+
+    async def test_unlisted_origin_is_rejected_without_consuming_ticket(self):
+        user = await _create_user(email="rejected-origin@example.com")
+        ticket = await _issue_ws_ticket(user)
+        native_origin = "http://127.0.0.1:8000"
+
+        rejected = _make_configured_production_communicator(
+            ticket,
+            "https://untrusted.example",
+            allowed_origins=[native_origin],
+        )
+        connected, _ = await rejected.connect()
+        self.assertFalse(connected)
+
+        accepted = _make_configured_production_communicator(
+            ticket,
+            native_origin,
+            allowed_origins=[native_origin],
+        )
+        connected, _ = await accepted.connect()
+        self.assertTrue(connected)
+        await accepted.send_json_to({"type": "ping"})
+        self.assertEqual(await accepted.receive_json_from(), {"type": "pong"})
+        await accepted.disconnect()
+
+    async def test_production_asgi_stack_rejects_origin_before_consuming_ticket(self):
+        user = await _create_user(email="production-origin-stack@example.com")
+        ticket = await _issue_ws_ticket(user)
+        configured_origin = settings.CORS_ALLOWED_ORIGINS[0]
+
+        rejected = _make_production_communicator(
+            ticket,
+            "https://untrusted.example",
+        )
+        connected, _ = await rejected.connect()
+        self.assertFalse(connected)
+
+        accepted = _make_production_communicator(ticket, configured_origin)
+        connected, subprotocol = await accepted.connect()
+        self.assertTrue(connected)
+        self.assertEqual(subprotocol, settings.WS_SUBPROTOCOL)
+        await accepted.send_json_to({"type": "ping"})
+        self.assertEqual(await accepted.receive_json_from(), {"type": "pong"})
+        await accepted.disconnect()
 
     async def test_missing_ticket_closes_4001(self):
         communicator = _make_communicator(ticket=None)

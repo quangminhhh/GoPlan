@@ -1,14 +1,23 @@
 import { Ionicons } from '@expo/vector-icons';
 import { Redirect, Tabs } from 'expo-router';
 import { useSession } from '@/features/auth/session';
-import { NotificationsProvider, useNotifications } from '@/features/notifications/application/NotificationsProvider';
+import { useNotifications } from '@/features/notifications/application/NotificationsProvider';
 import { colors } from '@/shared/theme/tokens';
 import { LoadingScreen } from '@/shared/ui/LoadingScreen';
 
 function TabsNavigator() {
-  const { unreadCount } = useNotifications();
+  const { items, unreadCount, lastKnownUnreadCount } = useNotifications();
+  const hasLoadedUnread = items.some((item) => !item.is_read);
   const notificationsBadge =
-    unreadCount !== null && unreadCount > 0 ? (unreadCount > 99 ? '99+' : unreadCount) : undefined;
+    unreadCount !== null
+      ? unreadCount > 0
+        ? unreadCount > 99
+          ? '99+'
+          : unreadCount
+        : undefined
+      : (lastKnownUnreadCount !== null && lastKnownUnreadCount > 0) || hasLoadedUnread
+        ? '•'
+        : undefined;
   return (
     <Tabs screenOptions={{ tabBarActiveTintColor: colors.primary, headerShown: true }}>
       <Tabs.Screen
@@ -58,9 +67,5 @@ export default function TabsLayout() {
   if (user?.requires_profile_setup) {
     return <Redirect href="/(auth)/profile-setup" />;
   }
-  return (
-    <NotificationsProvider ownerUserId={user?.id ?? null}>
-      <TabsNavigator />
-    </NotificationsProvider>
-  );
+  return <TabsNavigator />;
 }

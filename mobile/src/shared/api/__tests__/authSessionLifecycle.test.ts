@@ -75,12 +75,24 @@ describe('auth session lifecycle', () => {
     expect(openingA).toEqual({ sessionGeneration: 1, credentialRevision: 0 });
     await setRefreshToken('refresh-a');
     publishAuthPair(openingA, { access: 'access-a', refresh: 'refresh-a' });
+    expect(getAuthSnapshot()).toMatchObject({
+      access: 'access-a',
+      publishedCredentialRevision: 0,
+    });
     activateAuthSession(openingA);
 
     const closing = requestAuthSessionClose('user');
-    expect(getAuthSnapshot()).toMatchObject({ phase: 'closing', sessionGeneration: 2 });
+    expect(getAuthSnapshot()).toMatchObject({
+      phase: 'closing',
+      sessionGeneration: 2,
+      publishedCredentialRevision: null,
+    });
     await closing;
-    expect(getAuthSnapshot()).toMatchObject({ phase: 'signedOut', sessionGeneration: 2 });
+    expect(getAuthSnapshot()).toMatchObject({
+      phase: 'signedOut',
+      sessionGeneration: 2,
+      publishedCredentialRevision: null,
+    });
 
     const openingB = await beginAuthSessionOpening();
     expect(openingB).toEqual({ sessionGeneration: 3, credentialRevision: 0 });
@@ -258,9 +270,18 @@ describe('auth session lifecycle', () => {
     const rotatedTicket = beginAuthCredentialRotation(ticket, rotatedPair);
 
     expect(rotatedTicket).toEqual({ sessionGeneration: 1, credentialRevision: 1 });
+    expect(getAuthSnapshot()).toMatchObject({
+      credentialRevision: 1,
+      access: 'access-a',
+      publishedCredentialRevision: 0,
+    });
     expect(oldRefresh?.recordCandidate({ access: 'stale-access', refresh: 'stale-refresh' })).toBe(false);
     expect(rotatedTicket && publishAuthPair(rotatedTicket, rotatedPair)).toBe(true);
-    expect(getAuthSnapshot()).toMatchObject({ credentialRevision: 1, access: 'rotated-access' });
+    expect(getAuthSnapshot()).toMatchObject({
+      credentialRevision: 1,
+      access: 'rotated-access',
+      publishedCredentialRevision: 1,
+    });
     oldRefresh?.finish();
   });
 

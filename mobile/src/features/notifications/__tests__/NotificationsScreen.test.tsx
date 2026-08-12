@@ -74,6 +74,7 @@ function readyContext(overrides: Partial<NotificationsContextValue> = {}): Notif
     loadingMore: false,
     hasNextPage: false,
     unreadCount: 1,
+    lastKnownUnreadCount: 1,
     markingAllRead: false,
     pendingReadIds: new Set(),
     pendingInvitationActions: new Map(),
@@ -128,6 +129,23 @@ describe('NotificationsScreen', () => {
     expect(screen.getByRole('button', { name: 'Mark all notifications as read' }).props.accessibilityState).toEqual(
       expect.objectContaining({ disabled: true }),
     );
+  });
+
+  it('keeps mark-all available from the last known signal while the exact badge is unknown', async () => {
+    mockUseNotifications.mockReturnValue(
+      readyContext({
+        unreadCount: null,
+        lastKnownUnreadCount: 3,
+        items: [{ ...notification, is_read: true }],
+      }),
+    );
+
+    await render(<NotificationsScreen />);
+
+    expect(
+      screen.getByRole('button', { name: 'Mark all notifications as read' }).props
+        .accessibilityState,
+    ).toEqual(expect.objectContaining({ disabled: false }));
   });
 
   it('delegates pull-to-refresh and guarded cursor pagination', async () => {

@@ -42,6 +42,25 @@ describe('NotificationRow', () => {
     expect(onOpen).toHaveBeenCalledWith('notification-1', null);
   });
 
+  it('exposes the current read state once on the simple row action', async () => {
+    const { rerender } = await render(<NotificationRow {...defaultProps} notification={base} />);
+
+    const label = 'Bob sent you a friend request';
+    expect(screen.getByRole('button', { name: label }).props.accessibilityValue).toEqual({
+      text: 'Unread',
+    });
+    expect(screen.queryByLabelText('Unread')).toBeNull();
+
+    await rerender(
+      <NotificationRow {...defaultProps} notification={{ ...base, is_read: true }} />,
+    );
+
+    expect(screen.getByRole('button', { name: label }).props.accessibilityValue).toEqual({
+      text: 'Read',
+    });
+    expect(screen.queryByLabelText('Unread')).toBeNull();
+  });
+
   it('renders malformed and unknown payloads neutrally without exposing raw JSON', async () => {
     await render(
       <NotificationRow
@@ -108,6 +127,35 @@ describe('NotificationRow', () => {
     expect(screen.getByText('You joined this trip.')).toBeTruthy();
     await fireEvent.press(screen.getByRole('button', { name: 'Trip invitation to Da Lat escape' }));
     expect(onOpen).toHaveBeenLastCalledWith('notification-1', 'trip-1');
+  });
+
+  it('exposes the current read state once on the invitation row action', async () => {
+    const invitation: NotificationItem = {
+      ...base,
+      notification_type: 'TRIP_INVITATION',
+      payload: invitationPayload,
+    };
+    const { rerender } = await render(
+      <NotificationRow {...defaultProps} notification={invitation} />,
+    );
+
+    const label = 'Trip invitation to Da Lat escape';
+    expect(screen.getByRole('button', { name: label }).props.accessibilityValue).toEqual({
+      text: 'Unread',
+    });
+    expect(screen.queryByLabelText('Unread')).toBeNull();
+
+    await rerender(
+      <NotificationRow
+        {...defaultProps}
+        notification={{ ...invitation, is_read: true }}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: label }).props.accessibilityValue).toEqual({
+      text: 'Read',
+    });
+    expect(screen.queryByLabelText('Unread')).toBeNull();
   });
 
   it('keeps legacy invitation status non-actionable and displays normalized row errors', async () => {

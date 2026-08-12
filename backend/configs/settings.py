@@ -3,8 +3,10 @@ import sys
 
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, ValidationError
+from django.core.validators import URLValidator
 from PIL import Image as _PILImage
 
 # Process-wide hard guard for extreme decompression bombs. Every Image.open path
@@ -14,6 +16,7 @@ _PILImage.MAX_IMAGE_PIXELS = 50_000_000
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+_HTTP_ORIGIN_VALIDATOR = URLValidator(schemes=("http", "https"))
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -26,6 +29,47 @@ def env_bool(name: str, default: bool = False) -> bool:
 def env_list(name: str) -> tuple[str, ...]:
     raw = os.environ.get(name, "")
     return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def env_origins(name: str) -> tuple[str, ...]:
+    origins = env_list(name)
+    if not origins:
+        raise ImproperlyConfigured(f"{name} must contain at least one origin.")
+
+    for entry_index, origin in enumerate(origins, start=1):
+        lowered_origin = origin.lower()
+        if lowered_origin == "null" or "*" in origin:
+            raise ImproperlyConfigured(
+                f"{name} entry {entry_index} must be an explicit HTTP(S) origin."
+            )
+
+        try:
+            _HTTP_ORIGIN_VALIDATOR(origin)
+            parsed = urlsplit(origin)
+            hostname = parsed.hostname
+            _ = parsed.port
+        except (ValidationError, ValueError):
+            invalid_origin = True
+        else:
+            invalid_origin = (
+                parsed.scheme not in {"http", "https"}
+                or hostname is None
+                or hostname.startswith(".")
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+                or parsed.netloc.endswith(":")
+            )
+
+        if invalid_origin:
+            raise ImproperlyConfigured(
+                f"{name} entry {entry_index} must be a valid HTTP(S) origin "
+                "without credentials, path, query, or fragment."
+            ) from None
+
+    return origins
 
 
 def env_int(name: str, default: int) -> int:
@@ -228,7 +272,7 @@ TRIP_MEMORY_MAX_ACTIVE_PER_USER_PER_TRIP = 1
 TRIP_MEMORY_MAX_ACTIVE_PER_TRIP = 3
 
 # -------- Cross-Origin Settings --------
-CORS_ALLOWED_ORIGINS = os.environ['CORS_ALLOWED_ORIGINS'].split(',')
+CORS_ALLOWED_ORIGINS = env_origins('CORS_ALLOWED_ORIGINS')
 CSRF_TRUSTED_ORIGINS = os.environ['CSRF_TRUSTED_ORIGINS'].split(',')
 
 SESSION_COOKIE_SAMESITE = 'Lax'

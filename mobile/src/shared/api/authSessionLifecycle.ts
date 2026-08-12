@@ -15,6 +15,11 @@ export interface AuthPair {
 export interface AuthLifecycleSnapshot extends AuthTicket {
   phase: AuthPhase;
   access: string | null;
+  /**
+   * Revision that owns `access`. It deliberately lags `credentialRevision`
+   * while a rotated refresh token is being persisted.
+   */
+  publishedCredentialRevision: number | null;
 }
 
 export type AuthCloseReason =
@@ -69,6 +74,7 @@ let phase: AuthPhase = 'signedOut';
 let sessionGeneration = 0;
 let credentialRevision = 0;
 let publishedAccess: string | null = null;
+let publishedCredentialRevision: number | null = null;
 let activePair: PairCandidate | null = null;
 let latestCandidate: PairCandidate | null = null;
 let closingSource: AuthTicket | null = null;
@@ -103,8 +109,15 @@ function sourceTicketIsCurrent(ticket: AuthTicket): boolean {
   return phase === 'closing' && closingSource !== null && sameTicket(ticket, closingSource);
 }
 
-function setPublishedAccess(access: string | null): void {
+function setPublishedAccess(
+  access: string | null,
+  revision: number | null,
+): void {
+  if ((access === null) !== (revision === null)) {
+    throw new Error('Published access and credential revision must move atomically.');
+  }
   publishedAccess = access;
+  publishedCredentialRevision = revision;
   setAccessToken(access);
 }
 
@@ -152,6 +165,7 @@ export function getAuthSnapshot(): AuthLifecycleSnapshot {
     sessionGeneration,
     credentialRevision,
     access: publishedAccess,
+    publishedCredentialRevision,
   };
 }
 
@@ -204,6 +218,7 @@ export async function beginAuthSessionOpening(): Promise<AuthTicket> {
   credentialRevision = 0;
   phase = 'opening';
   publishedAccess = null;
+  publishedCredentialRevision = null;
   activePair = null;
   latestCandidate = null;
   closingSource = null;
@@ -297,7 +312,7 @@ export function publishAuthPair(ticket: AuthTicket, pair: AuthPair): boolean {
   const candidate = makeCandidate(ticket, pair);
   activePair = candidate;
   latestCandidate = newerCandidate(latestCandidate, candidate);
-  setPublishedAccess(pair.access);
+  setPublishedAccess(pair.access, ticket.credentialRevision);
   publishLifecycle();
   return true;
 }
@@ -385,7 +400,7 @@ export function requestAuthSessionClose(reason: AuthCloseReason): Promise<void> 
   closingHandoff = newerCandidate(activePair, latestCandidate);
   phase = 'closing';
   sessionGeneration = context.closingGeneration;
-  setPublishedAccess(null);
+  setPublishedAccess(null, null);
   try {
     effectsAtStart?.onClosing?.(context);
   } catch {
@@ -434,6 +449,7 @@ export function requestAuthSessionClose(reason: AuthCloseReason): Promise<void> 
     closingHandoff = null;
     closingSource = null;
     publishedAccess = null;
+    publishedCredentialRevision = null;
     phase = 'signedOut';
     publishLifecycle();
 
@@ -452,6 +468,7 @@ export function __resetAuthSessionLifecycleForTests(): void {
   sessionGeneration = 0;
   credentialRevision = 0;
   publishedAccess = null;
+  publishedCredentialRevision = null;
   activePair = null;
   latestCandidate = null;
   closingSource = null;
