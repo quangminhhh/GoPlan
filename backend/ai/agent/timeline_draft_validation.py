@@ -18,9 +18,11 @@ from trips.services import (
     TimelineInvalidAssigneeError,
     TimelineInvalidCustomTypeError,
     TimelineSectionNotFoundError,
+    normalize_timeline_activity_input,
     plan_timeline_activity_create,
     plan_timeline_activity_patch,
     resolve_timeline_activity_create_references,
+    timeline_json_value,
 )
 
 
@@ -114,9 +116,14 @@ def plan_timeline_create_draft(
             blocking_field_errors={"data": "Activity data must be an object."},
         )
 
+    normalized_data = normalize_timeline_activity_input(data)
+    normalized_payload = {
+        **payload,
+        "data": timeline_json_value(normalized_data),
+    }
     missing_names = missing_payload_field_names(
         action_type=action_type,
-        payload=payload,
+        payload=normalized_payload,
         currency_code=trip.currency_code,
     )
     field_errors = {
@@ -138,7 +145,7 @@ def plan_timeline_create_draft(
         try:
             references = resolve_timeline_activity_create_references(
                 trip=trip,
-                data=data,
+                data=normalized_data,
                 section_id=section_id,
                 lock_section=lock_section,
                 require_section=not has_section_date,
@@ -156,7 +163,7 @@ def plan_timeline_create_draft(
 
     if field_errors:
         return TimelineDraftCreateResult(
-            payload=payload,
+            payload=normalized_payload,
             plan=None,
             field_errors=field_errors,
             blocking_field_errors=blocking_field_errors,
@@ -165,7 +172,7 @@ def plan_timeline_create_draft(
     try:
         plan = plan_timeline_activity_create(
             trip=trip,
-            data=data,
+            data=normalized_data,
             section_id=section_id,
             section=(references.section if references is not None else None),
             lock_section=False,
@@ -202,7 +209,7 @@ def plan_timeline_create_draft(
             blocking_field_errors={"assignee_user_id": str(exc)},
         )
 
-    canonical_payload = {**payload, "data": plan.data}
+    canonical_payload = {**normalized_payload, "data": plan.data}
     if plan.section is not None:
         canonical_payload["section_id"] = str(plan.section.id)
     return TimelineDraftCreateResult(

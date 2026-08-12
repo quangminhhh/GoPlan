@@ -379,7 +379,11 @@ class AIActionDraftChangeSequenceTests(TestCase):
             response_message=self.response_message,
             user=self.user,
             status=AIActionDraftStatus.NEEDS_INFO,
-            payload={"title": "Lunch", "total_amount": "500000"},
+            payload={
+                "title": "Lunch",
+                "total_amount": "500000",
+                "currency_code": self.trip.currency_code,
+            },
             missing_fields=[
                 {"name": "total_amount", "label": "Amount", "type": "money"}
             ],

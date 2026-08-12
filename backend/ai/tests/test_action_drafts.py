@@ -106,6 +106,36 @@ class AIActionDraftModelTests(TestCase):
 
 
 class AIActionDraftPayloadTests(AIActionDraftModelTests):
+    def test_partial_timeline_create_keeps_json_safe_clock_until_complete(self):
+        section = self.trip.timeline_sections.order_by("section_date").first()
+
+        draft = create_action_draft(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            action_type="timeline.activity.create",
+            payload={
+                "section_id": str(section.id),
+                "data": {
+                    "title": "Museum visit",
+                    "system_type": "SIGHTSEEING",
+                    "time_mode": "TIME_RANGE",
+                    "start_time": "2026-04-20T08:00:00+07:00",
+                },
+            },
+        )
+
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(
+            draft.payload["data"]["start_time"],
+            "08:00:00",
+        )
+        self.assertEqual(
+            {field["name"] for field in draft.missing_fields},
+            {"end_time"},
+        )
+
     def test_captain_can_confirm_captain_managed_draft(self):
         draft = AIActionDraft.objects.create(
             trip=self.trip,
@@ -768,7 +798,11 @@ class AIActionDraftPatchTests(APITestCase, AIActionDraftModelTests):
         push_chat_message,
     ):
         draft = self._create_patch_draft(
-            payload={"title": "Lunch", "total_amount": "500000"},
+            payload={
+                "title": "Lunch",
+                "total_amount": "500000",
+                "currency_code": self.trip.currency_code,
+            },
         )
 
         self._assert_patch_request_is_a_true_noop(
@@ -1009,6 +1043,59 @@ class AIActionDraftPatchTests(APITestCase, AIActionDraftModelTests):
         self.assertEqual(confirmed.status, AIActionDraftStatus.CONFIRMED)
         self.assertEqual(expense.total_amount, Decimal("25.50"))
         self.assertEqual(expense.currency_code, "USD")
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_same_amount_patch_after_currency_change_restamps_and_revalidates(
+        self,
+        push_chat_message,
+    ):
+        from trips.models import Trip
+
+        draft = create_action_draft(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            action_type="expense.create",
+            payload={
+                "title": "Lunch",
+                "currency_code": "VND",
+                "total_amount": "25.50",
+            },
+        )
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(draft.payload["currency_code"], "VND")
+        self.assertEqual(draft.payload["total_amount"], "25.50")
+        self.assertIn(
+            "total_amount",
+            {field["name"] for field in draft.missing_fields},
+        )
+        Trip.objects.filter(pk=self.trip.pk).update(currency_code="USD")
+        self.client.force_authenticate(self.user)
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.patch(
+                f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                {"payload": {"total_amount": "25.50"}},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["draft"]["status"], AIActionDraftStatus.READY)
+        self.assertEqual(response.data["draft"]["preview"]["currency_code"], "USD")
+        self.assertEqual(response.data["draft"]["display"]["hero"]["currency"], "USD")
+        draft.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertEqual(draft.payload["currency_code"], "USD")
+        self.assertEqual(draft.payload["total_amount"], "25.50")
+        self.assertEqual(draft.preview["currency_code"], "USD")
+        self.assertEqual(draft.display["hero"]["currency"], "USD")
+        self.assertEqual(draft.missing_fields, [])
+        self.assertEqual(self.trip.chat_change_sequence, 1)
+        self.assertEqual(self.response_message.change_sequence, 1)
+        self.assertEqual(len(callbacks), 1)
+        push_chat_message.assert_not_called()
 
     @patch("ai.chat_changes.push_chat_message")
     def test_currency_change_patch_rejects_amount_invalid_for_current_trip(
@@ -2301,6 +2388,106 @@ class AIActionDraftPatchFieldValidationTests(APITestCase, AIActionDraftModelTest
         )
 
         self.assertEqual(res.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(
+            draft.status,
+            AIActionDraftStatus.READY,
+            {"missing_fields": draft.missing_fields, "payload": draft.payload},
+        )
+        self.assertEqual(draft.missing_fields, [])
+        self.assertNotIn("title", draft.payload)
+        self.assertNotIn("system_type", draft.payload)
+        self.assertNotIn("time_mode", draft.payload)
+        self.assertEqual(draft.payload["data"]["title"], "Museum Visit")
+        self.assertEqual(draft.payload["data"]["system_type"], "SIGHTSEEING")
+        self.assertEqual(draft.payload["data"]["time_mode"], "TIME_RANGE")
+        self.assertEqual(draft.payload["data"]["start_time"], "08:00:00")
+        self.assertEqual(draft.payload["data"]["end_time"], "10:00:00")
+
+    def test_nested_timeline_fields_take_precedence_over_legacy_top_level_fields(self):
+        draft = self._create_needs_info_activity_draft()
+        draft.payload["data"] = {
+            "title": "Canonical museum visit",
+            "system_type": "FOOD",
+            "time_mode": "TIME_RANGE",
+        }
+        draft.save(update_fields=["payload", "updated_at"])
+        self.client.force_authenticate(self.user)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {"start_time": "08:00", "end_time": "10:00"}},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertEqual(draft.missing_fields, [])
+        self.assertNotIn("title", draft.payload)
+        self.assertNotIn("system_type", draft.payload)
+        self.assertNotIn("time_mode", draft.payload)
+        self.assertEqual(
+            draft.payload["data"]["title"],
+            "Canonical museum visit",
+        )
+        self.assertEqual(draft.payload["data"]["system_type"], "FOOD")
+        self.assertEqual(draft.payload["data"]["time_mode"], "TIME_RANGE")
+
+    def test_incoming_nested_timeline_fields_win_independent_of_json_key_order(self):
+        section = self.trip.timeline_sections.order_by("section_date").first()
+        patch_payloads = (
+            {
+                "title": "Legacy leaf title",
+                "data": {"title": "Canonical nested title"},
+            },
+            {
+                "data": {"title": "Canonical nested title"},
+                "title": "Legacy leaf title",
+            },
+        )
+        self.client.force_authenticate(self.user)
+
+        for patch_payload in patch_payloads:
+            with self.subTest(keys=tuple(patch_payload)):
+                draft = AIActionDraft.objects.create(
+                    trip=self.trip,
+                    interaction=self.interaction,
+                    response_message=self.response_message,
+                    requested_by=self.user,
+                    action_type="timeline.activity.create",
+                    status=AIActionDraftStatus.NEEDS_INFO,
+                    required_confirmation=AI_CONFIRMATION_CAPTAIN,
+                    payload={
+                        "section_id": str(section.id),
+                        "data": {
+                            "system_type": "SIGHTSEEING",
+                            "time_mode": "FLEXIBLE",
+                        },
+                    },
+                    preview={},
+                    missing_fields=[
+                        {"name": "title", "label": "Title"},
+                        {"name": "data", "label": "Activity details"},
+                    ],
+                    preconditions={},
+                    expires_at=timezone.now() + timedelta(hours=24),
+                )
+
+                response = self.client.patch(
+                    f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                    data={"payload": patch_payload},
+                    format="json",
+                )
+
+                self.assertEqual(response.status_code, 200)
+                draft.refresh_from_db()
+                self.assertEqual(draft.status, AIActionDraftStatus.READY)
+                self.assertEqual(
+                    draft.payload["data"]["title"],
+                    "Canonical nested title",
+                )
+                self.assertNotIn("title", draft.payload)
 
     def test_patch_synthetic_time_range_updates_nested_payload(self):
         section = self.trip.timeline_sections.order_by("section_date").first()

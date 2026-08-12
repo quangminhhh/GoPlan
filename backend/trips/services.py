@@ -1279,7 +1279,8 @@ def normalize_timeline_activity_input(data: dict) -> dict:
     return normalized
 
 
-def _timeline_json_value(value):
+def timeline_json_value(value):
+    """Convert normalized timeline values into JSON-safe canonical values."""
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, time):
@@ -1287,9 +1288,9 @@ def _timeline_json_value(value):
     if isinstance(value, (Decimal, UUID)):
         return str(value)
     if isinstance(value, dict):
-        return {key: _timeline_json_value(item) for key, item in value.items()}
+        return {key: timeline_json_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_timeline_json_value(item) for item in value]
+        return [timeline_json_value(item) for item in value]
     return value
 
 
@@ -1503,7 +1504,7 @@ def plan_timeline_activity_create(
         "reminder_offsets_minutes": reminder_offsets,
     }
     return TimelineActivityCreatePlan(
-        data=_timeline_json_value(canonical_data),
+        data=timeline_json_value(canonical_data),
         apply_data=apply_data,
         final_data=final_data,
         section=references.section,
@@ -1743,7 +1744,7 @@ def plan_timeline_activity_patch(
         "reminder_offsets_minutes": final_reminder_offsets,
     }
     return TimelineActivityPatchPlan(
-        data=_timeline_json_value(apply_data),
+        data=timeline_json_value(apply_data),
         apply_data=apply_data,
         final_data=final_data,
         final_time_mode=final_time_mode,

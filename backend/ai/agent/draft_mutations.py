@@ -85,19 +85,32 @@ def _apply_draft_patch_payload(draft: AIActionDraft, patch_payload: dict) -> dic
         AI_ACTION_TIMELINE_ACTIVITY_UPDATE,
     }:
         existing_data = next_payload.get("data")
-        data = dict(existing_data) if isinstance(existing_data, dict) else {}
+        legacy_data = {
+            key: next_payload.pop(key)
+            for key in tuple(next_payload)
+            if key in TIMELINE_ACTIVITY_DATA_FIELDS
+        }
+        data = {
+            **legacy_data,
+            **(dict(existing_data) if isinstance(existing_data, dict) else {}),
+        }
         data_overridden = False
         for key, value in patch_payload.items():
             if key == "data":
-                if isinstance(value, dict):
-                    data.update(value)
-                else:
-                    next_payload["data"] = value
-                    data_overridden = True
-            elif key in TIMELINE_ACTIVITY_DATA_FIELDS:
+                continue
+            if key in TIMELINE_ACTIVITY_DATA_FIELDS:
                 data[key] = value
             else:
                 next_payload[key] = value
+        if "data" in patch_payload:
+            nested_patch = patch_payload["data"]
+            if isinstance(nested_patch, dict):
+                # The canonical wrapper wins when a legacy client submits both
+                # representations, independent of JSON object key order.
+                data.update(nested_patch)
+            else:
+                next_payload["data"] = nested_patch
+                data_overridden = True
         if not data_overridden:
             next_payload["data"] = data
         return next_payload
@@ -257,9 +270,6 @@ def patch_action_draft(
             if not patch_payload:
                 return draft
 
-            if next_payload == draft.payload:
-                return draft
-
             expense_currency_changed = (
                 draft.action_type == AI_ACTION_EXPENSE_CREATE
                 and next_payload.get("currency_code")
@@ -270,6 +280,9 @@ def patch_action_draft(
                 # for input while the trip currency changes, so restamp the
                 # locked authoritative value on every explicit edit.
                 next_payload["currency_code"] = locked_trip.currency_code
+
+            if next_payload == draft.payload:
+                return draft
 
             timeline_create_result = plan_timeline_create_draft(
                 action_type=draft.action_type,
