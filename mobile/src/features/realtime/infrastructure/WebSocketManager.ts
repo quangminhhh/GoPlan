@@ -46,6 +46,7 @@ export type RealtimeSocketFactory = (
 ) => RealtimeSocket;
 
 type TimerHandle = ReturnType<typeof setTimeout>;
+type TicketRequestKind = 'issue' | 'refresh';
 
 export interface RealtimeScheduler {
   setTimeout(callback: () => void, delayMs: number): TimerHandle;
@@ -247,7 +248,7 @@ export class WebSocketManager implements RealtimeManager {
 
   private beginTicketRequest(
     owner: RealtimeOwner,
-    requestKind: 'issue' | 'refresh',
+    requestKind: TicketRequestKind,
     status: 'connecting' | 'reconnecting',
   ): void {
     if (!this.canUseOwner(owner) || !sameOwner(this.currentOwner, owner)) return;
@@ -275,7 +276,7 @@ export class WebSocketManager implements RealtimeManager {
     url: string,
     owner: RealtimeOwner,
     requestId: number,
-    requestKind: 'issue' | 'refresh',
+    requestKind: TicketRequestKind,
   ): Promise<void> {
     try {
       const ticket =
@@ -287,7 +288,7 @@ export class WebSocketManager implements RealtimeManager {
     } catch (error) {
       if (!this.isAttemptCurrent(owner, requestId)) return;
       this.isConnecting = false;
-      this.handleTicketFailure(owner, error);
+      this.handleTicketFailure(owner, requestKind, error);
     }
   }
 
@@ -304,7 +305,7 @@ export class WebSocketManager implements RealtimeManager {
       socket = this.dependencies.socketFactory(url, [WS_SUBPROTOCOL, ticket]);
     } catch {
       this.isConnecting = false;
-      this.scheduleReconnect(owner);
+      this.scheduleReconnect(owner, 'issue');
       return;
     }
 
@@ -417,18 +418,22 @@ export class WebSocketManager implements RealtimeManager {
     }
   }
 
-  private handleTicketFailure(owner: RealtimeOwner, error: unknown): void {
+  private handleTicketFailure(
+    owner: RealtimeOwner,
+    requestKind: TicketRequestKind,
+    error: unknown,
+  ): void {
     if (error instanceof TicketRequestError) {
       if (error.kind === 'hardAuth') {
         this.hardStop(owner);
         return;
       }
       if (error.kind === 'throttled') {
-        this.scheduleThrottledReconnect(owner, error.retryAfterMs);
+        this.scheduleThrottledReconnect(owner, requestKind, error.retryAfterMs);
         return;
       }
     }
-    this.scheduleReconnect(owner);
+    this.scheduleReconnect(owner, requestKind);
   }
 
   private handleNetworkClose(owner: RealtimeOwner): void {
@@ -437,10 +442,13 @@ export class WebSocketManager implements RealtimeManager {
       this.beginTicketRequest(owner, 'issue', 'reconnecting');
       return;
     }
-    this.scheduleReconnect(owner);
+    this.scheduleReconnect(owner, 'issue');
   }
 
-  private scheduleReconnect(owner: RealtimeOwner): void {
+  private scheduleReconnect(
+    owner: RealtimeOwner,
+    requestKind: TicketRequestKind,
+  ): void {
     if (!this.canUseOwner(owner) || !sameOwner(this.currentOwner, owner)) return;
     if (this.reconnectAttempt >= REALTIME_TIMING.maxReconnectAttempts) {
       this.isConnecting = false;
@@ -453,11 +461,12 @@ export class WebSocketManager implements RealtimeManager {
       REALTIME_TIMING.maxBackoffMs,
     );
     this.reconnectAttempt += 1;
-    this.scheduleRetry(owner, baseDelay + this.jitterMs());
+    this.scheduleRetry(owner, requestKind, baseDelay + this.jitterMs());
   }
 
   private scheduleThrottledReconnect(
     owner: RealtimeOwner,
+    requestKind: TicketRequestKind,
     retryAfterMs: number | null,
   ): void {
     const requestedDelay = retryAfterMs ?? REALTIME_TIMING.throttleFallbackMs;
@@ -465,17 +474,21 @@ export class WebSocketManager implements RealtimeManager {
       requestedDelay + this.jitterMs(),
       REALTIME_TIMING.throttleMaxMs,
     );
-    this.scheduleRetry(owner, delay);
+    this.scheduleRetry(owner, requestKind, delay);
   }
 
-  private scheduleRetry(owner: RealtimeOwner, delayMs: number): void {
+  private scheduleRetry(
+    owner: RealtimeOwner,
+    requestKind: TicketRequestKind,
+    delayMs: number,
+  ): void {
     if (!this.canUseOwner(owner) || !sameOwner(this.currentOwner, owner)) return;
     this.clearReconnectTimer();
     this.isConnecting = false;
     this.setStatus('reconnecting');
     this.reconnectTimer = this.dependencies.scheduler.setTimeout(() => {
       this.reconnectTimer = null;
-      this.beginTicketRequest(owner, 'issue', 'reconnecting');
+      this.beginTicketRequest(owner, requestKind, 'reconnecting');
     }, delayMs);
   }
 

@@ -110,6 +110,7 @@ describe('notificationRealtimeReducer', () => {
       type: 'UNREAD_COUNT_RESOLVED',
       unreadCount: 3,
       requestVersion: staleRequestVersion,
+      knownItemIdsAtStart: [],
     });
     expect(state.unreadCount).toBeNull();
 
@@ -118,6 +119,7 @@ describe('notificationRealtimeReducer', () => {
       type: 'UNREAD_COUNT_RESOLVED',
       unreadCount: 3,
       requestVersion: reconcileRequestVersion,
+      knownItemIdsAtStart: [],
     });
     expect(state.unreadCount).toBe(3);
   });
@@ -160,7 +162,7 @@ describe('notificationRealtimeReducer', () => {
     expect(state.unreadCount).toBe(0);
   });
 
-  it('only applies read_all to ids known when the event arrived', () => {
+  it('does not guess the read state of an unknown row returned by a stale first page', () => {
     const known = makeNotification('known');
     const unknown = makeNotification('unknown');
     let state = createNotificationRealtimeState({ items: [known], unreadCount: 2 });
@@ -222,6 +224,52 @@ describe('notificationRealtimeReducer', () => {
     ).toBe(true);
   });
 
+  it('applies a local read-all delta only to the request snapshot ids', () => {
+    const visibleAtStart = makeNotification('visible-at-start');
+    const createdAfterStart = makeNotification('created-after-start');
+    let state = createNotificationRealtimeState({
+      items: [visibleAtStart],
+      unreadCount: 2,
+    });
+    state = receive(state, created(createdAfterStart));
+
+    state = notificationRealtimeReducer(state, {
+      type: 'LOCAL_READ_ALL_CONFIRMED',
+      notificationIds: [visibleAtStart.id],
+      updatedCount: 2,
+      countIsAmbiguous: false,
+    });
+
+    expect(
+      state.items.find((item) => item.id === visibleAtStart.id)?.is_read,
+    ).toBe(true);
+    expect(
+      state.items.find((item) => item.id === createdAfterStart.id)?.is_read,
+    ).toBe(false);
+    expect(state.unreadCount).toBe(1);
+  });
+
+  it.each([0, 1])(
+    'invalidates an ambiguous read-all delta of %s until count reconciliation',
+    (updatedCount) => {
+    const item = makeNotification('item');
+    const initial = createNotificationRealtimeState({
+      items: [item],
+      unreadCount: 1,
+    });
+
+    const next = notificationRealtimeReducer(initial, {
+      type: 'LOCAL_READ_ALL_CONFIRMED',
+      notificationIds: [item.id],
+      updatedCount,
+      countIsAmbiguous: true,
+    });
+
+    expect(next.items[0]?.is_read).toBe(true);
+    expect(next.unreadCount).toBeNull();
+    },
+  );
+
   it('does not let a stale first page drop a created push that arrived in flight', () => {
     const existing = makeNotification('existing');
     const pushed = { ...makeNotification('pushed'), payload: { source: 'websocket' } };
@@ -238,6 +286,120 @@ describe('notificationRealtimeReducer', () => {
     expect(state.items).toEqual([pushed, existing]);
   });
 
+  it('invalidates a numeric badge below the loaded unread lower bound', () => {
+    const unread = makeNotification('unread');
+    const state = notificationRealtimeReducer(
+      createNotificationRealtimeState({ unreadCount: 0 }),
+      {
+        type: 'FIRST_PAGE_RESOLVED',
+        items: [unread],
+        requestVersion: 0,
+      },
+    );
+
+    expect(state.items).toEqual([unread]);
+    expect(state.unreadCount).toBeNull();
+  });
+
+  it('turns an accepted zero count into a per-id read proof for a stale first page', () => {
+    const item = makeNotification('item');
+    let state = createNotificationRealtimeState({ items: [item], unreadCount: 1 });
+    const requestVersion = captureNotificationRealtimeVersion(state);
+
+    state = notificationRealtimeReducer(state, {
+      type: 'UNREAD_COUNT_RESOLVED',
+      unreadCount: 0,
+      requestVersion,
+      knownItemIdsAtStart: [item.id],
+    });
+
+    expect(state.items[0]?.is_read).toBe(true);
+    expect(state.unreadCount).toBe(0);
+    expect(state.version).toBe(1);
+    expect(state.overlays.readById.get(item.id)).toEqual({
+      version: 1,
+      countDelta: 0,
+    });
+
+    state = notificationRealtimeReducer(state, {
+      type: 'FIRST_PAGE_RESOLVED',
+      items: [item],
+      requestVersion,
+    });
+
+    expect(state.items[0]?.is_read).toBe(true);
+    expect(state.unreadCount).toBe(0);
+  });
+
+  it('keeps an item added after a zero-count request unread and invalidates the count', () => {
+    const known = makeNotification('known');
+    const addedDuringRequest = makeNotification('added-during-request');
+    let state = createNotificationRealtimeState({
+      items: [known],
+      unreadCount: 2,
+    });
+    const requestVersion = captureNotificationRealtimeVersion(state);
+
+    state = notificationRealtimeReducer(state, {
+      type: 'FIRST_PAGE_RESOLVED',
+      items: [addedDuringRequest, known],
+      requestVersion,
+    });
+    state = notificationRealtimeReducer(state, {
+      type: 'UNREAD_COUNT_RESOLVED',
+      unreadCount: 0,
+      requestVersion,
+      knownItemIdsAtStart: [known.id],
+    });
+
+    expect(state.items.find((item) => item.id === known.id)?.is_read).toBe(true);
+    expect(
+      state.items.find((item) => item.id === addedDuringRequest.id)?.is_read,
+    ).toBe(false);
+    expect(state.unreadCount).toBeNull();
+    expect(state.overlays.readById.has(addedDuringRequest.id)).toBe(false);
+  });
+
+  it('discards a stale zero count without publishing read proofs', () => {
+    const known = makeNotification('known');
+    let state = createNotificationRealtimeState({ items: [known], unreadCount: 1 });
+    const requestVersion = captureNotificationRealtimeVersion(state);
+    state = receive(state, created(makeNotification('created-after-request')));
+    const beforeResponse = state;
+
+    state = notificationRealtimeReducer(state, {
+      type: 'UNREAD_COUNT_RESOLVED',
+      unreadCount: 0,
+      requestVersion,
+      knownItemIdsAtStart: [known.id],
+    });
+
+    expect(state).toBe(beforeResponse);
+    expect(state.items.find((item) => item.id === known.id)?.is_read).toBe(false);
+    expect(state.overlays.readById.has(known.id)).toBe(false);
+  });
+
+  it('invalidates a positive count below the loaded unread lower bound without marking rows', () => {
+    const first = makeNotification('first');
+    const second = makeNotification('second');
+    const initial = createNotificationRealtimeState({
+      items: [first, second],
+      unreadCount: 2,
+    });
+
+    const state = notificationRealtimeReducer(initial, {
+      type: 'UNREAD_COUNT_RESOLVED',
+      unreadCount: 1,
+      requestVersion: 0,
+      knownItemIdsAtStart: [first.id, second.id],
+    });
+
+    expect(state.items).toEqual([first, second]);
+    expect(state.unreadCount).toBeNull();
+    expect(state.version).toBe(0);
+    expect(state.overlays.readById.size).toBe(0);
+  });
+
   it('discards a stale count instead of double-applying realtime badge changes', () => {
     let state = createNotificationRealtimeState({ unreadCount: 2 });
     const requestVersion = captureNotificationRealtimeVersion(state);
@@ -249,6 +411,7 @@ describe('notificationRealtimeReducer', () => {
       type: 'UNREAD_COUNT_RESOLVED',
       unreadCount: 3,
       requestVersion,
+      knownItemIdsAtStart: [],
     });
 
     expect(state.unreadCount).toBe(3);
@@ -264,6 +427,7 @@ describe('notificationRealtimeReducer', () => {
       type: 'UNREAD_COUNT_RESOLVED',
       unreadCount: 1,
       requestVersion: staleRequestVersion,
+      knownItemIdsAtStart: [],
     });
 
     expect(state.unreadCount).toBe(2);
@@ -279,6 +443,7 @@ describe('notificationRealtimeReducer', () => {
       type: 'UNREAD_COUNT_RESOLVED',
       unreadCount: 7.9,
       requestVersion,
+      knownItemIdsAtStart: [],
     });
 
     expect(state.unreadCount).toBe(7);

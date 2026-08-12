@@ -445,6 +445,71 @@ describe('WebSocketManager', () => {
     expect(value.sockets.calls[1]?.protocols[1]).toBe('refresh-1');
   });
 
+  it('retries a throttled refreshed-ticket request through the refresh endpoint', async () => {
+    const value = harness();
+    value.tickets.refreshSteps.push(
+      () => Promise.reject(new TicketRequestError('throttled', 42_000)),
+      () => Promise.resolve('refreshed-after-throttle'),
+    );
+    const socket = await connectOpen(value);
+
+    socket.message(JSON.stringify({ type: 'auth_error', code: 'token_expired' }));
+    await flushPromises();
+
+    expect(value.tickets.issueCalls).toBe(1);
+    expect(value.tickets.refreshCalls).toBe(1);
+    await jest.advanceTimersByTimeAsync(41_999);
+    expect(value.tickets.refreshCalls).toBe(1);
+
+    await jest.advanceTimersByTimeAsync(1);
+    await flushPromises();
+
+    expect(value.tickets.issueCalls).toBe(1);
+    expect(value.tickets.refreshCalls).toBe(2);
+    expect(value.sockets.calls[1]?.protocols[1]).toBe('refreshed-after-throttle');
+  });
+
+  it('retries a transient refreshed-ticket failure through the refresh endpoint', async () => {
+    const value = harness();
+    value.tickets.refreshSteps.push(
+      () => Promise.reject(new TicketRequestError('transient')),
+      () => Promise.resolve('refreshed-after-backoff'),
+    );
+    const socket = await connectOpen(value);
+
+    socket.serverClose(4002);
+    await flushPromises();
+
+    expect(value.tickets.issueCalls).toBe(1);
+    expect(value.tickets.refreshCalls).toBe(1);
+    await jest.advanceTimersByTimeAsync(999);
+    expect(value.tickets.refreshCalls).toBe(1);
+
+    await jest.advanceTimersByTimeAsync(1);
+    await flushPromises();
+
+    expect(value.tickets.issueCalls).toBe(1);
+    expect(value.tickets.refreshCalls).toBe(2);
+    expect(value.sockets.calls[1]?.protocols[1]).toBe('refreshed-after-backoff');
+  });
+
+  it('hard-stops when refreshed-ticket recovery receives a hard auth failure', async () => {
+    const value = harness();
+    value.tickets.refreshSteps.push(
+      () => Promise.reject(new TicketRequestError('hardAuth')),
+    );
+    const socket = await connectOpen(value);
+
+    socket.serverClose(4002);
+    await flushPromises();
+    value.manager.connect(OWNER_A);
+
+    expect(value.tickets.issueCalls).toBe(1);
+    expect(value.tickets.refreshCalls).toBe(1);
+    expect(value.manager.getSnapshot().status).toBe('disconnected');
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
   it.each([
     ['envelope', (socket: { message(data: unknown): void }) => socket.message(JSON.stringify({ type: 'auth_error', code: 'auth_failed' }))],
     ['close code', (socket: { serverClose(code: number): void }) => socket.serverClose(4001)],
