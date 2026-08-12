@@ -1197,6 +1197,328 @@ class AIActionDraftPatchFieldValidationTests(APITestCase, AIActionDraftModelTest
             expires_at=timezone.now() + timedelta(hours=24),
         )
 
+    def _create_needs_info_activity_update_draft(
+        self,
+        *,
+        data,
+        missing_fields,
+    ):
+        section = self.trip.timeline_sections.order_by("section_date").first()
+        activity = section.activities.create(
+            trip=self.trip,
+            title="Museum Visit",
+            time_mode="TIME_RANGE",
+            position=0,
+        )
+        return AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response_message,
+            requested_by=self.user,
+            action_type="timeline.activity.update",
+            status=AIActionDraftStatus.NEEDS_INFO,
+            required_confirmation=AI_CONFIRMATION_CAPTAIN,
+            payload={"activity_id": str(activity.id), "data": data},
+            preview={"title": "Museum Visit"},
+            missing_fields=missing_fields,
+            preconditions={},
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_nested_patch_rejects_end_before_existing_start(
+        self,
+        push_chat_message,
+    ):
+        draft = self._create_needs_info_activity_update_draft(
+            data={"start_time": "10:00"},
+            missing_fields=[
+                {
+                    "name": "data",
+                    "label": "Activity details",
+                    "type": "json",
+                }
+            ],
+        )
+        self.client.force_authenticate(self.user)
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            res = self.client.patch(
+                f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                data={"payload": {"data": {"end_time": "08:00"}}},
+                format="json",
+            )
+
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data["error_code"], "FIELD_VALIDATION_FAILED")
+        self.assertEqual(set(res.data["field_errors"]), {"data"})
+        self.assertEqual(
+            set(res.data),
+            {"detail", "error_code", "field_errors", "draft"},
+        )
+        self.assertEqual(
+            res.data["draft"]["status"],
+            AIActionDraftStatus.NEEDS_INFO,
+        )
+        self.assertTrue(res.data["draft"]["can_edit"])
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(draft.payload["data"], {"start_time": "10:00"})
+        self.assertEqual(draft.result, {})
+        self.assertEqual(draft.error_code, "")
+        self.assertEqual(draft.error_detail, "")
+        self.trip.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 0)
+        self.assertEqual(self.response_message.change_sequence, 0)
+        self.assertEqual(callbacks, [])
+        push_chat_message.assert_not_called()
+
+    def test_direct_patch_rejects_start_after_existing_end(self):
+        draft = self._create_needs_info_activity_update_draft(
+            data={"end_time": "08:00"},
+            missing_fields=[{"name": "start_time", "label": "Start time"}],
+        )
+        self.client.force_authenticate(self.user)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {"start_time": "10:00"}},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data["error_code"], "FIELD_VALIDATION_FAILED")
+        self.assertIn("start_time", res.data["field_errors"])
+        self.assertEqual(
+            res.data["draft"]["status"],
+            AIActionDraftStatus.NEEDS_INFO,
+        )
+        self.assertTrue(res.data["draft"]["can_edit"])
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(draft.payload["data"], {"end_time": "08:00"})
+        self.assertEqual(draft.result, {})
+        self.assertEqual(draft.error_code, "")
+        self.assertEqual(draft.error_detail, "")
+
+    def test_valid_one_sided_patch_becomes_ready_with_merged_nested_data(self):
+        draft = self._create_needs_info_activity_update_draft(
+            data={"start_time": "08:00"},
+            missing_fields=[{"name": "end_time", "label": "End time"}],
+        )
+        self.client.force_authenticate(self.user)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {"end_time": "10:00"}},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(set(res.data), {"draft"})
+        self.assertEqual(res.data["draft"]["status"], AIActionDraftStatus.READY)
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertEqual(
+            draft.payload["data"],
+            {"start_time": "08:00", "end_time": "10:00"},
+        )
+        self.assertEqual(draft.missing_fields, [])
+        self.assertEqual(draft.error_code, "")
+        self.assertEqual(draft.error_detail, "")
+
+    def test_valid_nested_one_sided_patch_becomes_ready(self):
+        draft = self._create_needs_info_activity_update_draft(
+            data={"start_time": "08:00"},
+            missing_fields=[
+                {
+                    "name": "data",
+                    "label": "Activity details",
+                    "type": "json",
+                }
+            ],
+        )
+        self.client.force_authenticate(self.user)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {"data": {"end_time": "10:00"}}},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertEqual(
+            draft.payload["data"],
+            {"start_time": "08:00", "end_time": "10:00"},
+        )
+        self.assertEqual(draft.missing_fields, [])
+
+    @patch("ai.chat_changes.push_chat_message")
+    def test_explicit_non_dict_data_patch_is_rejected_without_mutation(
+        self,
+        push_chat_message,
+    ):
+        malformed_values = (
+            "not-an-object",
+            "",
+            "   ",
+            1,
+            True,
+            ["not", "an", "object"],
+            None,
+        )
+        self.client.force_authenticate(self.user)
+
+        for malformed_data in malformed_values:
+            with self.subTest(data=malformed_data):
+                draft = self._create_needs_info_activity_update_draft(
+                    data={"start_time": "08:00"},
+                    missing_fields=[
+                        {
+                            "name": "data",
+                            "label": "Activity details",
+                            "type": "json",
+                        }
+                    ],
+                )
+                original_payload = draft.payload
+                original_updated_at = draft.updated_at
+                with self.captureOnCommitCallbacks(execute=False) as callbacks:
+                    res = self.client.patch(
+                        f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+                        data={"payload": {"data": malformed_data}},
+                        format="json",
+                    )
+
+                self.assertEqual(res.status_code, 400)
+                self.assertEqual(
+                    res.data["error_code"],
+                    "FIELD_VALIDATION_FAILED",
+                )
+                self.assertEqual(set(res.data["field_errors"]), {"data"})
+                draft.refresh_from_db()
+                self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+                self.assertEqual(draft.payload, original_payload)
+                self.assertEqual(draft.updated_at, original_updated_at)
+                self.assertEqual(callbacks, [])
+
+        self.trip.refresh_from_db()
+        self.response_message.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 0)
+        self.assertEqual(self.response_message.change_sequence, 0)
+        push_chat_message.assert_not_called()
+
+    def test_empty_data_object_is_a_true_noop(self):
+        draft = self._create_needs_info_activity_update_draft(
+            data={"start_time": "08:00"},
+            missing_fields=[
+                {
+                    "name": "data",
+                    "label": "Activity details",
+                    "type": "json",
+                }
+            ],
+        )
+        original_updated_at = draft.updated_at
+        self.client.force_authenticate(self.user)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {"data": {}}},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(draft.payload["data"], {"start_time": "08:00"})
+        self.assertEqual(draft.updated_at, original_updated_at)
+
+    def test_direct_leaf_patch_recovers_legacy_non_dict_data(self):
+        draft = self._create_needs_info_activity_update_draft(
+            data="legacy-invalid-data",
+            missing_fields=[{"name": "title", "label": "Title"}],
+        )
+        self.client.force_authenticate(self.user)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {"title": "Recovered activity"}},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertEqual(
+            draft.payload["data"],
+            {"title": "Recovered activity"},
+        )
+
+    def test_nested_patch_recovers_legacy_non_dict_data(self):
+        draft = self._create_needs_info_activity_update_draft(
+            data=["legacy-invalid-data"],
+            missing_fields=[
+                {
+                    "name": "data",
+                    "label": "Activity details",
+                    "type": "json",
+                }
+            ],
+        )
+        self.client.force_authenticate(self.user)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {"data": {"title": "Recovered activity"}}},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertEqual(
+            draft.payload["data"],
+            {"title": "Recovered activity"},
+        )
+
+    def test_empty_nested_object_recovers_legacy_non_dict_data(self):
+        draft = self._create_needs_info_activity_update_draft(
+            data="legacy-invalid-data",
+            missing_fields=[
+                {
+                    "name": "data",
+                    "label": "Activity details",
+                    "type": "json",
+                }
+            ],
+        )
+        self.client.force_authenticate(self.user)
+
+        res = self.client.patch(
+            f"/api/trips/{self.trip.id}/ai/action-drafts/{draft.id}",
+            data={"payload": {"data": {}}},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
+        self.assertEqual(draft.payload["data"], {})
+        self.assertEqual(
+            draft.missing_fields,
+            [
+                {
+                    "name": "data",
+                    "label": "Activity details",
+                    "type": "json",
+                }
+            ],
+        )
+
     def test_patch_returns_field_errors_when_end_before_start(self):
         draft = self._create_needs_info_activity_draft()
         self.client.force_authenticate(self.user)

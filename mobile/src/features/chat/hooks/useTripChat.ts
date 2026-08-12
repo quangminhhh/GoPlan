@@ -368,6 +368,7 @@ export function useTripChat({ tripId: rawTripId }: UseTripChatOptions): UseTripC
     tripId &&
     sessionStatus === 'signedIn' &&
       user &&
+      tripDetail.error === null &&
       tripDetail.status === 'ready' &&
       tripDetail.detail?.my_membership.status === 'ACTIVE',
   );
