@@ -5,6 +5,10 @@ from datetime import timedelta
 from django.db import transaction
 from django.utils import timezone
 
+from ai.chat_changes import (
+    lock_trip_for_ai_chat_change,
+    schedule_chat_message_push,
+)
 from ai.models import AIActionDraft, AIInteraction, AIInteractionStatus
 from ai.services import (
     AI_LOCK_TTL,
@@ -12,7 +16,7 @@ from ai.services import (
     message_for_error_code,
 )
 from chat.models import ChatMessage, ChatMessageAIStatus, ChatMessageSenderKind
-from chat.services import push_chat_message
+from chat.services import allocate_chat_change_sequence
 from trips.models import Trip
 
 
@@ -89,19 +93,25 @@ def finish_interaction_success(*, interaction, message_text: str) -> ChatMessage
     """Create the AI ChatMessage and attach drafts already persisted by tools."""
     now = timezone.now()
     with transaction.atomic():
-        interaction = AIInteraction.objects.select_for_update().get(pk=interaction.pk)
+        locked_trip = lock_trip_for_ai_chat_change(trip_id=interaction.trip_id)
+        interaction = AIInteraction.objects.select_for_update().get(
+            pk=interaction.pk,
+            trip=locked_trip,
+        )
         if interaction.response_message_id is not None:
             return interaction.response_message
 
         content = (message_text or "").strip() or "GoPlanAI"
+        change_sequence = allocate_chat_change_sequence(locked_trip=locked_trip)
         message = ChatMessage.objects.create(
-            trip=interaction.trip,
+            trip=locked_trip,
             sender=None,
             sender_kind=ChatMessageSenderKind.AI,
             sender_display_name_snapshot="GoPlanAI",
             sender_identify_tag_snapshot=None,
             content=content,
             ai_status=ChatMessageAIStatus.SUCCESS,
+            change_sequence=change_sequence,
         )
         AIActionDraft.objects.filter(
             interaction=interaction, response_message__isnull=True
@@ -121,7 +131,7 @@ def finish_interaction_success(*, interaction, message_text: str) -> ChatMessage
                 "lock_expires_at",
             ]
         )
-        transaction.on_commit(lambda: push_chat_message(message))
+        schedule_chat_message_push(message)
     return message
 
 
@@ -157,17 +167,23 @@ def release_interaction_for_retry(
 def finish_interaction_failure(*, interaction, error_code: str) -> ChatMessage:
     now = timezone.now()
     with transaction.atomic():
-        interaction = AIInteraction.objects.select_for_update().get(pk=interaction.pk)
+        locked_trip = lock_trip_for_ai_chat_change(trip_id=interaction.trip_id)
+        interaction = AIInteraction.objects.select_for_update().get(
+            pk=interaction.pk,
+            trip=locked_trip,
+        )
         if interaction.response_message_id is not None:
             return interaction.response_message
+        change_sequence = allocate_chat_change_sequence(locked_trip=locked_trip)
         message = ChatMessage.objects.create(
-            trip=interaction.trip,
+            trip=locked_trip,
             sender=None,
             sender_kind=ChatMessageSenderKind.AI,
             sender_display_name_snapshot="GoPlanAI",
             sender_identify_tag_snapshot=None,
             content=message_for_error_code(error_code),
             ai_status=ChatMessageAIStatus.ERROR,
+            change_sequence=change_sequence,
         )
         interaction.response_message = message
         interaction.status = AIInteractionStatus.FAILED
@@ -175,5 +191,5 @@ def finish_interaction_failure(*, interaction, error_code: str) -> ChatMessage:
         interaction.completed_at = now
         interaction.lock_expires_at = now
         interaction.save()
-        transaction.on_commit(lambda: push_chat_message(message))
+        schedule_chat_message_push(message)
     return message

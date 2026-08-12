@@ -22,6 +22,10 @@ type WebSocketManagerInternals = {
 };
 
 describe("WebSocketManager", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("upgrades non-local ws URLs on secure pages", () => {
     expect(resolveWebSocketBaseUrl("ws://api.example.com", "https:")).toBe(
       "wss://api.example.com",
@@ -53,6 +57,48 @@ describe("WebSocketManager", () => {
 
     expect(listener).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["null", "42", '"primitive"', "[]"])(
+    "ignores parsed JSON without a string message type: %s",
+    async (payload) => {
+      class FakeWebSocket {
+        static readonly CONNECTING = 0;
+        static readonly OPEN = 1;
+        static readonly CLOSING = 2;
+        static readonly CLOSED = 3;
+        static instances: FakeWebSocket[] = [];
+
+        readyState = FakeWebSocket.CONNECTING;
+        onopen: ((event: Event) => void) | null = null;
+        onmessage: ((event: MessageEvent) => void) | null = null;
+        onclose: ((event: CloseEvent) => void) | null = null;
+        onerror: ((event: Event) => void) | null = null;
+        send = vi.fn();
+        close = vi.fn();
+
+        constructor() {
+          FakeWebSocket.instances.push(this);
+        }
+      }
+      vi.stubGlobal("WebSocket", FakeWebSocket);
+      vi.mocked(bffWsTicket).mockResolvedValueOnce({ ticket: "ticket" });
+      const manager = new WebSocketManager();
+      const listener = vi.fn();
+      manager.on("chat.message", listener);
+
+      manager.connect();
+      await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      const socket = FakeWebSocket.instances[0];
+
+      expect(() => {
+        socket.onmessage?.({ data: payload } as MessageEvent);
+      }).not.toThrow();
+      expect(listener).not.toHaveBeenCalled();
+
+      manager.disconnect();
+      vi.unstubAllGlobals();
+    },
+  );
 
   describe("throttled ticket fetch", () => {
     beforeEach(() => {

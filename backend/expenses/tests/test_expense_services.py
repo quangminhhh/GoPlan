@@ -14,6 +14,7 @@ from expenses.models import (
     ExpenseParticipant,
 )
 from expenses.services import (
+    _get_member_trip,
     CollectorNotParticipantError,
     ContributionUserNotParticipantError,
     ExpenseLockedError,
@@ -72,6 +73,17 @@ class ExpenseCreationServiceTests(TestCase):
             role=TripRole.MEMBER,
             status=MemberStatus.ACTIVE,
         )
+
+    def test_non_locking_member_trip_lookup_remains_a_single_query(self):
+        with self.assertNumQueries(1):
+            trip, membership = _get_member_trip(
+                self.trip.id,
+                self.captain,
+                for_update=False,
+            )
+
+        self.assertEqual(trip.id, self.trip.id)
+        self.assertEqual(membership.user_id, self.captain.id)
 
     def test_create_expense_snapshots_active_members_and_even_shares(self):
         expense = create_expense(

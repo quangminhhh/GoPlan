@@ -210,7 +210,12 @@ class RealtimeConsumer(BaseConsumer):
         if not isinstance(trip_id, str) or not trip_id:
             return
 
-        group_name = self._chat_group_name(trip_id)
+        try:
+            canonical_trip_id = str(UUID(trip_id))
+        except (TypeError, ValueError):
+            return
+
+        group_name = self._chat_group_name(canonical_trip_id)
         if group_name in self._chat_groups:
             try:
                 await self.channel_layer.group_discard(group_name, self.channel_name)
@@ -218,7 +223,9 @@ class RealtimeConsumer(BaseConsumer):
                 logger.exception("Failed to leave chat group %s", group_name)
             self._chat_groups.discard(group_name)
 
-        await self.send_json({"type": "chat.unsubscribed", "trip_id": trip_id})
+        await self.send_json(
+            {"type": "chat.unsubscribed", "trip_id": canonical_trip_id}
+        )
 
     async def chat_message_push(self, event):
         if not await self._ensure_current_session():

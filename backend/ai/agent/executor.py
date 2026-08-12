@@ -27,6 +27,11 @@ from ai.agent.payload_validation import (
     missing_payload_field_names,
 )
 from ai.agent.preconditions import expected_precondition_target
+from ai.chat_changes import (
+    lock_active_trip_member_for_ai_action,
+    lock_trip_for_ai_chat_change,
+    mark_ai_response_message_changed,
+)
 from ai.models import AIActionDraft, AIActionDraftStatus
 from expenses.models import Expense
 from expenses.services import (
@@ -40,7 +45,6 @@ from expenses.services import (
     update_expense,
 )
 from trips.models import (
-    MemberStatus,
     TimelineActivity,
     TimelineSection,
     Trip,
@@ -148,29 +152,6 @@ def _check_preconditions(draft: AIActionDraft) -> None:
         return
 
     raise AIActionDraftStaleError("Draft target precondition is unsupported.")
-
-
-def _lock_precondition_trip_context(*, draft: AIActionDraft, actor) -> None:
-    expected_target = expected_precondition_target(
-        action_type=draft.action_type,
-        payload=draft.payload,
-    )
-    if expected_target is None:
-        return
-
-    try:
-        TripMember.objects.select_for_update().get(
-            trip_id=draft.trip_id,
-            user=actor,
-            status=MemberStatus.ACTIVE,
-        )
-    except TripMember.DoesNotExist as exc:
-        raise AIActionDraftForbiddenError("You cannot confirm this draft.") from exc
-
-    try:
-        Trip.objects.select_for_update().get(pk=draft.trip_id)
-    except Trip.DoesNotExist as exc:
-        raise AIActionDraftStaleError("Draft trip no longer exists.") from exc
 
 
 def _validate_action_payload_ready(draft: AIActionDraft) -> None:
@@ -609,6 +590,10 @@ def mark_action_draft_failed(
 ) -> AIActionDraft | None:
     with transaction.atomic():
         try:
+            locked_trip = lock_trip_for_ai_chat_change(trip_id=trip_id)
+        except Trip.DoesNotExist:
+            return None
+        try:
             draft = (
                 AIActionDraft.objects
                 .select_for_update(of=("self",))
@@ -631,20 +616,34 @@ def mark_action_draft_failed(
             ]
         )
         if draft.response_message_id is not None:
-            draft.response_message.updated_at = timezone.now()
-            draft.response_message.save(update_fields=["updated_at"])
+            mark_ai_response_message_changed(
+                message=draft.response_message,
+                locked_trip=locked_trip,
+            )
         return draft
 
 
 def confirm_action_draft(*, draft_id, trip_id, actor) -> AIActionDraft:
     expired = False
     with transaction.atomic():
+        try:
+            locked_trip = lock_trip_for_ai_chat_change(trip_id=trip_id)
+        except Trip.DoesNotExist as exc:
+            raise AIActionDraft.DoesNotExist from exc
+        try:
+            lock_active_trip_member_for_ai_action(
+                locked_trip=locked_trip,
+                actor=actor,
+            )
+        except TripMember.DoesNotExist as exc:
+            raise AIActionDraft.DoesNotExist from exc
         draft = (
             AIActionDraft.objects
             .select_for_update(of=("self",))
-            .select_related("response_message", "trip")
+            .select_related("response_message")
             .get(pk=draft_id, trip_id=trip_id)
         )
+        draft.trip = locked_trip
         if draft.status == AIActionDraftStatus.CONFIRMED:
             return draft
         if draft.status != AIActionDraftStatus.READY:
@@ -654,8 +653,10 @@ def confirm_action_draft(*, draft_id, trip_id, actor) -> AIActionDraft:
             draft.status = AIActionDraftStatus.EXPIRED
             draft.save(update_fields=["status", "updated_at"])
             if draft.response_message_id is not None:
-                draft.response_message.updated_at = timezone.now()
-                draft.response_message.save(update_fields=["updated_at"])
+                mark_ai_response_message_changed(
+                    message=draft.response_message,
+                    locked_trip=locked_trip,
+                )
         else:
             normalized_payload = _normalized_timeline_activity_payload(
                 action_type=draft.action_type,
@@ -668,7 +669,6 @@ def confirm_action_draft(*, draft_id, trip_id, actor) -> AIActionDraft:
             if not can_confirm_action_draft(draft, viewer=actor):
                 raise AIActionDraftForbiddenError("You cannot confirm this draft.")
 
-            _lock_precondition_trip_context(draft=draft, actor=actor)
             _check_preconditions(draft)
             result = _execute(draft, actor=actor)
             draft.status = AIActionDraftStatus.CONFIRMED
@@ -686,8 +686,10 @@ def confirm_action_draft(*, draft_id, trip_id, actor) -> AIActionDraft:
                 update_fields.append("payload")
             draft.save(update_fields=update_fields)
             if draft.response_message_id is not None:
-                draft.response_message.updated_at = timezone.now()
-                draft.response_message.save(update_fields=["updated_at"])
+                mark_ai_response_message_changed(
+                    message=draft.response_message,
+                    locked_trip=locked_trip,
+                )
     if expired:
         raise AIActionDraftExpiredError("Draft expired.")
     return draft

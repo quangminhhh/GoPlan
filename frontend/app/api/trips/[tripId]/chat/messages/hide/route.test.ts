@@ -67,4 +67,18 @@ describe("BFF /api/trips/[tripId]/chat/messages/hide", () => {
       }),
     );
   });
+
+  it("rejects malformed trip IDs without forwarding bulk hide", async () => {
+    const { POST } = await import(
+      "@/app/api/trips/[tripId]/chat/messages/hide/route"
+    );
+
+    const response = await POST(
+      buildPostRequest({ message_ids: ["msg-1"] }) as never,
+      { params: Promise.resolve({ tripId: "invalid" }) },
+    );
+
+    expect(response.status).toBe(400);
+    expect(protectedUpstreamMock.protectedUpstreamCall).not.toHaveBeenCalled();
+  });
 });

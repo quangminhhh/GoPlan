@@ -18,6 +18,7 @@ from chat.serializers import (
     SendChatMessageSerializer,
 )
 from chat.services import (
+    ChatChangeSequenceExhaustedError,
     ChatDeleteForbiddenError,
     ChatDeleteInvalidModeError,
     ChatDeleteWindowExpiredError,
@@ -64,6 +65,8 @@ def _map_service_error(exc: Exception) -> tuple[str, int] | None:
     if isinstance(exc, ChatDeleteForbiddenError):
         return exc.error_code, status.HTTP_403_FORBIDDEN
     if isinstance(exc, ChatDeleteWindowExpiredError):
+        return exc.error_code, status.HTTP_409_CONFLICT
+    if isinstance(exc, ChatChangeSequenceExhaustedError):
         return exc.error_code, status.HTTP_409_CONFLICT
     if isinstance(exc, ChatMessageDeletedError):
         return exc.error_code, status.HTTP_409_CONFLICT
@@ -125,6 +128,8 @@ class TripChatMessagesAPIView(ChatAPIView):
                 since=data.get("since"),
                 updated_since=data.get("updated_since"),
                 updated_since_id=data.get("updated_since_id"),
+                changed_since=data.get("changed_since"),
+                changed_since_id=data.get("changed_since_id"),
             )
         except Exception as exc:
             mapped = _map_service_error(exc)
@@ -275,7 +280,7 @@ class MessageReactionCreateAPIView(ChatAPIView):
             )
 
         try:
-            reactions = add_reaction(
+            payload = add_reaction(
                 user=request.user,
                 trip_id=trip_id,
                 message_id=message_id,
@@ -288,7 +293,7 @@ class MessageReactionCreateAPIView(ChatAPIView):
             error_code, status_code = mapped
             return _error_response(str(exc), error_code, status_code)
 
-        return Response({"reactions": reactions}, status=status.HTTP_201_CREATED)
+        return Response(payload, status=status.HTTP_201_CREATED)
 
 
 class MessageReactionDetailAPIView(ChatAPIView):
@@ -301,7 +306,7 @@ class MessageReactionDetailAPIView(ChatAPIView):
 
     def delete(self, request, trip_id, message_id, emoji):
         try:
-            reactions = remove_reaction(
+            payload = remove_reaction(
                 user=request.user,
                 trip_id=trip_id,
                 message_id=message_id,
@@ -314,4 +319,4 @@ class MessageReactionDetailAPIView(ChatAPIView):
             error_code, status_code = mapped
             return _error_response(str(exc), error_code, status_code)
 
-        return Response({"reactions": reactions}, status=status.HTTP_200_OK)
+        return Response(payload, status=status.HTTP_200_OK)

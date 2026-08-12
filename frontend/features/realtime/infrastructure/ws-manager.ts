@@ -235,12 +235,21 @@ export class WebSocketManager {
     ws.onmessage = (event: MessageEvent) => {
       if (!this.isActiveSocket(ws, requestId)) return;
 
-      let data: WsMessage;
+      let parsed: unknown;
       try {
-        data = JSON.parse(event.data as string) as WsMessage;
+        parsed = JSON.parse(event.data as string) as unknown;
       } catch {
         return;
       }
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        typeof (parsed as { type?: unknown }).type !== "string"
+      ) {
+        return;
+      }
+      const data = parsed as WsMessage;
 
       if (data.type === "auth_error") {
         socketAuthHandled = true;

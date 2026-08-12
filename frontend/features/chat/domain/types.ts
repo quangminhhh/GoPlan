@@ -13,7 +13,7 @@ export const ALLOWED_REACTION_EMOJIS = [
 export type AllowedEmoji = (typeof ALLOWED_REACTION_EMOJIS)[number];
 
 export type ReactionSummary = {
-  emoji: string;
+  emoji: AllowedEmoji;
   count: number;
   /** User IDs who reacted with this emoji — used to derive reacted_by_me client-side. */
   reacted_by_ids: string[];
@@ -36,6 +36,8 @@ export type ChatMessage = {
   client_message_id: string | null;
   created_at: string;
   updated_at: string;
+  /** Monotonic server-authored mutation order for this trip chat. */
+  change_sequence: number;
   is_deleted_for_everyone: boolean;
   deleted_for_everyone_at: string | null;
   deleted_for_everyone_by_id: string | null;
@@ -55,7 +57,7 @@ export type ChatGapFillResponse = {
   has_more: boolean;
 };
 
-export type ChatUpdateSyncResponse = {
+export type ChatChangeSyncResponse = {
   results: ChatMessage[];
   has_more: boolean;
 };
@@ -75,6 +77,22 @@ export type DeleteChatMessageMode = "for_me" | "for_everyone";
 
 export type HideChatMessagesResult = {
   hidden_message_ids: string[];
+};
+
+export type DeleteChatMessageResult =
+  | {
+      mode: "for_me";
+      hidden_message_ids: string[];
+    }
+  | {
+      mode: "for_everyone";
+      message: ChatMessage;
+    };
+
+export type ReactionMutationResult = {
+  reactions: ReactionSummary[];
+  change_sequence: number;
+  updated_at: string;
 };
 
 // -------- WebSocket payloads (browser wire format, dotted namespace) --------
@@ -134,6 +152,8 @@ export type WsChatReactionUpdate = {
   trip_id: string;
   message_id: string;
   reactions: ReactionSummary[];
+  change_sequence: number;
+  updated_at: string;
 };
 
 export type WsChatAITypingStarted = {

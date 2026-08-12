@@ -99,22 +99,34 @@ def _assert_trip_open_for_expenses(trip: Trip) -> None:
 
 
 def _get_member_trip(trip_id, actor, *, for_update: bool = False) -> tuple[Trip, TripMember]:
+    if for_update:
+        # Keep the global mutation lock order aligned with chat/AI and trip
+        # membership services: Trip -> TripMember -> domain rows.
+        try:
+            trip = Trip.objects.select_for_update().get(pk=trip_id)
+        except Trip.DoesNotExist:
+            raise TripNotFoundError("Trip not found.")
+        try:
+            membership = TripMember.objects.select_for_update().get(
+                trip=trip,
+                user=actor,
+                status=MemberStatus.ACTIVE,
+            )
+        except TripMember.DoesNotExist:
+            raise TripNotFoundError("Trip not found.")
+        return trip, membership
+
     membership_queryset = TripMember.objects.select_related("trip").filter(
         trip_id=trip_id,
         user=actor,
         status=MemberStatus.ACTIVE,
     )
-    if for_update:
-        membership_queryset = membership_queryset.select_for_update()
     try:
         membership = membership_queryset.get()
     except TripMember.DoesNotExist:
         raise TripNotFoundError("Trip not found.")
 
-    trip = membership.trip
-    if for_update:
-        trip = Trip.objects.select_for_update().get(pk=trip.pk)
-    return trip, membership
+    return membership.trip, membership
 
 
 def _get_trip(trip_id, *, for_update: bool = False) -> Trip:

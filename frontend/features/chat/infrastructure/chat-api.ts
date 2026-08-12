@@ -1,22 +1,33 @@
 import { bff } from "@/shared/http/bff-client";
+import {
+  ChatContractError,
+  parseChatChangeSyncResponse,
+  parseChatGapFillResponse,
+  parseChatHistoryResponse,
+  parseChatSendResponse,
+  parseDeleteChatMessageResult,
+  parseHideChatMessagesResult,
+  parseReactionMutationResult,
+} from "@/features/chat/domain/chat-contract";
 
 import type {
   ChatGapFillResponse,
   ChatHistoryResponse,
-  ChatMessage,
-  ChatUpdateSyncResponse,
+  ChatChangeSyncResponse,
+  DeleteChatMessageResult,
   DeleteChatMessageMode,
   HideChatMessagesResult,
-  ReactionSummary,
+  ReactionMutationResult,
   SendChatMessageInput,
   SendChatMessageResult,
 } from "@/features/chat/domain/types";
+import { requireCanonicalChatTripId } from "@/features/chat/domain/trip-id";
 
 const HISTORY_DEFAULT_LIMIT = 30;
 const GAP_FILL_DEFAULT_LIMIT = 100;
 
 function chatBasePath(tripId: string): string {
-  return `/api/trips/${encodeURIComponent(tripId)}/chat/messages`;
+  return `/api/trips/${encodeURIComponent(requireCanonicalChatTripId(tripId))}/chat/messages`;
 }
 
 function reactionBasePath(tripId: string, messageId: string): string {
@@ -32,12 +43,17 @@ export async function bffSendChatMessage(
   tripId: string,
   input: SendChatMessageInput,
 ): Promise<SendChatMessageResult> {
-  const res = await bff.post<{ message: ChatMessage }>(
-    chatBasePath(tripId),
+  const canonicalTripId = requireCanonicalChatTripId(tripId);
+  const res = await bff.post<unknown>(
+    chatBasePath(canonicalTripId),
     input,
   );
-  const status: 200 | 201 = res.status === 201 ? 201 : 200;
-  return { message: res.data.message, status };
+  if (res.status !== 200 && res.status !== 201) {
+    throw new ChatContractError();
+  }
+  const status = res.status;
+  const parsed = parseChatSendResponse(res.data, canonicalTripId);
+  return { message: parsed.message, status };
 }
 
 export type ListChatHistoryOptions = {
@@ -52,16 +68,19 @@ export type ListChatHistoryOptions = {
 export async function bffListChatHistory(
   tripId: string,
   options: ListChatHistoryOptions = {},
+  signal?: AbortSignal,
 ): Promise<ChatHistoryResponse> {
+  const canonicalTripId = requireCanonicalChatTripId(tripId);
   const params: Record<string, string | number> = {
     limit: options.limit ?? HISTORY_DEFAULT_LIMIT,
   };
   if (options.cursor) params.cursor = options.cursor;
 
-  const res = await bff.get<ChatHistoryResponse>(chatBasePath(tripId), {
+  const res = await bff.get<unknown>(chatBasePath(canonicalTripId), {
     params,
+    ...(signal ? { signal } : {}),
   });
-  return res.data;
+  return parseChatHistoryResponse(res.data, canonicalTripId);
 }
 
 export type GapFillChatOptions = {
@@ -77,85 +96,92 @@ export type GapFillChatOptions = {
 export async function bffGapFillChatMessages(
   tripId: string,
   options: GapFillChatOptions,
+  signal?: AbortSignal,
 ): Promise<ChatGapFillResponse> {
-  const res = await bff.get<ChatGapFillResponse>(chatBasePath(tripId), {
+  const canonicalTripId = requireCanonicalChatTripId(tripId);
+  const res = await bff.get<unknown>(chatBasePath(canonicalTripId), {
     params: {
       since: options.since,
       limit: options.limit ?? GAP_FILL_DEFAULT_LIMIT,
     },
+    ...(signal ? { signal } : {}),
   });
-  return res.data;
+  return parseChatGapFillResponse(res.data, canonicalTripId);
 }
 
-export type SyncUpdatedChatOptions = {
-  updated_since: string;
-  updated_since_id?: string;
+export type SyncChangedChatOptions = {
+  changed_since: number;
+  changed_since_id?: string;
   limit?: number;
 };
 
 /**
- * `GET .../messages?updated_since=&limit=` — ascending mutation catch-up page.
+ * `GET .../messages?changed_since=&limit=` — ascending mutation catch-up page.
  * This covers updates to already-known messages, such as reactions and delete
  * tombstones, which `since=<message_id>` cannot see.
  */
-export async function bffSyncUpdatedChatMessages(
+export async function bffSyncChangedChatMessages(
   tripId: string,
-  options: SyncUpdatedChatOptions,
-): Promise<ChatUpdateSyncResponse> {
+  options: SyncChangedChatOptions,
+  signal?: AbortSignal,
+): Promise<ChatChangeSyncResponse> {
+  const canonicalTripId = requireCanonicalChatTripId(tripId);
   const params: Record<string, string | number> = {
-    updated_since: options.updated_since,
+    changed_since: options.changed_since,
     limit: options.limit ?? GAP_FILL_DEFAULT_LIMIT,
   };
-  if (options.updated_since_id) params.updated_since_id = options.updated_since_id;
+  if (options.changed_since_id) params.changed_since_id = options.changed_since_id;
 
-  const res = await bff.get<ChatUpdateSyncResponse>(chatBasePath(tripId), {
+  const res = await bff.get<unknown>(chatBasePath(canonicalTripId), {
     params,
+    ...(signal ? { signal } : {}),
   });
-  return res.data;
+  return parseChatChangeSyncResponse(res.data, canonicalTripId);
 }
 
 export async function bffAddReaction(
   tripId: string,
   messageId: string,
   emoji: string,
-): Promise<ReactionSummary[]> {
-  const res = await bff.post<{ reactions: ReactionSummary[] }>(
+): Promise<ReactionMutationResult> {
+  const res = await bff.post<unknown>(
     reactionBasePath(tripId, messageId),
     { emoji },
   );
-  return res.data.reactions;
+  return parseReactionMutationResult(res.data);
 }
 
 export async function bffRemoveReaction(
   tripId: string,
   messageId: string,
   emoji: string,
-): Promise<ReactionSummary[]> {
-  const res = await bff.delete<{ reactions: ReactionSummary[] }>(
+): Promise<ReactionMutationResult> {
+  const res = await bff.delete<unknown>(
     `${reactionBasePath(tripId, messageId)}/${encodeURIComponent(emoji)}`,
   );
-  return res.data.reactions;
+  return parseReactionMutationResult(res.data);
 }
 
 export async function bffDeleteChatMessage(
   tripId: string,
   messageId: string,
   mode: DeleteChatMessageMode,
-): Promise<{ message: ChatMessage } | HideChatMessagesResult> {
-  const res = await bff.delete<{ message: ChatMessage } | HideChatMessagesResult>(
-    `${chatBasePath(tripId)}/${encodeURIComponent(messageId)}`,
+): Promise<DeleteChatMessageResult> {
+  const canonicalTripId = requireCanonicalChatTripId(tripId);
+  const res = await bff.delete<unknown>(
+    `${chatBasePath(canonicalTripId)}/${encodeURIComponent(messageId)}`,
     { data: { mode } },
   );
-  return res.data;
+  return parseDeleteChatMessageResult(res.data, canonicalTripId, mode);
 }
 
 export async function bffHideChatMessagesForMe(
   tripId: string,
   messageIds: string[],
 ): Promise<HideChatMessagesResult> {
-  const res = await bff.post<HideChatMessagesResult>(
+  const res = await bff.post<unknown>(
     `${chatBasePath(tripId)}/hide`,
     { message_ids: messageIds },
   );
-  return res.data;
+  return parseHideChatMessagesResult(res.data);
 }

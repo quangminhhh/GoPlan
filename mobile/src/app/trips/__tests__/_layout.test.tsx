@@ -83,6 +83,15 @@ describe('TripsLayout header actions', () => {
     expect(screen.getByLabelText('Close custom types')).toBeTruthy();
   });
 
+  it('registers Chat as a push route in the Trips stack', async () => {
+    await render(<TripsLayout />);
+
+    expect(mockRegisterScreen).toHaveBeenCalledWith(
+      '[tripId]/chat/index',
+      expect.objectContaining({ title: 'Chat' }),
+    );
+  });
+
   it('registers Expenses dashboard and detail as push routes and its form as a sheet', async () => {
     await render(<TripsLayout />);
 

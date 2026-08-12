@@ -4,6 +4,8 @@ import {
   type WsMessage,
 } from "@/features/realtime/domain/types";
 import { wsManager } from "@/features/realtime/infrastructure/ws-manager";
+import { canonicalizeChatTripId } from "@/features/chat/domain/trip-id";
+import { parseChatWsEvent } from "@/features/chat/infrastructure/chat-ws-parser";
 
 import type {
   WsChatAITypingStarted,
@@ -19,6 +21,8 @@ import type {
 
 type ChatRoomListeners = {
   onMessage?: (event: WsChatMessagePush) => void;
+  /** Fired synchronously after a subscribe command is accepted by the socket. */
+  onSubscribeAttempt?: () => void;
   onMessageDeleted?: (event: WsChatMessageDeleted) => void;
   onKicked?: (event: WsChatKicked) => void;
   onError?: (event: WsChatError) => void;
@@ -51,22 +55,34 @@ const rooms = new Map<string, RoomState>();
 let lifecycleInstalled = false;
 let lastStatus: WsConnectionStatus = "disconnected";
 
+function sendSubscribe(tripId: string, room: RoomState): boolean {
+  const sent = wsManager.send({
+    type: CHAT_WS_MESSAGE_TYPES.SUBSCRIBE,
+    trip_id: tripId,
+  });
+  if (sent) room.listeners.onSubscribeAttempt?.();
+  return sent;
+}
+
 function ensureLifecycle(): void {
   if (lifecycleInstalled) return;
   lifecycleInstalled = true;
 
   wsManager.on(CHAT_WS_MESSAGE_TYPES.MESSAGE, (data: WsMessage) => {
-    const event = data as unknown as WsChatMessagePush;
+    const event = parseChatWsEvent(CHAT_WS_MESSAGE_TYPES.MESSAGE, data);
+    if (event?.type !== CHAT_WS_MESSAGE_TYPES.MESSAGE) return;
     rooms.get(event.trip_id)?.listeners.onMessage?.(event);
   });
 
   wsManager.on(CHAT_WS_MESSAGE_TYPES.MESSAGE_DELETED, (data: WsMessage) => {
-    const event = data as unknown as WsChatMessageDeleted;
+    const event = parseChatWsEvent(CHAT_WS_MESSAGE_TYPES.MESSAGE_DELETED, data);
+    if (event?.type !== CHAT_WS_MESSAGE_TYPES.MESSAGE_DELETED) return;
     rooms.get(event.trip_id)?.listeners.onMessageDeleted?.(event);
   });
 
   wsManager.on(CHAT_WS_MESSAGE_TYPES.KICKED, (data: WsMessage) => {
-    const event = data as unknown as WsChatKicked;
+    const event = parseChatWsEvent(CHAT_WS_MESSAGE_TYPES.KICKED, data);
+    if (event?.type !== CHAT_WS_MESSAGE_TYPES.KICKED) return;
     const room = rooms.get(event.trip_id);
     if (!room) return;
     rooms.delete(event.trip_id);
@@ -74,32 +90,38 @@ function ensureLifecycle(): void {
   });
 
   wsManager.on(CHAT_WS_MESSAGE_TYPES.ERROR, (data: WsMessage) => {
-    const event = data as unknown as WsChatError;
+    const event = parseChatWsEvent(CHAT_WS_MESSAGE_TYPES.ERROR, data);
+    if (event?.type !== CHAT_WS_MESSAGE_TYPES.ERROR) return;
     rooms.get(event.trip_id)?.listeners.onError?.(event);
   });
 
   wsManager.on(CHAT_WS_MESSAGE_TYPES.SUBSCRIBED, (data: WsMessage) => {
-    const event = data as unknown as WsChatSubscribed;
+    const event = parseChatWsEvent(CHAT_WS_MESSAGE_TYPES.SUBSCRIBED, data);
+    if (event?.type !== CHAT_WS_MESSAGE_TYPES.SUBSCRIBED) return;
     rooms.get(event.trip_id)?.listeners.onSubscribed?.(event);
   });
 
   wsManager.on(CHAT_WS_MESSAGE_TYPES.UNSUBSCRIBED, (data: WsMessage) => {
-    const event = data as unknown as WsChatUnsubscribed;
+    const event = parseChatWsEvent(CHAT_WS_MESSAGE_TYPES.UNSUBSCRIBED, data);
+    if (event?.type !== CHAT_WS_MESSAGE_TYPES.UNSUBSCRIBED) return;
     rooms.get(event.trip_id)?.listeners.onUnsubscribed?.(event);
   });
 
   wsManager.on(CHAT_WS_MESSAGE_TYPES.REACTION_UPDATE, (data: WsMessage) => {
-    const event = data as unknown as WsChatReactionUpdate;
+    const event = parseChatWsEvent(CHAT_WS_MESSAGE_TYPES.REACTION_UPDATE, data);
+    if (event?.type !== CHAT_WS_MESSAGE_TYPES.REACTION_UPDATE) return;
     rooms.get(event.trip_id)?.listeners.onReactionUpdate?.(event);
   });
 
   wsManager.on(CHAT_WS_MESSAGE_TYPES.AI_TYPING_STARTED, (data: WsMessage) => {
-    const event = data as unknown as WsChatAITypingStarted;
+    const event = parseChatWsEvent(CHAT_WS_MESSAGE_TYPES.AI_TYPING_STARTED, data);
+    if (event?.type !== CHAT_WS_MESSAGE_TYPES.AI_TYPING_STARTED) return;
     rooms.get(event.trip_id)?.listeners.onAITypingStarted?.(event);
   });
 
   wsManager.on(CHAT_WS_MESSAGE_TYPES.AI_TYPING_STOPPED, (data: WsMessage) => {
-    const event = data as unknown as WsChatAITypingStopped;
+    const event = parseChatWsEvent(CHAT_WS_MESSAGE_TYPES.AI_TYPING_STOPPED, data);
+    if (event?.type !== CHAT_WS_MESSAGE_TYPES.AI_TYPING_STOPPED) return;
     rooms.get(event.trip_id)?.listeners.onAITypingStopped?.(event);
   });
 
@@ -107,10 +129,7 @@ function ensureLifecycle(): void {
     if (status === "connected" && lastStatus !== "connected") {
       // Resubscribe every active room on reconnect.
       for (const [tripId, room] of rooms) {
-        room.sentSubscribe = wsManager.send({
-          type: CHAT_WS_MESSAGE_TYPES.SUBSCRIBE,
-          trip_id: tripId,
-        });
+        room.sentSubscribe = sendSubscribe(tripId, room);
       }
     }
     if (status !== "connected") {
@@ -142,27 +161,24 @@ export function joinChatRoom(
   tripId: string,
   listeners: ChatRoomListeners,
 ): ChatRoomHandle {
+  const canonicalTripId = canonicalizeChatTripId(tripId);
+  if (canonicalTripId === null) {
+    return { leave: () => {} };
+  }
   ensureLifecycle();
-
-  const owner = Symbol(tripId);
-  const existing = rooms.get(tripId);
+  const owner = Symbol(canonicalTripId);
+  const existing = rooms.get(canonicalTripId);
   if (existing) {
     existing.listeners = listeners;
     existing.owner = owner;
     if (!existing.sentSubscribe && wsManager.getStatus() === "connected") {
-      existing.sentSubscribe = wsManager.send({
-        type: CHAT_WS_MESSAGE_TYPES.SUBSCRIBE,
-        trip_id: tripId,
-      });
+      existing.sentSubscribe = sendSubscribe(canonicalTripId, existing);
     }
   } else {
-    const sent =
-      wsManager.getStatus() === "connected" &&
-      wsManager.send({
-        type: CHAT_WS_MESSAGE_TYPES.SUBSCRIBE,
-        trip_id: tripId,
-      });
-    rooms.set(tripId, { listeners, owner, sentSubscribe: Boolean(sent) });
+    const room: RoomState = { listeners, owner, sentSubscribe: false };
+    rooms.set(canonicalTripId, room);
+    room.sentSubscribe =
+      wsManager.getStatus() === "connected" && sendSubscribe(canonicalTripId, room);
   }
 
   let left = false;
@@ -170,14 +186,14 @@ export function joinChatRoom(
     leave: () => {
       if (left) return;
       left = true;
-      const room = rooms.get(tripId);
+      const room = rooms.get(canonicalTripId);
       if (!room) return;
       if (room.owner !== owner) return;
-      rooms.delete(tripId);
+      rooms.delete(canonicalTripId);
       if (wsManager.getStatus() === "connected" && room.sentSubscribe) {
         wsManager.send({
           type: CHAT_WS_MESSAGE_TYPES.UNSUBSCRIBE,
-          trip_id: tripId,
+          trip_id: canonicalTripId,
         });
       }
     },

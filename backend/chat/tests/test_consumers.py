@@ -217,6 +217,28 @@ class ChatConsumerTests(TransactionTestCase):
         self.assertEqual(pushed["type"], "chat.message")
         self.assertEqual(pushed["message"]["id"], "canonical-message")
 
+        await communicator.send_json_to(
+            {"type": "chat.unsubscribe", "trip_id": uppercase_trip_id}
+        )
+        unsubscribed = await communicator.receive_json_from(timeout=1)
+        self.assertEqual(
+            unsubscribed,
+            {"type": "chat.unsubscribed", "trip_id": canonical_trip_id},
+        )
+
+        await channel_layer.group_send(
+            f"trip_chat_{canonical_trip_id}",
+            {
+                "type": "chat_message_push",
+                "data": {
+                    "type": "chat.message",
+                    "trip_id": canonical_trip_id,
+                    "message": {"id": "after-canonical-unsubscribe"},
+                },
+            },
+        )
+        self.assertTrue(await communicator.receive_nothing(timeout=0.2))
+
         await communicator.disconnect()
 
     @override_settings(WS_MAX_CHAT_SUBSCRIPTIONS_PER_CONNECTION=1)

@@ -10,13 +10,21 @@ from rest_framework.test import APITestCase
 
 from chat.models import ChatMessage
 from chat.services import (
+    ChatChangeSequenceExhaustedError,
     ChatInvalidContentError,
     add_reaction,
     list_chat_messages,
     send_chat_message,
 )
 from test_helpers import create_completed_user
-from trips.models import MemberStatus, Trip, TripMember, TripRole, TripStatus
+from trips.models import (
+    CHAT_CHANGE_SEQUENCE_MAX,
+    MemberStatus,
+    Trip,
+    TripMember,
+    TripRole,
+    TripStatus,
+)
 from trips.services import TripNotFoundError, TripTerminalError
 
 TEST_CHANNEL_LAYERS = {
@@ -91,6 +99,9 @@ class SendChatMessageServiceTests(APITestCase):
         self.assertEqual(message.client_message_id, client_message_id)
         self.assertEqual(message.sender_display_name_snapshot, self.member.display_name)
         self.assertEqual(message.sender_identify_tag_snapshot, self.member.identify_tag)
+        self.assertEqual(message.change_sequence, 1)
+        self.trip.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 1)
         self.assertEqual(ChatMessage.objects.count(), 1)
 
     def test_idempotent_retry_returns_existing_message(self):
@@ -113,7 +124,29 @@ class SendChatMessageServiceTests(APITestCase):
         self.assertFalse(second_created)
         self.assertEqual(first.id, second.id)
         self.assertEqual(second.content, "Hello once")
+        self.assertEqual(first.change_sequence, 1)
+        self.assertEqual(second.change_sequence, 1)
+        self.trip.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 1)
         self.assertEqual(ChatMessage.objects.count(), 1)
+
+    def test_each_new_message_allocates_next_trip_sequence(self):
+        first, _ = send_chat_message(
+            user=self.member,
+            trip_id=self.trip.id,
+            content="First sequence",
+            client_message_id=uuid4(),
+        )
+        second, _ = send_chat_message(
+            user=self.captain,
+            trip_id=self.trip.id,
+            content="Second sequence",
+            client_message_id=uuid4(),
+        )
+
+        self.assertEqual((first.change_sequence, second.change_sequence), (1, 2))
+        self.trip.refresh_from_db()
+        self.assertEqual(self.trip.chat_change_sequence, 2)
 
     def test_non_member_gets_trip_not_found(self):
         with self.assertRaises(TripNotFoundError):
@@ -168,6 +201,25 @@ class SendChatMessageServiceTests(APITestCase):
                 content="   ",
                 client_message_id=uuid4(),
             )
+
+    def test_sequence_exhaustion_rejects_create_without_partial_write(self):
+        self.trip.chat_change_sequence = CHAT_CHANGE_SEQUENCE_MAX
+        self.trip.save(update_fields=["chat_change_sequence"])
+
+        with self.assertRaises(ChatChangeSequenceExhaustedError):
+            send_chat_message(
+                user=self.member,
+                trip_id=self.trip.id,
+                content="Cannot allocate",
+                client_message_id=uuid4(),
+            )
+
+        self.trip.refresh_from_db()
+        self.assertEqual(
+            self.trip.chat_change_sequence,
+            CHAT_CHANGE_SEQUENCE_MAX,
+        )
+        self.assertFalse(ChatMessage.objects.exists())
 
 
 class ListChatMessagesServiceTests(APITestCase):
@@ -272,6 +324,101 @@ class ListChatMessagesServiceTests(APITestCase):
         self.assertTrue(first_page["has_more"])
         self.assertFalse(second_page["has_more"])
 
+    @patch("chat.services._push_reaction_update")
+    def test_changed_since_catches_equal_and_backward_updated_at(self, mock_push):
+        same_time = timezone.now()
+        with patch("chat.services.timezone.now", return_value=same_time):
+            first = add_reaction(
+                user=self.captain,
+                trip_id=self.trip.id,
+                message_id=self.messages[0].id,
+                emoji="👍",
+            )
+            second = add_reaction(
+                user=self.captain,
+                trip_id=self.trip.id,
+                message_id=self.messages[0].id,
+                emoji="😂",
+            )
+
+        equal_time_page = list_chat_messages(
+            user=self.member,
+            trip_id=self.trip.id,
+            changed_since=first["change_sequence"],
+            limit=10,
+        )
+        self.assertEqual(
+            [message["id"] for message in equal_time_page["results"]],
+            [str(self.messages[0].id)],
+        )
+        self.assertEqual(
+            equal_time_page["results"][0]["change_sequence"],
+            second["change_sequence"],
+        )
+
+        backward_time = same_time - timedelta(days=1)
+        with patch("chat.services.timezone.now", return_value=backward_time):
+            third = add_reaction(
+                user=self.captain,
+                trip_id=self.trip.id,
+                message_id=self.messages[0].id,
+                emoji="😮",
+            )
+
+        backward_time_page = list_chat_messages(
+            user=self.member,
+            trip_id=self.trip.id,
+            changed_since=second["change_sequence"],
+            limit=10,
+        )
+        self.assertEqual(
+            [message["id"] for message in backward_time_page["results"]],
+            [str(self.messages[0].id)],
+        )
+        self.assertEqual(
+            backward_time_page["results"][0]["change_sequence"],
+            third["change_sequence"],
+        )
+
+    def test_changed_since_id_paginates_duplicate_legacy_sequence_losslessly(self):
+        duplicate_sequence = 7
+        ordered_messages = sorted(self.messages[:2], key=lambda message: message.id)
+        ChatMessage.objects.filter(
+            pk__in=[message.pk for message in ordered_messages]
+        ).update(change_sequence=duplicate_sequence)
+        ChatMessage.objects.filter(pk=self.messages[2].pk).update(
+            change_sequence=duplicate_sequence + 1
+        )
+
+        first_page = list_chat_messages(
+            user=self.member,
+            trip_id=self.trip.id,
+            changed_since=duplicate_sequence - 1,
+            limit=1,
+        )
+        second_page = list_chat_messages(
+            user=self.member,
+            trip_id=self.trip.id,
+            changed_since=first_page["results"][-1]["change_sequence"],
+            changed_since_id=first_page["results"][-1]["id"],
+            limit=10,
+        )
+
+        returned_ids = [
+            first_page["results"][0]["id"],
+            *[message["id"] for message in second_page["results"]],
+        ]
+        self.assertEqual(
+            returned_ids,
+            [
+                str(ordered_messages[0].id),
+                str(ordered_messages[1].id),
+                str(self.messages[2].id),
+            ],
+        )
+        self.assertTrue(first_page["has_more"])
+        self.assertFalse(second_page["has_more"])
+
     def test_non_member_cannot_list(self):
         with self.assertRaises(TripNotFoundError):
             list_chat_messages(user=self.other, trip_id=self.trip.id)
@@ -328,6 +475,10 @@ class ChatMessagePushTests(TransactionTestCase):
         self.assertEqual(
             mock_send.call_args[0][1]["data"]["message"]["id"],
             str(message.id),
+        )
+        self.assertEqual(
+            mock_send.call_args[0][1]["data"]["message"]["change_sequence"],
+            message.change_sequence,
         )
 
     def test_idempotent_retry_does_not_push_again(self):

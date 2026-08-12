@@ -3,8 +3,11 @@ from __future__ import annotations
 import uuid
 
 from django.conf import settings
+from django.core.validators import MaxValueValidator
 from django.db import models
 from django.db.models import Q
+
+from trips.models import CHAT_CHANGE_SEQUENCE_MAX
 
 ALLOWED_REACTION_EMOJIS = ["❤️", "😂", "😮", "😢", "😡", "👍", "👎"]
 
@@ -57,6 +60,10 @@ class ChatMessage(models.Model):
     )
     content = models.TextField()
     client_message_id = models.UUIDField(null=True, blank=True)
+    change_sequence = models.PositiveBigIntegerField(
+        default=0,
+        validators=[MaxValueValidator(CHAT_CHANGE_SEQUENCE_MAX)],
+    )
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True, db_index=True)
     deleted_for_everyone_at = models.DateTimeField(null=True, blank=True)
@@ -79,12 +86,23 @@ class ChatMessage(models.Model):
                 fields=["trip", "updated_at", "id"],
                 name="chat_chatme_trip_id_d13dbb_idx",
             ),
+            models.Index(
+                fields=["trip", "change_sequence", "id"],
+                name="chat_msg_trip_change_seq_idx",
+            ),
         ]
         constraints = [
             models.UniqueConstraint(
                 fields=["trip", "sender", "client_message_id"],
                 condition=Q(client_message_id__isnull=False),
                 name="chat_unique_client_message",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(change_sequence__gte=0)
+                    & Q(change_sequence__lte=CHAT_CHANGE_SEQUENCE_MAX)
+                ),
+                name="chat_message_change_sequence_safe",
             ),
         ]
 

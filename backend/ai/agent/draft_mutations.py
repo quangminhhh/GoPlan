@@ -14,7 +14,12 @@ from ai.agent.draft_fields import (
     normalize_missing_field_names,
 )
 from ai.agent.drafts import (
+    can_cancel_action_draft,
     can_edit_action_draft,
+)
+from ai.agent.draft_validation import (
+    validate_action_draft_patch_payload,
+    validate_action_draft_patch_shape,
 )
 from ai.agent.executor import (
     AIActionDraftExpiredError,
@@ -29,7 +34,13 @@ from ai.agent.preconditions import (
     action_requires_stale_precondition,
     build_backend_preconditions,
 )
+from ai.chat_changes import (
+    lock_active_trip_member_for_ai_action,
+    lock_trip_for_ai_chat_change,
+    mark_ai_response_message_changed,
+)
 from ai.models import AIActionDraft, AIActionDraftStatus
+from trips.models import Trip, TripMember
 
 
 class AIActionDraftPatchFieldNotAllowedError(Exception):
@@ -67,7 +78,8 @@ def _apply_draft_patch_payload(draft: AIActionDraft, patch_payload: dict) -> dic
         AI_ACTION_TIMELINE_ACTIVITY_CREATE,
         AI_ACTION_TIMELINE_ACTIVITY_UPDATE,
     }:
-        data = dict(next_payload.get("data") or {})
+        existing_data = next_payload.get("data")
+        data = dict(existing_data) if isinstance(existing_data, dict) else {}
         data_overridden = False
         for key, value in patch_payload.items():
             if key == "data":
@@ -132,17 +144,36 @@ def _refresh_missing_fields(draft: AIActionDraft, payload: dict) -> list[dict]:
     )
 
 
-def _touch_response_message(draft: AIActionDraft) -> None:
+def _lock_trip_or_raise_draft_missing(*, trip_id) -> Trip:
+    try:
+        return lock_trip_for_ai_chat_change(trip_id=trip_id)
+    except Trip.DoesNotExist as exc:
+        raise AIActionDraft.DoesNotExist from exc
+
+
+def _lock_actor_or_raise_draft_missing(*, locked_trip: Trip, actor) -> None:
+    try:
+        lock_active_trip_member_for_ai_action(
+            locked_trip=locked_trip,
+            actor=actor,
+        )
+    except TripMember.DoesNotExist as exc:
+        raise AIActionDraft.DoesNotExist from exc
+
+
+def _touch_response_message(*, draft: AIActionDraft, locked_trip: Trip) -> None:
     if draft.response_message_id is None:
         return
-    draft.response_message.updated_at = timezone.now()
-    draft.response_message.save(update_fields=["updated_at"])
+    mark_ai_response_message_changed(
+        message=draft.response_message,
+        locked_trip=locked_trip,
+    )
 
 
-def _expire_draft(draft: AIActionDraft) -> None:
+def _expire_draft(*, draft: AIActionDraft, locked_trip: Trip) -> None:
     draft.status = AIActionDraftStatus.EXPIRED
     draft.save(update_fields=["status", "updated_at"])
-    _touch_response_message(draft)
+    _touch_response_message(draft=draft, locked_trip=locked_trip)
 
 
 def patch_action_draft(
@@ -154,17 +185,36 @@ def patch_action_draft(
 ) -> AIActionDraft:
     expired = False
     with transaction.atomic():
+        locked_trip = _lock_trip_or_raise_draft_missing(trip_id=trip_id)
+        _lock_actor_or_raise_draft_missing(
+            locked_trip=locked_trip,
+            actor=actor,
+        )
         draft = (
             AIActionDraft.objects.select_for_update(of=("self",))
-            .select_related("response_message", "trip")
+            .select_related("response_message")
             .get(pk=draft_id, trip_id=trip_id)
+        )
+        validate_action_draft_patch_shape(
+            draft=draft,
+            patch_payload=patch_payload,
+        )
+        next_payload = (
+            _apply_draft_patch_payload(draft, patch_payload)
+            if patch_payload
+            else draft.payload
+        )
+        validate_action_draft_patch_payload(
+            draft=draft,
+            patch_payload=patch_payload,
+            candidate_payload=next_payload,
         )
 
         if (
             draft.status in {AIActionDraftStatus.NEEDS_INFO, AIActionDraftStatus.READY}
             and draft.expires_at <= timezone.now()
         ):
-            _expire_draft(draft)
+            _expire_draft(draft=draft, locked_trip=locked_trip)
             expired = True
         elif draft.status != AIActionDraftStatus.NEEDS_INFO:
             raise AIActionDraftNotReadyError(
@@ -178,10 +228,12 @@ def patch_action_draft(
             if disallowed_fields:
                 raise AIActionDraftPatchFieldNotAllowedError(disallowed_fields)
 
-            next_payload = _apply_draft_patch_payload(
-                draft,
-                patch_payload,
-            )
+            if not patch_payload:
+                return draft
+
+            if next_payload == draft.payload:
+                return draft
+
             still_missing = _refresh_missing_fields(draft, next_payload)
             try:
                 next_preconditions = (
@@ -205,8 +257,8 @@ def patch_action_draft(
             )
             if not still_missing:
                 trip_context = {
-                    "timezone": draft.trip.timezone,
-                    "currency_code": draft.trip.currency_code,
+                    "timezone": locked_trip.timezone,
+                    "currency_code": locked_trip.currency_code,
                 }
                 draft.display = build_display(
                     action_type=draft.action_type,
@@ -228,7 +280,59 @@ def patch_action_draft(
                     "updated_at",
                 ]
             )
-            _touch_response_message(draft)
+            _touch_response_message(draft=draft, locked_trip=locked_trip)
+
+    if expired:
+        raise AIActionDraftExpiredError("Draft expired.")
+    return draft
+
+
+def cancel_action_draft(*, draft_id, trip_id, actor) -> AIActionDraft:
+    """Cancel a mutable draft and republish its response snapshot once."""
+    expired = False
+    with transaction.atomic():
+        locked_trip = _lock_trip_or_raise_draft_missing(trip_id=trip_id)
+        _lock_actor_or_raise_draft_missing(
+            locked_trip=locked_trip,
+            actor=actor,
+        )
+        draft = (
+            AIActionDraft.objects.select_for_update(of=("self",))
+            .select_related("response_message")
+            .get(pk=draft_id, trip_id=trip_id)
+        )
+
+        if (
+            draft.status in {
+                AIActionDraftStatus.NEEDS_INFO,
+                AIActionDraftStatus.READY,
+            }
+            and draft.expires_at <= timezone.now()
+        ):
+            _expire_draft(draft=draft, locked_trip=locked_trip)
+            expired = True
+        elif draft.status in {
+            AIActionDraftStatus.CONFIRMED,
+            AIActionDraftStatus.CANCELLED,
+            AIActionDraftStatus.EXPIRED,
+            AIActionDraftStatus.FAILED,
+        }:
+            return draft
+        elif not can_cancel_action_draft(draft, viewer=actor):
+            raise AIActionDraftForbiddenError("You cannot cancel this draft.")
+        else:
+            draft.status = AIActionDraftStatus.CANCELLED
+            draft.cancelled_by = actor
+            draft.cancelled_at = timezone.now()
+            draft.save(
+                update_fields=[
+                    "status",
+                    "cancelled_by",
+                    "cancelled_at",
+                    "updated_at",
+                ]
+            )
+            _touch_response_message(draft=draft, locked_trip=locked_trip)
 
     if expired:
         raise AIActionDraftExpiredError("Draft expired.")

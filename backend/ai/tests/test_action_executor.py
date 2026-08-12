@@ -5,6 +5,7 @@ from decimal import Decimal
 from unittest.mock import patch
 from uuid import uuid4
 
+from django.db import OperationalError
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APITestCase
@@ -721,6 +722,12 @@ class ActionExecutorTests(TestCase):
             content="@GoPlanAI add day three activity",
             client_message_id=uuid4(),
         )
+        ai_response = ChatMessage.objects.create(
+            trip=trip,
+            sender_kind=ChatMessageSenderKind.AI,
+            sender_display_name_snapshot="GoPlanAI",
+            content="I prepared a draft.",
+        )
         interaction = AIInteraction.objects.create(
             trip=trip,
             requested_by=self.captain,
@@ -732,7 +739,7 @@ class ActionExecutorTests(TestCase):
         draft = AIActionDraft.objects.create(
             trip=trip,
             interaction=interaction,
-            response_message=self.response,
+            response_message=ai_response,
             requested_by=self.captain,
             action_type="timeline.activity.create",
             status=AIActionDraftStatus.READY,
@@ -1035,7 +1042,60 @@ class ActionDraftConfirmAPITests(APITestCase):
     def _confirm_url(self, draft_id):
         return f"/api/trips/{self.trip.id}/ai/action-drafts/{draft_id}/confirm"
 
-    @patch("ai.views.push_chat_message")
+    @patch("ai.chat_changes.push_chat_message")
+    @patch(
+        "ai.views.confirm_action_draft",
+        side_effect=OperationalError("deadlock detected"),
+    )
+    def test_transient_database_error_does_not_persist_failed_draft(
+        self,
+        confirm_action_draft_mock,
+        push_chat_message,
+    ):
+        self.client.force_authenticate(self.captain)
+        draft = AIActionDraft.objects.create(
+            trip=self.trip,
+            interaction=self.interaction,
+            response_message=self.response,
+            requested_by=self.captain,
+            action_type="expense.create",
+            status=AIActionDraftStatus.READY,
+            required_confirmation=AI_CONFIRMATION_CAPTAIN,
+            payload={"title": "Dinner", "total_amount": "1200000"},
+            preview={"title": "Dinner"},
+            missing_fields=[],
+            preconditions={},
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+        draft_updated_at = draft.updated_at
+        message_updated_at = self.response.updated_at
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.post(self._confirm_url(draft.id))
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.data,
+            {
+                "detail": "Draft execution failed.",
+                "error_code": "AI_DRAFT_EXECUTION_FAILED",
+            },
+        )
+        confirm_action_draft_mock.assert_called_once()
+        draft.refresh_from_db()
+        self.trip.refresh_from_db()
+        self.response.refresh_from_db()
+        self.assertEqual(draft.status, AIActionDraftStatus.READY)
+        self.assertEqual(draft.error_code, "")
+        self.assertEqual(draft.error_detail, "")
+        self.assertEqual(draft.updated_at, draft_updated_at)
+        self.assertEqual(self.trip.chat_change_sequence, 0)
+        self.assertEqual(self.response.change_sequence, 0)
+        self.assertEqual(self.response.updated_at, message_updated_at)
+        self.assertEqual(callbacks, [])
+        push_chat_message.assert_not_called()
+
+    @patch("ai.chat_changes.push_chat_message")
     def test_confirm_timeline_activity_create_returns_confirmed_draft(
         self,
         push_chat_message,
@@ -1098,9 +1158,10 @@ class ActionDraftConfirmAPITests(APITestCase):
             ).exists()
         )
 
-        response = self.client.post(
-            f"/api/trips/{trip.id}/ai/action-drafts/{draft.id}/confirm"
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/trips/{trip.id}/ai/action-drafts/{draft.id}/confirm"
+            )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -1157,7 +1218,8 @@ class ActionDraftConfirmAPITests(APITestCase):
             expires_at=timezone.now() + timedelta(hours=24),
         )
 
-        response = self.client.post(self._confirm_url(draft.id))
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(self._confirm_url(draft.id))
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.data["draft"]["status"], AIActionDraftStatus.FAILED)
@@ -1167,7 +1229,7 @@ class ActionDraftConfirmAPITests(APITestCase):
         self.assertEqual(draft.error_code, "AI_DRAFT_STALE")
         self.assertIn("changed", draft.error_detail)
 
-    @patch("ai.views.push_chat_message")
+    @patch("ai.chat_changes.push_chat_message")
     def test_expired_confirm_response_includes_updated_draft(self, push_chat_message):
         self.client.force_authenticate(self.captain)
         draft = AIActionDraft.objects.create(
@@ -1185,7 +1247,8 @@ class ActionDraftConfirmAPITests(APITestCase):
             expires_at=timezone.now() - timedelta(seconds=1),
         )
 
-        response = self.client.post(self._confirm_url(draft.id))
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(self._confirm_url(draft.id))
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.data["error_code"], "AI_DRAFT_EXPIRED")

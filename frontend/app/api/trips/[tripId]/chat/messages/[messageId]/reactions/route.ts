@@ -4,16 +4,24 @@ import {
   buildProtectedResponse,
   protectedUpstreamCall,
 } from "@/app/api/_lib/protected-upstream";
+import { canonicalizeChatTripId } from "@/features/chat/domain/trip-id";
 
 type RouteContext = { params: Promise<{ tripId: string; messageId: string }> };
 
 export async function POST(request: NextRequest, context: RouteContext) {
   const { tripId, messageId } = await context.params;
+  const canonicalTripId = canonicalizeChatTripId(tripId);
+  if (canonicalTripId === null) {
+    return Response.json(
+      { detail: "Trip ID is invalid.", error_code: "INVALID_TRIP_ID" },
+      { status: 400 },
+    );
+  }
   const authorization = request.headers.get("Authorization");
   const body = await request.text();
 
   const result = await protectedUpstreamCall({
-    path: `/api/trips/${encodeURIComponent(tripId)}/chat/messages/${encodeURIComponent(messageId)}/reactions`,
+    path: `/api/trips/${encodeURIComponent(canonicalTripId)}/chat/messages/${encodeURIComponent(messageId)}/reactions`,
     method: "POST",
     body,
     authorization,

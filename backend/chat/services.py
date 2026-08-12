@@ -30,7 +30,13 @@ from chat.models import (
     ChatMessageSenderKind,
     MessageReaction,
 )
-from trips.models import MemberStatus, Trip, TripMember, TripStatus
+from trips.models import (
+    CHAT_CHANGE_SEQUENCE_MAX,
+    MemberStatus,
+    Trip,
+    TripMember,
+    TripStatus,
+)
 from trips.services import TripNotFoundError, TripTerminalError
 
 logger = logging.getLogger(__name__)
@@ -89,6 +95,10 @@ class ChatDeleteWindowExpiredError(ChatDeleteError):
 
 class ChatDeleteInvalidModeError(ChatDeleteError):
     error_code = "INVALID_DELETE_MODE"
+
+
+class ChatChangeSequenceExhaustedError(ChatServiceError):
+    error_code = "CHANGE_SEQUENCE_EXHAUSTED"
 
 
 def _chat_group_name(trip_id) -> str:
@@ -193,6 +203,25 @@ def ensure_user_can_access_trip_chat(user, trip_id) -> None:
     _get_active_chat_trip(trip_id, user)
 
 
+def allocate_chat_change_sequence(*, locked_trip: Trip) -> int:
+    """Allocate the next per-trip chat change sequence.
+
+    The caller must hold a ``select_for_update()`` lock on ``locked_trip`` and
+    run inside the same transaction as the ChatMessage creation or mutation.
+    This helper is intentionally reusable by the AI message lifecycle.
+    """
+    current_sequence = locked_trip.chat_change_sequence
+    if current_sequence < 0 or current_sequence >= CHAT_CHANGE_SEQUENCE_MAX:
+        raise ChatChangeSequenceExhaustedError(
+            "Chat change sequence is exhausted."
+        )
+
+    next_sequence = current_sequence + 1
+    locked_trip.chat_change_sequence = next_sequence
+    locked_trip.save(update_fields=["chat_change_sequence"])
+    return next_sequence
+
+
 def build_reactions_payload(message: ChatMessage) -> list[dict]:
     """Aggregate reactions for a message grouped by emoji.
 
@@ -274,6 +303,7 @@ def build_chat_message_payload(message: ChatMessage, *, viewer=None) -> dict:
         "client_message_id": (
             str(message.client_message_id) if message.client_message_id else None
         ),
+        "change_sequence": message.change_sequence,
         "created_at": message.created_at.isoformat(),
         "updated_at": message.updated_at.isoformat(),
         "is_deleted_for_everyone": is_deleted,
@@ -478,6 +508,7 @@ def send_chat_message(
 
         try:
             with transaction.atomic():
+                change_sequence = allocate_chat_change_sequence(locked_trip=trip)
                 message = ChatMessage.objects.create(
                     trip=trip,
                     sender=user,
@@ -485,6 +516,7 @@ def send_chat_message(
                     sender_identify_tag_snapshot=user.identify_tag,
                     content=display_content if has_ai_mention else normalized_content,
                     client_message_id=client_message_id,
+                    change_sequence=change_sequence,
                 )
 
                 if has_ai_mention:
@@ -619,6 +651,42 @@ def _updated_since_page(
     }
 
 
+def _changed_since_page(
+    trip: Trip,
+    *,
+    user,
+    changed_since: int,
+    changed_since_id=None,
+    limit: int,
+) -> dict:
+    queryset = (
+        ChatMessage.objects
+        .filter(trip=trip)
+        .exclude(hidden_for_users__user=user)
+    )
+    if changed_since_id is not None:
+        queryset = queryset.filter(
+            Q(change_sequence__gt=changed_since)
+            | Q(change_sequence=changed_since, id__gt=changed_since_id)
+        )
+    else:
+        queryset = queryset.filter(change_sequence__gt=changed_since)
+
+    rows = list(
+        queryset
+        .select_related("sender")
+        .prefetch_related("reactions", "ai_action_drafts")
+        .order_by("change_sequence", "id")[: limit + 1]
+    )
+    page = rows[:limit]
+    return {
+        "results": [
+            build_chat_message_payload(message, viewer=user) for message in page
+        ],
+        "has_more": len(rows) > limit,
+    }
+
+
 def list_chat_messages(
     *,
     user,
@@ -628,8 +696,19 @@ def list_chat_messages(
     since=None,
     updated_since=None,
     updated_since_id=None,
+    changed_since: int | None = None,
+    changed_since_id=None,
 ) -> dict:
     trip = _get_active_chat_trip(trip_id, user)
+    if changed_since is not None:
+        resolved_limit = min(limit or GAP_FILL_DEFAULT_LIMIT, GAP_FILL_MAX_LIMIT)
+        return _changed_since_page(
+            trip,
+            user=user,
+            changed_since=changed_since,
+            changed_since_id=changed_since_id,
+            limit=resolved_limit,
+        )
     if updated_since is not None:
         resolved_limit = min(limit or GAP_FILL_DEFAULT_LIMIT, GAP_FILL_MAX_LIMIT)
         return _updated_since_page(
@@ -727,16 +806,19 @@ def delete_message_for_everyone(*, user, trip_id, message_id) -> ChatMessage:
 
         MessageReaction.objects.filter(message=message).delete()
         deleted_at = timezone.now()
+        change_sequence = allocate_chat_change_sequence(locked_trip=trip)
         message.content = ""
         message.deleted_for_everyone_at = deleted_at
         message.deleted_for_everyone_by = user
         message.updated_at = deleted_at
+        message.change_sequence = change_sequence
         message.save(
             update_fields=[
                 "content",
                 "deleted_for_everyone_at",
                 "deleted_for_everyone_by",
                 "updated_at",
+                "change_sequence",
             ]
         )
         transaction.on_commit(lambda: _push_message_deleted(message))
@@ -745,7 +827,19 @@ def delete_message_for_everyone(*, user, trip_id, message_id) -> ChatMessage:
 
 # -------- Reactions --------
 
-def _push_reaction_update(*, message: ChatMessage, reactions: list[dict]) -> None:
+def _build_reaction_mutation_payload(
+    *,
+    message: ChatMessage,
+    reactions: list[dict],
+) -> dict:
+    return {
+        "reactions": reactions,
+        "change_sequence": message.change_sequence,
+        "updated_at": message.updated_at.isoformat(),
+    }
+
+
+def _push_reaction_update(*, message: ChatMessage, payload: dict) -> None:
     try:
         channel_layer = get_channel_layer()
         async_to_sync(channel_layer.group_send)(
@@ -756,7 +850,7 @@ def _push_reaction_update(*, message: ChatMessage, reactions: list[dict]) -> Non
                     "type": "chat.reaction_update",
                     "trip_id": str(message.trip_id),
                     "message_id": str(message.id),
-                    "reactions": reactions,
+                    **payload,
                 },
             },
         )
@@ -768,12 +862,16 @@ def _push_reaction_update(*, message: ChatMessage, reactions: list[dict]) -> Non
         )
 
 
-def _touch_message_updated_at(message: ChatMessage) -> None:
+def _mark_message_changed(*, message: ChatMessage, locked_trip: Trip) -> None:
     message.updated_at = timezone.now()
-    ChatMessage.objects.filter(pk=message.pk).update(updated_at=message.updated_at)
+    message.change_sequence = allocate_chat_change_sequence(locked_trip=locked_trip)
+    ChatMessage.objects.filter(pk=message.pk).update(
+        updated_at=message.updated_at,
+        change_sequence=message.change_sequence,
+    )
 
 
-def add_reaction(*, user, trip_id, message_id, emoji: str) -> list[dict]:
+def add_reaction(*, user, trip_id, message_id, emoji: str) -> dict:
     if emoji not in ALLOWED_REACTION_EMOJIS:
         raise ChatReactionInvalidEmojiError("Unsupported emoji.")
 
@@ -803,16 +901,20 @@ def add_reaction(*, user, trip_id, message_id, emoji: str) -> list[dict]:
         except IntegrityError:
             raise ChatReactionDuplicateError("You already reacted with this emoji.")
 
-        _touch_message_updated_at(message)
+        _mark_message_changed(message=message, locked_trip=trip)
         reactions = _fresh_reactions_payload(message.id)
+        payload = _build_reaction_mutation_payload(
+            message=message,
+            reactions=reactions,
+        )
         transaction.on_commit(
-            lambda: _push_reaction_update(message=message, reactions=reactions)
+            lambda: _push_reaction_update(message=message, payload=payload)
         )
 
-    return reactions
+    return payload
 
 
-def remove_reaction(*, user, trip_id, message_id, emoji: str) -> list[dict]:
+def remove_reaction(*, user, trip_id, message_id, emoji: str) -> dict:
     if emoji not in ALLOWED_REACTION_EMOJIS:
         raise ChatReactionInvalidEmojiError("Unsupported emoji.")
 
@@ -835,10 +937,14 @@ def remove_reaction(*, user, trip_id, message_id, emoji: str) -> list[dict]:
         if deleted_count == 0:
             raise ChatReactionNotFoundError("Reaction not found.")
 
-        _touch_message_updated_at(message)
+        _mark_message_changed(message=message, locked_trip=trip)
         reactions = _fresh_reactions_payload(message.id)
+        payload = _build_reaction_mutation_payload(
+            message=message,
+            reactions=reactions,
+        )
         transaction.on_commit(
-            lambda: _push_reaction_update(message=message, reactions=reactions)
+            lambda: _push_reaction_update(message=message, payload=payload)
         )
 
-    return reactions
+    return payload

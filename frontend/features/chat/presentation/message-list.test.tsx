@@ -22,6 +22,7 @@ function makeMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
     client_message_id: null,
     created_at: "2026-05-08T10:00:00Z",
     updated_at: "2026-05-08T10:00:00Z",
+    change_sequence: 1,
     is_deleted_for_everyone: false,
     deleted_for_everyone_at: null,
     deleted_for_everyone_by_id: null,

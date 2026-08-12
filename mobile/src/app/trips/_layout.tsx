@@ -79,6 +79,12 @@ export default function TripsLayout() {
         }}
       />
       <Stack.Screen
+        name="[tripId]/chat/index"
+        options={{
+          title: 'Chat',
+        }}
+      />
+      <Stack.Screen
         name="[tripId]/timeline/index"
         options={{
           title: 'Timeline',

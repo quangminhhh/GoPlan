@@ -47,7 +47,11 @@ describe("BFF /api/trips/[tripId]/chat/messages/[messageId]/reactions/[emoji]", 
     const { DELETE } = await import(
       "@/app/api/trips/[tripId]/chat/messages/[messageId]/reactions/[emoji]/route"
     );
-    const payload = { reactions: [] };
+    const payload = {
+      reactions: [],
+      change_sequence: 43,
+      updated_at: "2026-08-10T12:01:00Z",
+    };
     protectedUpstreamMock.protectedUpstreamCall.mockResolvedValue({
       ok: true,
       data: payload,
@@ -71,5 +75,22 @@ describe("BFF /api/trips/[tripId]/chat/messages/[messageId]/reactions/[emoji]", 
         authorization: "Bearer t",
       }),
     );
+  });
+
+  it("rejects malformed trip IDs without forwarding the reaction delete", async () => {
+    const { DELETE } = await import(
+      "@/app/api/trips/[tripId]/chat/messages/[messageId]/reactions/[emoji]/route"
+    );
+
+    const response = await DELETE(buildDeleteRequest() as never, {
+      params: Promise.resolve({
+        tripId: "invalid",
+        messageId: MESSAGE_ID,
+        emoji: "👍",
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(protectedUpstreamMock.protectedUpstreamCall).not.toHaveBeenCalled();
   });
 });
