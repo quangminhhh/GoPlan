@@ -12,6 +12,11 @@ import {
   transcriptReducer,
   type TranscriptState,
 } from '../application/transcriptReducer';
+import { makeDraftFixture, makeRawDraftFixture } from '../ai/__fixtures__/drafts';
+import {
+  aiActionDraftSourceIdentity,
+  type AIActionDraft,
+} from '../ai/drafts';
 import type {
   ChatApiFailure,
   ChatMessage,
@@ -99,6 +104,33 @@ function initialWith(messages: readonly ChatMessage[]): TranscriptState {
   });
 }
 
+function aiDraft(
+  overrides: Readonly<Record<string, unknown>> = {},
+): AIActionDraft {
+  return makeDraftFixture(overrides);
+}
+
+function aiMessage(
+  drafts: readonly Readonly<Record<string, unknown>>[],
+  changeSequence = 10,
+  overrides: Partial<ChatMessage> = {},
+): ChatMessage {
+  return message('ai-message', {
+    sender: {
+      id: null,
+      display_name: 'GoPlanAI',
+      identify_tag: null,
+      avatar_url: null,
+    },
+    sender_kind: 'AI',
+    ai_status: 'SUCCESS',
+    content: 'AI response',
+    change_sequence: changeSequence,
+    action_drafts: drafts,
+    ...overrides,
+  });
+}
+
 describe('transcriptReducer', () => {
   it('creates isolated immutable collections and resource-scopes every action', () => {
     const first = createTranscriptState(RESOURCE_KEY);
@@ -108,12 +140,16 @@ describe('transcriptReducer', () => {
       resourceKey: RESOURCE_KEY,
       version: 0,
       roomStatus: 'idle',
+      isLoadingInitial: false,
       terminalLocked: false,
     });
     expect(first.confirmed).not.toBe(second.confirmed);
     expect(first.pending).not.toBe(second.pending);
     expect(first.hidden).not.toBe(second.hidden);
     expect(first.reactionLiveVersions).not.toBe(second.reactionLiveVersions);
+    expect(first.deferredAuthoritativePatches).not.toBe(
+      second.deferredAuthoritativePatches,
+    );
 
     const ignored = transcriptReducer(first, {
       type: 'UPSERT',
@@ -121,6 +157,250 @@ describe('transcriptReducer', () => {
       messages: [message('server-1')],
     });
     expect(ignored).toBe(first);
+  });
+
+  it('projects a guarded AI draft snapshot without changing the authoritative row or opaque siblings', () => {
+    const source = aiDraft({ future_source_value: { nested: true } });
+    const sibling = makeRawDraftFixture({
+      id: '33333333-3333-4333-8333-333333333333',
+      action_type: 'future.action',
+      future_sibling_value: ['keep', 7],
+    });
+    const malformed = { id: source.id, future_malformed_value: true };
+    const initialized = initialWith([
+      aiMessage([source, sibling, malformed]),
+    ]);
+    const projected = aiDraft({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+      future_projection_value: { preserved: true },
+    });
+    const after = transcriptReducer(initialized, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: projected,
+    });
+
+    expect(after.confirmed.get('ai-message')?.change_sequence).toBe(10);
+    expect(after.confirmed.get('ai-message')?.action_drafts[0]).toBe(source);
+    const effective = selectMessageById(after, 'ai-message');
+    expect(effective?.action_drafts[0]).toBe(projected);
+    expect(effective?.action_drafts[1]).toBe(sibling);
+    expect(effective?.action_drafts[2]).toBe(malformed);
+
+    const wrongResource = transcriptReducer(after, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: 'trip-2:member-1',
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(projected),
+      draft: source,
+    });
+    const staleSource = transcriptReducer(after, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: source,
+    });
+    expect(wrongResource).toBe(after);
+    expect(staleSource).toBe(after);
+  });
+
+  it('supports chained local AI draft projections and retains them across partial reaction pushes', () => {
+    const source = aiDraft();
+    const second = aiDraft({
+      summary: 'Edited once',
+      updated_at: '2026-08-09T10:01:00.000Z',
+    });
+    const third = aiDraft({
+      summary: 'Edited twice',
+      updated_at: '2026-08-09T10:02:00.000Z',
+    });
+    let state = initialWith([aiMessage([source])]);
+    state = transcriptReducer(state, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: second,
+    });
+    state = transcriptReducer(state, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(second),
+      draft: third,
+    });
+    state = transcriptReducer(state, {
+      type: 'REACTION_PATCH',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      reactions: [reaction('👍', ['member-1'])],
+      changeSequence: 11,
+      updatedAt: '2026-08-09T10:03:00.000Z',
+    });
+
+    expect(selectMessageById(state, 'ai-message')?.action_drafts[0]).toBe(
+      third,
+    );
+    expect(state.confirmed.get('ai-message')).toMatchObject({
+      change_sequence: 11,
+      action_drafts: [source],
+    });
+    expect(
+      state.aiDraftOverlays
+        .get('ai-message')
+        ?.get(source.id)?.priorSourceIdentities,
+    ).toEqual(
+      new Set([
+        aiActionDraftSourceIdentity(source),
+        aiActionDraftSourceIdentity(second),
+      ]),
+    );
+  });
+
+  it('retains an AI projection for higher old-chain snapshots and clears it when the full row catches up', () => {
+    const source = aiDraft();
+    const second = aiDraft({
+      summary: 'Edited once',
+      updated_at: '2026-08-09T10:01:00.000Z',
+    });
+    const projected = aiDraft({
+      summary: 'Edited twice',
+      updated_at: '2026-08-09T10:02:00.000Z',
+    });
+    let state = initialWith([aiMessage([source])]);
+    state = transcriptReducer(state, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: second,
+    });
+    state = transcriptReducer(state, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(second),
+      draft: projected,
+    });
+    state = transcriptReducer(state, {
+      type: 'UPSERT',
+      resourceKey: RESOURCE_KEY,
+      messages: [aiMessage([second], 12)],
+    });
+
+    expect(selectMessageById(state, 'ai-message')?.action_drafts[0]).toBe(
+      projected,
+    );
+    expect(state.aiDraftOverlays.has('ai-message')).toBe(true);
+
+    state = transcriptReducer(state, {
+      type: 'UPSERT',
+      resourceKey: RESOURCE_KEY,
+      messages: [aiMessage([projected], 13)],
+    });
+    expect(state.aiDraftOverlays.has('ai-message')).toBe(false);
+    expect(selectMessageById(state, 'ai-message')?.action_drafts[0]).toBe(
+      projected,
+    );
+    expect(state.confirmed.get('ai-message')?.change_sequence).toBe(13);
+  });
+
+  it.each([
+    {
+      label: 'a concurrent valid draft',
+      incoming: aiMessage([
+        aiDraft({
+          summary: 'Concurrent server update',
+          updated_at: '2026-08-09T10:09:00.000Z',
+        }),
+      ], 11),
+    },
+    { label: 'a missing draft', incoming: aiMessage([], 11) },
+    {
+      label: 'a malformed draft',
+      incoming: aiMessage([
+        makeRawDraftFixture({ status: 'EXECUTED' }),
+      ], 11),
+    },
+    {
+      label: 'a tombstone',
+      incoming: aiMessage([aiDraft()], 11, {
+        is_deleted_for_everyone: true,
+      }),
+    },
+  ])('lets $label clear a stale local AI projection', ({ incoming }) => {
+    const source = aiDraft();
+    const projected = aiDraft({
+      status: 'CONFIRMED',
+      can_confirm: false,
+      updated_at: '2026-08-09T10:01:00.000Z',
+    });
+    let state = initialWith([aiMessage([source])]);
+    state = transcriptReducer(state, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: projected,
+    });
+    state = transcriptReducer(state, {
+      type: 'UPSERT',
+      resourceKey: RESOURCE_KEY,
+      messages: [incoming],
+    });
+
+    expect(state.aiDraftOverlays.has('ai-message')).toBe(false);
+    expect(selectMessageById(state, 'ai-message')?.action_drafts).toEqual(
+      incoming.action_drafts,
+    );
+  });
+
+  it('clears AI projections on hide, kick, and reset', () => {
+    const source = aiDraft();
+    const projected = aiDraft({
+      updated_at: '2026-08-09T10:01:00.000Z',
+    });
+    const initialized = initialWith([aiMessage([source])]);
+    const withProjection = transcriptReducer(initialized, {
+      type: 'AI_DRAFT_LOCAL_SNAPSHOT',
+      resourceKey: RESOURCE_KEY,
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: projected,
+    });
+
+    const hidden = transcriptReducer(withProjection, {
+      type: 'HIDE_MESSAGES',
+      resourceKey: RESOURCE_KEY,
+      messageIds: ['ai-message'],
+      requestVersion: withProjection.version,
+    });
+    const kicked = transcriptReducer(withProjection, {
+      type: 'KICKED',
+      resourceKey: RESOURCE_KEY,
+    });
+    const reset = transcriptReducer(withProjection, {
+      type: 'RESET',
+      resourceKey: 'trip-2:member-1',
+    });
+
+    expect(hidden.aiDraftOverlays.size).toBe(0);
+    expect(kicked.aiDraftOverlays.size).toBe(0);
+    expect(reset.aiDraftOverlays.size).toBe(0);
   });
 
   it('merges an initial page with one shared mutation version without mutating the prior maps', () => {
@@ -259,6 +539,115 @@ describe('transcriptReducer', () => {
       expect(after.confirmed.has('unknown')).toBe(false);
     },
   );
+
+  it('materializes a deferred full patch over a stale older page', () => {
+    const stale = message('not-loaded', { content: 'Stale older snapshot' });
+    const tombstone = message('not-loaded', {
+      content: '',
+      updated_at: '2026-08-09T10:10:00.000Z',
+      change_sequence: 10,
+      is_deleted_for_everyone: true,
+      deleted_for_everyone_at: '2026-08-09T10:10:00.000Z',
+      deleted_for_everyone_by_id: 'member-1',
+      delete_for_everyone_until: null,
+      can_delete_for_everyone: false,
+      reactions: [],
+    });
+    const initial = createTranscriptState(RESOURCE_KEY);
+    const deferred = transcriptReducer(initial, {
+      type: 'PATCH_KNOWN',
+      resourceKey: RESOURCE_KEY,
+      messages: [tombstone],
+      requestVersion: initial.version,
+    });
+
+    expect(deferred.confirmed.has(stale.id)).toBe(false);
+    expect(deferred.deferredAuthoritativePatches.has(stale.id)).toBe(true);
+
+    const materialized = transcriptReducer(deferred, {
+      type: 'OLDER_RESOLVED',
+      resourceKey: RESOURCE_KEY,
+      messages: [stale],
+      nextCursor: null,
+      requestVersion: initial.version,
+    });
+
+    expect(materialized.confirmed.get(stale.id)).toEqual(tombstone);
+    expect(materialized.deferredAuthoritativePatches.has(stale.id)).toBe(false);
+  });
+
+  it('composes deferred full and reaction authority before an older row appears', () => {
+    const stale = message('not-loaded', { content: 'Stale older snapshot' });
+    const updated = message('not-loaded', {
+      content: 'Changed while not loaded',
+      updated_at: '2026-08-09T10:10:00.000Z',
+      change_sequence: 10,
+    });
+    const latestReactions = [reaction('😂', ['member-2'])];
+    const initial = createTranscriptState(RESOURCE_KEY);
+    const withFullPatch = transcriptReducer(initial, {
+      type: 'PATCH_KNOWN',
+      resourceKey: RESOURCE_KEY,
+      messages: [updated],
+      requestVersion: initial.version,
+    });
+    const withReactionPatch = transcriptReducer(withFullPatch, {
+      type: 'REACTION_PATCH',
+      resourceKey: RESOURCE_KEY,
+      messageId: stale.id,
+      reactions: latestReactions,
+      changeSequence: 11,
+      updatedAt: '2026-08-09T10:11:00.000Z',
+    });
+
+    const materialized = transcriptReducer(withReactionPatch, {
+      type: 'UPSERT',
+      resourceKey: RESOURCE_KEY,
+      messages: [stale],
+      requestVersion: initial.version,
+    });
+
+    expect(materialized.confirmed.get(stale.id)).toMatchObject({
+      content: updated.content,
+      reactions: latestReactions,
+      change_sequence: 11,
+      updated_at: '2026-08-09T10:11:00.000Z',
+    });
+    expect(materialized.deferredAuthoritativePatches.size).toBe(0);
+  });
+
+  it('keeps a deferred tombstone authoritative over a later reaction push', () => {
+    const stale = message('not-loaded');
+    const tombstone = message('not-loaded', {
+      content: '',
+      change_sequence: 10,
+      is_deleted_for_everyone: true,
+      deleted_for_everyone_at: '2026-08-09T10:10:00.000Z',
+      reactions: [],
+    });
+    const initial = createTranscriptState(RESOURCE_KEY);
+    const deferred = transcriptReducer(initial, {
+      type: 'PATCH_KNOWN',
+      resourceKey: RESOURCE_KEY,
+      messages: [tombstone],
+    });
+    const afterImpossibleReaction = transcriptReducer(deferred, {
+      type: 'REACTION_PATCH',
+      resourceKey: RESOURCE_KEY,
+      messageId: stale.id,
+      reactions: [reaction('👍', ['member-2'])],
+      changeSequence: 11,
+      updatedAt: '2026-08-09T10:11:00.000Z',
+    });
+    const materialized = transcriptReducer(afterImpossibleReaction, {
+      type: 'UPSERT',
+      resourceKey: RESOURCE_KEY,
+      messages: [stale],
+    });
+
+    expect(afterImpossibleReaction).toBe(deferred);
+    expect(materialized.confirmed.get(stale.id)).toEqual(tombstone);
+  });
 
   it('rejects a known REST patch that began before a local optimistic mutation', () => {
     const base = message('server-1', {
@@ -990,6 +1379,150 @@ describe('transcriptReducer', () => {
     });
     expect(afterLiveHistoryUpdate.confirmed.has('server-2')).toBe(true);
     expect(afterLiveHistoryUpdate.terminalLocked).toBe(true);
+
+    const afterTerminalHistoryLoad = transcriptReducer(locked, {
+      type: 'INIT_RESOLVED',
+      resourceKey: RESOURCE_KEY,
+      messages: [message('server-history')],
+      nextCursor: null,
+      requestVersion: locked.version,
+    });
+    expect(afterTerminalHistoryLoad.confirmed.has('server-history')).toBe(true);
+    expect(afterTerminalHistoryLoad.terminalLocked).toBe(true);
+  });
+
+  it('normalizes terminal state while preserving an active read-only page', () => {
+    let state = transcriptReducer(createTranscriptState(RESOURCE_KEY), {
+      type: 'INIT_START',
+      resourceKey: RESOURCE_KEY,
+    });
+    state = transcriptReducer(state, {
+      type: 'OLDER_START',
+      resourceKey: RESOURCE_KEY,
+    });
+    state = transcriptReducer(state, {
+      type: 'CATCHUP_PHASE',
+      resourceKey: RESOURCE_KEY,
+      phase: 'gap',
+    });
+
+    const locked = transcriptReducer(state, {
+      type: 'TERMINAL_LOCK',
+      resourceKey: RESOURCE_KEY,
+      error: terminalFailure,
+      requestVersion: state.version,
+    });
+
+    expect(locked).toMatchObject({
+      roomStatus: 'ready',
+      roomError: null,
+      terminalLocked: true,
+      isLoadingOlder: true,
+      olderLoadError: null,
+      isGapFilling: true,
+      isUpdating: false,
+    });
+    expect(
+      transcriptReducer(locked, {
+        type: 'INIT_START',
+        resourceKey: RESOURCE_KEY,
+      }),
+    ).toBe(locked);
+    expect(
+      transcriptReducer(locked, {
+        type: 'OLDER_START',
+        resourceKey: RESOURCE_KEY,
+      }),
+    ).toBe(locked);
+    const updating = transcriptReducer(locked, {
+      type: 'CATCHUP_PHASE',
+      resourceKey: RESOURCE_KEY,
+      phase: 'update',
+    });
+    expect(updating).toMatchObject({
+      terminalLocked: true,
+      isGapFilling: false,
+      isUpdating: true,
+    });
+  });
+
+  it('allows terminal history pagination to expose and settle its busy state', () => {
+    const initialized = transcriptReducer(createTranscriptState(RESOURCE_KEY), {
+      type: 'INIT_RESOLVED',
+      resourceKey: RESOURCE_KEY,
+      messages: [message('newest')],
+      nextCursor: 'older-page',
+      requestVersion: 0,
+    });
+    const locked = transcriptReducer(initialized, {
+      type: 'TERMINAL_LOCK',
+      resourceKey: RESOURCE_KEY,
+      error: terminalFailure,
+      requestVersion: initialized.version,
+    });
+    const loading = transcriptReducer(locked, {
+      type: 'OLDER_START',
+      resourceKey: RESOURCE_KEY,
+    });
+
+    expect(loading.isLoadingOlder).toBe(true);
+    expect(
+      transcriptReducer(loading, {
+        type: 'OLDER_START',
+        resourceKey: RESOURCE_KEY,
+      }),
+    ).toBe(loading);
+
+    const settled = transcriptReducer(loading, {
+      type: 'OLDER_RESOLVED',
+      resourceKey: RESOURCE_KEY,
+      messages: [message('older')],
+      nextCursor: null,
+      requestVersion: loading.version,
+    });
+    expect(settled.isLoadingOlder).toBe(false);
+    expect(settled.hasMoreOlder).toBe(false);
+    expect(settled.confirmed.has('older')).toBe(true);
+    expect(settled.terminalLocked).toBe(true);
+  });
+
+  it('exposes terminal initial-history retry without replacing the read-only room', () => {
+    const locked = transcriptReducer(createTranscriptState(RESOURCE_KEY), {
+      type: 'TERMINAL_LOCK',
+      resourceKey: RESOURCE_KEY,
+      error: terminalFailure,
+      requestVersion: 0,
+    });
+    const loading = transcriptReducer(locked, {
+      type: 'INIT_START',
+      resourceKey: RESOURCE_KEY,
+    });
+
+    expect(loading).toMatchObject({
+      roomStatus: 'ready',
+      terminalLocked: true,
+      isLoadingInitial: true,
+      roomError: null,
+    });
+    expect(
+      transcriptReducer(loading, {
+        type: 'INIT_START',
+        resourceKey: RESOURCE_KEY,
+      }),
+    ).toBe(loading);
+
+    const failed = transcriptReducer(loading, {
+      type: 'INIT_FAILED',
+      resourceKey: RESOURCE_KEY,
+      error: failure,
+      requestVersion: loading.version,
+    });
+    expect(failed).toMatchObject({
+      roomStatus: 'ready',
+      terminalLocked: true,
+      isLoadingInitial: false,
+      roomError: failure,
+    });
   });
 
   it('suspends only active work while preserving confirmed history and retryable sends', () => {

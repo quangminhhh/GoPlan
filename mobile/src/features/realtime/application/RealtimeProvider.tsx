@@ -82,6 +82,7 @@ export function RealtimeProvider({
   const transport = useMemo<RealtimeTransport>(
     () => ({
       send: (message) => manager.send(message),
+      retryConnection: () => manager.retryConnection(),
       subscribe: (type, listener) => manager.subscribe(type, listener),
       subscribeAll: (listener) => manager.subscribeAll(listener),
     }),

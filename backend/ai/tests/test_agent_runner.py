@@ -201,7 +201,10 @@ class RunnerTests(TestCase):
         self.assertIsNone(result.error_code)
         draft = AIActionDraft.objects.get(interaction=self.interaction)
         self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
-        self.assertEqual(draft.payload, {"title": "Lunch"})
+        self.assertEqual(
+            draft.payload,
+            {"title": "Lunch", "currency_code": "VND"},
+        )
         self.assertEqual(
             draft.missing_fields,
             [{"name": "total_amount", "label": "Amount", "type": "money"}],
@@ -227,7 +230,10 @@ class RunnerTests(TestCase):
         draft = AIActionDraft.objects.get(interaction=self.interaction)
         self.assertEqual(draft.action_type, "expense.create")
         self.assertEqual(draft.status, AIActionDraftStatus.NEEDS_INFO)
-        self.assertEqual(draft.payload, {"title": "Lunch QA"})
+        self.assertEqual(
+            draft.payload,
+            {"title": "Lunch QA", "currency_code": "VND"},
+        )
         self.assertEqual(
             draft.missing_fields,
             [{"name": "total_amount", "label": "Amount", "type": "money"}],

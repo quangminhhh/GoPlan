@@ -32,6 +32,7 @@ class AIActionDraftPatchPayloadValidationTests(SimpleTestCase):
             draft=draft,
             patch_payload=patch_payload,
             candidate_payload=candidate_payload,
+            currency_code="VND",
         )
         return candidate_payload
 
@@ -266,6 +267,7 @@ class AIActionDraftPatchPayloadValidationTests(SimpleTestCase):
                     "title": "Dinner",
                     "total_amount": "invalid",
                 },
+                currency_code="VND",
             )
 
         self.assertEqual(set(context.exception.field_errors), {"total_amount"})

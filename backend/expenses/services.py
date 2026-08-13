@@ -28,6 +28,12 @@ from trips.services import (
 
 
 ZERO_DECIMAL_CURRENCIES = {"VND", "JPY", "KRW"}
+EXPENSE_AMOUNT_MAX_DIGITS = 14
+EXPENSE_AMOUNT_DECIMAL_PLACES = 2
+EXPENSE_AMOUNT_MAX_WHOLE_DIGITS = (
+    EXPENSE_AMOUNT_MAX_DIGITS - EXPENSE_AMOUNT_DECIMAL_PLACES
+)
+EXPENSE_AMOUNT_MAX_VALUE = Decimal("999999999999.99")
 MAX_OPTIMAL_SETTLEMENT_PARTICIPANTS = 16
 
 
@@ -272,6 +278,12 @@ def normalize_currency_amount(amount: Decimal, currency_code: str) -> Decimal:
     if normalized_amount <= 0:
         raise ExpenseServiceError("Amount must be greater than zero.")
 
+    if normalized_amount > EXPENSE_AMOUNT_MAX_VALUE:
+        raise ExpenseServiceError(
+            "Amount must have no more than "
+            f"{EXPENSE_AMOUNT_MAX_WHOLE_DIGITS} digits before the decimal point."
+        )
+
     return normalized_amount
 
 
@@ -287,6 +299,12 @@ def normalize_non_negative_currency_amount(amount: Decimal, currency_code: str) 
 
     if normalized_amount < 0:
         raise ExpenseServiceError("Amount must be greater than or equal to zero.")
+
+    if normalized_amount > EXPENSE_AMOUNT_MAX_VALUE:
+        raise ExpenseServiceError(
+            "Amount must have no more than "
+            f"{EXPENSE_AMOUNT_MAX_WHOLE_DIGITS} digits before the decimal point."
+        )
 
     return normalized_amount
 

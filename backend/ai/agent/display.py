@@ -36,8 +36,29 @@ STATUS_LABELS = {
     "CANCELLED": "Cancelled",
 }
 
+TIMELINE_REVIEW_META_LABELS = {
+    "Assigned member",
+    "Booking reference",
+    "Contact name",
+    "Contact phone",
+    "Custom type",
+    "External link",
+    "Location note",
+    "Meeting point",
+    "Note",
+    "Reminders",
+}
+
 
 def _activity_payload(payload: dict) -> dict:
+    resolved_data = payload.get("resolved_data")
+    if isinstance(resolved_data, dict):
+        return resolved_data
+    data = payload.get("data")
+    return data if isinstance(data, dict) else payload
+
+
+def _activity_patch_payload(payload: dict) -> dict:
     data = payload.get("data")
     return data if isinstance(data, dict) else payload
 
@@ -106,10 +127,17 @@ def _has_positive_amount(value) -> bool:
 
 
 def _location_label(payload: dict) -> str | None:
+    place = payload.get("place")
+    if payload.get("location_mode") == "STRUCTURED":
+        if not isinstance(place, dict):
+            return None
+        return _non_empty_string(place, "title") or _non_empty_string(
+            place,
+            "address",
+        )
     label = _non_empty_string(payload, "location_label")
     if label:
         return label
-    place = payload.get("place")
     if not isinstance(place, dict):
         return None
     title = _non_empty_string(place, "title")
@@ -157,10 +185,99 @@ def _activity_meta(payload: dict) -> list[dict]:
     return meta
 
 
-def _build_timeline_activity(*, payload: dict, trip_context: dict, tone: str) -> dict:
+def _timeline_review_meta(
+    *,
+    payload: dict,
+    activity_payload: dict,
+    trip_context: dict,
+    tone: str,
+) -> list[dict]:
+    meta = []
+    target_title = _non_empty_string(payload, "target_title")
+    if tone == "update" and target_title:
+        meta.append({"label": "Target", "value": target_title})
+
+    section_label = _non_empty_string(payload, "section_label")
+    section_date = _non_empty_string(payload, "section_date")
+    if section_label and section_date:
+        meta.append({"label": "Date", "value": f"{section_label} · {section_date}"})
+    elif section_date or section_label:
+        meta.append({"label": "Date", "value": section_date or section_label})
+
+    time_label = _fmt_time_range(
+        activity_payload.get("start_time"),
+        activity_payload.get("end_time"),
+        trip_context.get("timezone", "UTC"),
+        activity_payload.get("time_mode"),
+    )
+    meta.append({"label": "Time", "value": time_label or "Not set"})
+
+    location_label = _location_label(activity_payload)
+    if location_label:
+        location_value = location_label
+    else:
+        patch_payload = _activity_patch_payload(payload)
+        location_changed = any(
+            field in patch_payload
+            for field in ("location_mode", "location_label", "place")
+        )
+        location_value = "Cleared" if tone == "update" and location_changed else "Not set"
+    meta.append({"label": "Location", "value": location_value})
+
+    custom_type_label = _non_empty_string(activity_payload, "custom_type_label")
+    system_type = _non_empty_string(activity_payload, "system_type")
+    if custom_type_label:
+        type_label = custom_type_label
+    elif system_type:
+        type_label = SYSTEM_TYPE_LABELS.get(system_type, system_type)
+    else:
+        type_label = "Not set"
+    meta.append({"label": "Type", "value": type_label})
+
+    assignee_label = _non_empty_string(activity_payload, "assignee_label")
+    assignee_scope = _non_empty_string(activity_payload, "assignee_scope")
+    meta.append(
+        {
+            "label": "Assignee",
+            "value": (
+                assignee_label
+                or ASSIGNEE_LABELS.get(assignee_scope or "NONE", "Unassigned")
+            ),
+        }
+    )
+
+    review_meta = payload.get("review_meta")
+    if isinstance(review_meta, list):
+        for row in review_meta:
+            if not isinstance(row, dict):
+                continue
+            label = row.get("label")
+            value = row.get("value")
+            if (
+                label in TIMELINE_REVIEW_META_LABELS
+                and isinstance(value, str)
+                and value.strip()
+            ):
+                meta.append({"label": label, "value": value})
+    else:
+        # Preserve the standalone display-builder contract. Authoritative
+        # presentation callers always supply review_meta, including an empty
+        # list, so only legacy/direct callers use this safe text allowlist.
+        meta.extend(_activity_meta(activity_payload))
+    return meta
+
+
+def _build_timeline_activity(
+    *,
+    payload: dict,
+    trip_context: dict,
+    tone: str,
+    include_review_context: bool = True,
+) -> dict:
     activity_payload = _activity_payload(payload)
     tz = trip_context.get("timezone", "UTC")
-    system_label = SYSTEM_TYPE_LABELS.get(
+    custom_type_label = _non_empty_string(activity_payload, "custom_type_label")
+    system_label = custom_type_label or SYSTEM_TYPE_LABELS.get(
         activity_payload.get("system_type", ""),
         "Activity",
     )
@@ -176,18 +293,32 @@ def _build_timeline_activity(*, payload: dict, trip_context: dict, tone: str) ->
     location_label = _location_label(activity_payload)
     if location_label:
         chips.append({"icon": "map-pin", "label": location_label})
-    assignee = ASSIGNEE_LABELS.get(
-        activity_payload.get("assignee_scope", "GROUP"),
-        "Whole group",
+    assignee = _non_empty_string(activity_payload, "assignee_label") or (
+        ASSIGNEE_LABELS.get(
+            activity_payload.get("assignee_scope", "GROUP"),
+            "Whole group",
+        )
     )
     chips.append({"icon": "users", "label": assignee})
+    meta = (
+        _timeline_review_meta(
+            payload=payload,
+            activity_payload=activity_payload,
+            trip_context=trip_context,
+            tone=tone,
+        )
+        if include_review_context
+        else []
+    )
+    if not include_review_context:
+        meta.extend(_activity_meta(activity_payload))
     return {
         "icon": "activity",
         "tone": tone,
         "kicker": f"Activity · {system_label}",
         "title": activity_payload.get("title", ""),
         "chips": chips,
-        "meta": _activity_meta(activity_payload),
+        "meta": meta,
     }
 
 
@@ -204,6 +335,15 @@ def _build_timeline_update(payload: dict, trip_context: dict) -> dict:
         payload=payload,
         trip_context=trip_context,
         tone="update",
+    )
+
+
+def _build_timeline_status(payload: dict, trip_context: dict) -> dict:
+    return _build_timeline_activity(
+        payload=payload,
+        trip_context=trip_context,
+        tone="update",
+        include_review_context=False,
     )
 
 
@@ -340,7 +480,7 @@ DISPLAY_BUILDERS: dict[str, Callable[[dict, dict], dict]] = {
     "timeline.activity.create": _build_timeline_create,
     "timeline.activity.update": _build_timeline_update,
     "timeline.activity.delete": _build_timeline_delete,
-    "timeline.activity.status.update": _build_timeline_update,
+    "timeline.activity.status.update": _build_timeline_status,
     "expense.create": _build_expense_create,
     "expense.update": _build_expense_update,
     "expense.delete": _build_expense_delete,

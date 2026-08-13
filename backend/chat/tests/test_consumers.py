@@ -81,6 +81,11 @@ def _add_member(trip, user):
 
 
 @database_sync_to_async
+def _set_trip_status(trip, status):
+    Trip.objects.filter(pk=trip.pk).update(status=status)
+
+
+@database_sync_to_async
 def _remove_member(trip, user):
     TripMember.objects.filter(
         trip=trip,
@@ -182,6 +187,37 @@ class ChatConsumerTests(TransactionTestCase):
         )
 
         await communicator.disconnect()
+
+    async def test_active_member_can_subscribe_to_terminal_trip(self):
+        captain = await _create_user(
+            "ws-terminal-cap@example.com",
+            "wstermcap",
+            "WTC001",
+        )
+        member = await _create_user(
+            "ws-terminal-member@example.com",
+            "wstermmem",
+            "WTM001",
+        )
+        trip = await _make_trip(captain)
+        await _add_member(trip, member)
+
+        for terminal_status in (TripStatus.COMPLETED, TripStatus.CANCELLED):
+            with self.subTest(trip_status=terminal_status):
+                await _set_trip_status(trip, terminal_status)
+                communicator, connected = await _connect(member)
+                self.assertTrue(connected)
+                try:
+                    await communicator.send_json_to(
+                        {"type": "chat.subscribe", "trip_id": str(trip.id)}
+                    )
+                    subscribed = await communicator.receive_json_from(timeout=1)
+                    self.assertEqual(
+                        subscribed,
+                        {"type": "chat.subscribed", "trip_id": str(trip.id)},
+                    )
+                finally:
+                    await communicator.disconnect()
 
     async def test_subscribe_uses_canonical_trip_id_for_group(self):
         captain = await _create_user("ws-canon-cap@example.com", "wscan", "WCN001")

@@ -116,6 +116,44 @@ class ExpenseCreationServiceTests(TestCase):
         self.assertEqual(Expense.objects.count(), 0)
         self.assertEqual(ExpenseParticipant.objects.count(), 0)
 
+    def test_accepts_max_decimalfield_amount_for_usd(self):
+        self.trip.currency_code = "USD"
+        self.trip.save(update_fields=["currency_code", "updated_at"])
+
+        expense = create_expense(
+            trip_id=self.trip.id,
+            actor=self.captain,
+            title="Maximum Dinner",
+            total_amount=Decimal("999999999999.99"),
+        )
+
+        self.assertEqual(expense.total_amount, Decimal("999999999999.99"))
+        self.assertEqual(
+            sum(
+                expense.participants.values_list("share_amount", flat=True),
+                Decimal("0"),
+            ),
+            expense.total_amount,
+        )
+
+    def test_rejects_decimalfield_overflow_without_creating_expense(self):
+        self.trip.currency_code = "USD"
+        self.trip.save(update_fields=["currency_code", "updated_at"])
+
+        with self.assertRaisesMessage(
+            ExpenseServiceError,
+            "Amount must have no more than 12 digits before the decimal point.",
+        ):
+            create_expense(
+                trip_id=self.trip.id,
+                actor=self.captain,
+                title="Overflow Dinner",
+                total_amount=Decimal("1000000000000.00"),
+            )
+
+        self.assertEqual(Expense.objects.count(), 0)
+        self.assertEqual(ExpenseParticipant.objects.count(), 0)
+
 
     def test_vnd_remainder_split_is_deterministic(self):
         third_member = create_completed_user(
@@ -412,6 +450,22 @@ class ExpenseContributionServiceTests(TestCase):
             )
 
         self.assertEqual(ExpenseContribution.objects.count(), 0)
+
+    def test_set_contribution_rejects_decimalfield_overflow(self):
+        with self.assertRaisesMessage(
+            ExpenseServiceError,
+            "Amount must have no more than 12 digits before the decimal point.",
+        ):
+            set_contribution(
+                trip_id=self.trip.id,
+                expense_id=self.expense.id,
+                target_user_id=self.member.id,
+                actor=self.captain,
+                amount=Decimal("1000000000000"),
+            )
+
+        self.assertEqual(ExpenseContribution.objects.count(), 0)
+        self.assertEqual(ExpenseLedgerEntry.objects.count(), 0)
 
     def test_set_contribution_rejects_negative_amount(self):
         with self.assertRaises(ExpenseServiceError):

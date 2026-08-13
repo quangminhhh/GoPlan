@@ -11,13 +11,21 @@ import {
 import {
   ActivityIndicator,
   FlatList,
+  Keyboard,
   type ListRenderItemInfo,
   Pressable,
   StyleSheet,
   Text,
   View,
+  type ViewProps,
 } from 'react-native';
 import { colors, spacing, typography } from '@/shared/theme/tokens';
+import { AITypingIndicator } from '../ai/components/AITypingIndicator';
+import {
+  focusAccessibilityNode,
+  type AccessibilityFocusTarget,
+} from '../ai/accessibilityFocus';
+import { useRoomAIActionDraftControllerSessionStore } from '../ai/reconciliationContext';
 import type {
   AllowedReactionEmoji,
   ChatApiFailure,
@@ -25,13 +33,23 @@ import type {
   DeleteChatMessageMode,
 } from '../types';
 import { ChatMessageActionsModal } from './ChatMessageActionsModal';
-import { ChatMessageBubble } from './ChatMessageBubble';
+import {
+  ChatMessageBubble,
+  type ChatMessageActionFocusResolver,
+  type ApplyMessageAIDraftSnapshot,
+} from './ChatMessageBubble';
 import { ChatSelectionToolbar } from './ChatSelectionToolbar';
 
 const MESSAGE_GROUP_WINDOW_MS = 5 * 60 * 1000;
 export const CHAT_HIDE_SELECTION_LIMIT = 100;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
-const MAINTAIN_VISIBLE_CONTENT_POSITION = { minIndexForVisible: 0 } as const;
+const MAINTAIN_VISIBLE_CONTENT_POSITION = {
+  minIndexForVisible: 0,
+  // An inverted list's native "top" is the visual newest edge. Keep readers
+  // anchored while they browse older messages, but reveal an incoming message
+  // when they are already within roughly one row of the live edge.
+  autoscrollToTopThreshold: 80,
+} as const;
 
 export interface ChatListMutationResult {
   applied: boolean;
@@ -66,6 +84,8 @@ interface ChatMessageListProps {
   isLoadingOlder: boolean;
   olderLoadError: string | null;
   actionsEnabled: boolean;
+  ambiguousAIDraftIds: ReadonlySet<string>;
+  aiTypingInteractionId: string | null;
   isHidingMessages: boolean;
   bottomAccessory: ReactNode;
   onLoadOlder: () => void;
@@ -73,6 +93,7 @@ interface ChatMessageListProps {
   onToggleReaction: (messageId: string, emoji: AllowedReactionEmoji) => void;
   onDeleteMessage: (messageId: string, mode: DeleteChatMessageMode) => void;
   onHideMessagesForMe: (messageIds: readonly string[]) => Promise<ChatListMutationResult>;
+  onApplyAIDraftSnapshot: ApplyMessageAIDraftSnapshot;
 }
 
 function chatMessageKey(message: ChatMessage): string {
@@ -168,9 +189,13 @@ function useDeleteDeadlineClock(messages: readonly ChatMessage[]): number {
   return nowMs;
 }
 
-function EmptyChatState() {
+function EmptyChatState({ onLayout, style }: Pick<ViewProps, 'onLayout' | 'style'>) {
   return (
-    <View style={styles.emptyState}>
+    <View
+      onLayout={onLayout}
+      style={[styles.emptyState, style]}
+      testID="chat-empty-state"
+    >
       <Ionicons name="chatbubbles-outline" size={44} color={colors.textMuted} />
       <Text accessibilityRole="header" style={styles.emptyTitle}>
         No messages yet
@@ -194,6 +219,8 @@ export function ChatMessageList({
   isLoadingOlder,
   olderLoadError,
   actionsEnabled,
+  ambiguousAIDraftIds,
+  aiTypingInteractionId,
   isHidingMessages,
   bottomAccessory,
   onLoadOlder,
@@ -201,17 +228,31 @@ export function ChatMessageList({
   onToggleReaction,
   onDeleteMessage,
   onHideMessagesForMe,
+  onApplyAIDraftSnapshot,
 }: ChatMessageListProps) {
+  const aiControllerSessionStore =
+    useRoomAIActionDraftControllerSessionStore();
   const nowMs = useDeleteDeadlineClock(messages);
   const userInteractedRef = useRef(false);
   const actionsEnabledRef = useRef(actionsEnabled);
   const messagesRef = useRef(messages);
+  const actionOriginFocusResolverRef =
+    useRef<ChatMessageActionFocusResolver | null>(null);
+  const actionFocusRestoreGenerationRef = useRef(0);
+  const actionFocusRestoreTimerRef =
+    useRef<ReturnType<typeof setTimeout> | null>(null);
   const [activeMessageId, setActiveMessageId] = useState<string | null>(null);
   const [selectedMessageIds, setSelectedMessageIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
   const [selectionFeedback, setSelectionFeedback] = useState<string | null>(null);
   const newestFirstMessages = useMemo(() => [...messages].reverse(), [messages]);
+  useLayoutEffect(() => {
+    if (aiControllerSessionStore === null) {
+      return;
+    }
+    aiControllerSessionStore.setAmbiguousDraftIds(ambiguousAIDraftIds);
+  }, [aiControllerSessionStore, ambiguousAIDraftIds]);
   const visibleMessageIds = useMemo(
     () => new Set(messages.map((message) => message.id)),
     [messages],
@@ -240,6 +281,15 @@ export function ChatMessageList({
     ? pendingReactionMessageIds.has(activeMessage.id) ||
       pendingDeleteMessageIds.has(activeMessage.id)
     : false;
+  const typingHeader = useMemo(
+    () =>
+      aiTypingInteractionId === null ? null : (
+        <View style={styles.typingHeader}>
+          <AITypingIndicator interactionId={aiTypingInteractionId} />
+        </View>
+      ),
+    [aiTypingInteractionId],
+  );
 
   useLayoutEffect(() => {
     actionsEnabledRef.current = actionsEnabled;
@@ -250,19 +300,77 @@ export function ChatMessageList({
     userInteractedRef.current = true;
   }, []);
 
+  const beginTranscriptDrag = useCallback(() => {
+    markUserInteraction();
+    Keyboard.dismiss();
+  }, [markUserInteraction]);
+
+  const clearActionFocusRestoreTimer = useCallback(() => {
+    const timer = actionFocusRestoreTimerRef.current;
+    actionFocusRestoreTimerRef.current = null;
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+  }, []);
+
+  useEffect(
+    () => () => {
+      actionFocusRestoreGenerationRef.current += 1;
+      actionOriginFocusResolverRef.current = null;
+      clearActionFocusRestoreTimer();
+    },
+    [clearActionFocusRestoreTimer],
+  );
+
   const loadOlderFromScroll = useCallback(() => {
     if (userInteractedRef.current && hasMoreOlder && !isLoadingOlder) {
       onLoadOlder();
     }
   }, [hasMoreOlder, isLoadingOlder, onLoadOlder]);
 
-  const openActions = useCallback((messageId: string) => {
-    setActiveMessageId(messageId);
-  }, []);
+  const openActions = useCallback(
+    (
+      messageId: string,
+      resolveFocusTarget: () => AccessibilityFocusTarget,
+    ) => {
+      actionFocusRestoreGenerationRef.current += 1;
+      clearActionFocusRestoreTimer();
+      actionOriginFocusResolverRef.current = resolveFocusTarget;
+      setActiveMessageId(messageId);
+    },
+    [clearActionFocusRestoreTimer],
+  );
 
   const closeActions = useCallback(() => {
     setActiveMessageId(null);
   }, []);
+
+  const closeActionsWithoutFocus = useCallback(() => {
+    actionFocusRestoreGenerationRef.current += 1;
+    clearActionFocusRestoreTimer();
+    actionOriginFocusResolverRef.current = null;
+    setActiveMessageId(null);
+  }, [clearActionFocusRestoreTimer]);
+
+  const restoreActionOriginFocus = useCallback(() => {
+    const resolveFocusTarget = actionOriginFocusResolverRef.current;
+    actionOriginFocusResolverRef.current = null;
+    clearActionFocusRestoreTimer();
+    if (resolveFocusTarget === null) return;
+
+    const generation = actionFocusRestoreGenerationRef.current;
+    // Fabric publishes Modal.onDismiss immediately before its own native focus
+    // restoration. Restore the originating control on the next task so the
+    // native completion cannot overwrite it.
+    actionFocusRestoreTimerRef.current = setTimeout(() => {
+      actionFocusRestoreTimerRef.current = null;
+      if (actionFocusRestoreGenerationRef.current !== generation) return;
+      const focusTarget = resolveFocusTarget();
+      if (focusTarget !== null) {
+        focusAccessibilityNode(focusTarget);
+      }
+    }, 0);
+  }, [clearActionFocusRestoreTimer]);
 
   const toggleSelection = useCallback(
     (messageId: string) => {
@@ -364,23 +472,34 @@ export function ChatMessageList({
           deleting={pendingDeleteMessageIds.has(item.id)}
           reactionBusy={pendingReactionMessageIds.has(item.id)}
           actionsEnabled={actionsEnabled}
+          showReactionAffordance={
+            actionsEnabled &&
+            !pending &&
+            !failed &&
+            !pendingDeleteMessageIds.has(item.id) &&
+            !item.is_deleted_for_everyone
+          }
+          ambiguousAIDraftIds={ambiguousAIDraftIds}
           selectionMode={selectionMode}
           selected={visibleSelectedIds.has(item.id)}
           onOpenActions={openActions}
           onToggleSelection={toggleSelection}
           onRetry={onRetry}
           onToggleReaction={onToggleReaction}
+          onApplyAIDraftSnapshot={onApplyAIDraftSnapshot}
         />
       );
     },
     [
       actionsEnabled,
+      ambiguousAIDraftIds,
       currentUserId,
       failedClientIds,
       failedByClientId,
       newestFirstMessages,
       onRetry,
       onToggleReaction,
+      onApplyAIDraftSnapshot,
       openActions,
       pendingClientIds,
       pendingDeleteMessageIds,
@@ -440,19 +559,20 @@ export function ChatMessageList({
         inverted
         initialNumToRender={20}
         keyExtractor={chatMessageKey}
-        keyboardDismissMode="interactive"
+        keyboardDismissMode="on-drag"
         keyboardShouldPersistTaps="handled"
         maintainVisibleContentPosition={MAINTAIN_VISIBLE_CONTENT_POSITION}
         onEndReached={loadOlderFromScroll}
         onEndReachedThreshold={0.25}
         onMomentumScrollBegin={markUserInteraction}
-        onScrollBeginDrag={markUserInteraction}
+        onScrollBeginDrag={beginTranscriptDrag}
         renderItem={renderMessage}
         contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={
           newestFirstMessages.length === 0 ? styles.emptyContent : styles.listContent
         }
         ListEmptyComponent={<EmptyChatState />}
+        ListHeaderComponent={typingHeader}
         ListFooterComponent={paginationFooter}
         testID="chat-message-list"
       />
@@ -486,6 +606,8 @@ export function ChatMessageList({
         canSelect={activeMessageCanMutate}
         busy={activeBusy}
         onClose={closeActions}
+        onCloseWithoutFocus={closeActionsWithoutFocus}
+        onDismiss={restoreActionOriginFocus}
         onReact={reactToActiveMessage}
         onHide={hideActiveMessage}
         onDeleteForEveryone={deleteActiveMessageForEveryone}
@@ -499,6 +621,10 @@ const styles = StyleSheet.create({
   shell: { flex: 1, backgroundColor: colors.surface },
   listContent: { paddingVertical: spacing.sm },
   emptyContent: { flexGrow: 1, justifyContent: 'center' },
+  typingHeader: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.xs,
+  },
   emptyState: {
     flex: 1,
     alignItems: 'center',

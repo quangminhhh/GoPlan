@@ -1,6 +1,19 @@
 import { act, fireEvent, render, screen } from '@testing-library/react-native';
+import {
+  Dimensions,
+  Keyboard,
+  StyleSheet,
+  type KeyboardEvent,
+} from 'react-native';
+import { makeDraftFixture } from '../ai/__fixtures__/drafts';
+import { aiActionDraftSourceIdentity } from '../ai/drafts';
+import { createAIReconciliationCoordinator } from '../ai/reconciliation';
 import type { ChatApiFailure, ChatMessage } from '../types';
-import { CHAT_KEYBOARD_BEHAVIOR, ChatScreen } from '../screens/ChatScreen';
+import {
+  chatKeyboardBottomInset,
+  ChatScreen,
+  stableChatKeyboardFrame,
+} from '../screens/ChatScreen';
 
 let mockParams: { tripId?: string | string[] } = { tripId: 'trip-1' };
 const mockUseTripChat = jest.fn();
@@ -11,8 +24,34 @@ jest.mock('expo-router', () => ({
 jest.mock('../hooks/useTripChat', () => ({
   useTripChat: (input: unknown) => mockUseTripChat(input),
 }), { virtual: true });
-jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }));
+jest.mock('@expo/vector-icons', () => ({
+  FontAwesome6: () => null,
+  Ionicons: () => null,
+}));
 jest.mock('@/features/auth/components/UserAvatar', () => ({ UserAvatar: () => null }));
+jest.mock('react-native-safe-area-context', () => {
+  const actual = jest.requireActual<
+    typeof import('react-native-safe-area-context')
+  >('react-native-safe-area-context');
+  return {
+    ...actual,
+    useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
+  };
+});
+jest.mock('../ai/api', () => {
+  const actual = jest.requireActual<typeof import('../ai/api')>('../ai/api');
+  return {
+    ...actual,
+    getAIActionDraft: jest.fn(),
+    cancelAIActionDraft: jest.fn(),
+  };
+});
+
+// eslint-disable-next-line import/first
+import { cancelAIActionDraft, getAIActionDraft } from '../ai/api';
+
+const mockGetAIActionDraft = jest.mocked(getAIActionDraft);
+const mockCancelAIActionDraft = jest.mocked(cancelAIActionDraft);
 
 const emptySet = new Set<string>();
 const emptyMap = new Map<string, ChatApiFailure>();
@@ -64,6 +103,9 @@ function chatResult(overrides: Record<string, unknown> = {}) {
     roomStatus: 'ready',
     subscriptionStatus: 'subscribed',
     roomError: null,
+    readSyncError: null,
+    initialLoadError: null,
+    isLoadingInitial: false,
     messages: [] as readonly ChatMessage[],
     pendingClientIds: emptySet,
     failedClientIds: emptySet,
@@ -74,17 +116,22 @@ function chatResult(overrides: Record<string, unknown> = {}) {
     isGapFilling: false,
     isUpdating: false,
     connectionStatus: 'connected',
+    connectionDiagnostics: null,
     connectionEpoch: 1,
     isReadOnly: false,
     pendingReactionMessageIds: emptySet,
     pendingDeleteMessageIds: emptySet,
     isHidingMessages: false,
     mutationError: null,
+    aiTypingState: { active: null },
     currentUserId: 'user-me',
     tripStatus: 'PLANNING',
     accessStatus: 'granted',
     loadOlder: jest.fn().mockResolvedValue(undefined),
+    retryCatchUp: jest.fn(),
+    retryConnection: jest.fn().mockReturnValue(false),
     retryInitialLoad: jest.fn().mockResolvedValue(undefined),
+    retrySubscription: jest.fn(),
     sendMessage: jest.fn().mockResolvedValue({
       kind: 'created',
       clientMessageId: 'client-1',
@@ -96,14 +143,21 @@ function chatResult(overrides: Record<string, unknown> = {}) {
     toggleReaction: jest.fn().mockResolvedValue({ kind: 'applied' }),
     deleteMessage: jest.fn().mockResolvedValue({ kind: 'applied' }),
     hideMessagesForMe: jest.fn().mockResolvedValue({ kind: 'applied' }),
+    applyAIDraftSnapshot: jest.fn(),
     ...overrides,
   };
 }
 
 describe('ChatScreen', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   beforeEach(() => {
     mockParams = { tripId: 'trip-1' };
     mockUseTripChat.mockReset();
+    mockGetAIActionDraft.mockReset();
+    mockCancelAIActionDraft.mockReset();
     mockUseTripChat.mockReturnValue(chatResult());
   });
 
@@ -164,6 +218,7 @@ describe('ChatScreen', () => {
   });
 
   it('keeps history but removes every composer mutation when subscription is rejected', async () => {
+    const retrySubscription = jest.fn();
     mockUseTripChat.mockReturnValue(
       chatResult({
         subscriptionStatus: 'rejected',
@@ -173,18 +228,69 @@ describe('ChatScreen', () => {
           detail: 'Too many chat rooms are subscribed.',
         },
         messages: [message('message-1')],
+        retrySubscription,
       }),
     );
     await render(<ChatScreen />);
 
     expect(screen.getByText('Content message-1')).toBeTruthy();
-    expect(screen.getByTestId('chat-subscription-rejected')).toHaveTextContent(
-      'Too many chat rooms are subscribed.',
-    );
+    expect(screen.getByText('Too many chat rooms are subscribed.')).toBeTruthy();
     expect(screen.getByTestId('chat-read-only-footer')).toBeTruthy();
     expect(screen.queryByLabelText('Message')).toBeNull();
     expect(screen.getByTestId('chat-message-message-1').props.accessibilityActions).toEqual([]);
+    await fireEvent.press(screen.getByLabelText('Retry live chat'));
+    expect(retrySubscription).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    ['COMPLETED', 'This completed trip’s chat is read-only.'],
+    ['CANCELLED', 'This cancelled trip’s chat is read-only.'],
+  ])(
+    'keeps terminal %s write-locked while exposing read-plane recovery',
+    async (tripStatus, terminalCopy) => {
+      const retrySubscription = jest.fn();
+      mockUseTripChat.mockReturnValue(
+        chatResult({
+          tripStatus,
+          isReadOnly: true,
+          subscriptionStatus: 'rejected',
+          connectionStatus: 'reconnecting',
+          roomError: {
+            errorCode: 'SUBSCRIPTION_LIMIT_REACHED',
+            detail: 'Too many chat rooms are subscribed.',
+          },
+          isGapFilling: true,
+          isUpdating: true,
+          retrySubscription,
+          mutationError: {
+            messageId: null,
+            error: failure('An unrelated mutation error.'),
+          },
+          messages: [message('message-1')],
+        }),
+      );
+      await render(<ChatScreen />);
+
+      expect(screen.getByTestId('chat-terminal-notice')).toHaveTextContent(
+        terminalCopy,
+      );
+      expect(screen.getByTestId('chat-read-only-footer')).toHaveTextContent(
+        terminalCopy,
+      );
+      expect(
+        screen.getByText(
+          'Live updates could not confirm this room. Retry to receive late messages.',
+        ),
+      ).toBeTruthy();
+      await fireEvent.press(screen.getByLabelText('Retry live updates'));
+      expect(retrySubscription).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId('chat-catch-up-status')).toHaveTextContent(
+        'Updating read-only chat history…',
+      );
+      expect(screen.queryByTestId('chat-mutation-error')).toBeNull();
+      expect(screen.queryByTestId('chat-connection-banner')).toBeNull();
+    },
+  );
 
   it('preserves a local draft while a temporary subscription rejection hides mutations', async () => {
     const readyResult = chatResult();
@@ -249,9 +355,17 @@ describe('ChatScreen', () => {
     expect(tripASend).not.toHaveBeenCalled();
   });
 
-  it('resets the composer when the signed-in user changes inside the same trip', async () => {
+  it('resets the composer when the signed-in user resource changes inside the same trip', async () => {
+    const coordinatorA = createAIReconciliationCoordinator({
+      resourceKey: 'user-a:trip-1',
+      tripId: 'trip-1',
+    });
+    const coordinatorB = createAIReconciliationCoordinator({
+      resourceKey: 'user-b:trip-1',
+      tripId: 'trip-1',
+    });
     mockUseTripChat.mockReturnValue(
-      chatResult({ currentUserId: 'user-a' }),
+      chatResult({ aiReconciliationCoordinator: coordinatorA }),
     );
     const view = await render(<ChatScreen />);
     await fireEvent.changeText(
@@ -260,11 +374,10 @@ describe('ChatScreen', () => {
     );
 
     mockUseTripChat.mockReturnValue(
-      chatResult({ currentUserId: 'user-b' }),
+      chatResult({ aiReconciliationCoordinator: coordinatorB }),
     );
     await view.rerender(<ChatScreen />);
 
-    expect(mockUseTripChat).toHaveBeenLastCalledWith({ tripId: 'trip-1' });
     expect(screen.getByLabelText('Message').props.value).toBe('');
   });
 
@@ -283,6 +396,45 @@ describe('ChatScreen', () => {
 
     expect(screen.getByTestId('chat-terminal-notice')).toHaveTextContent(copy);
     expect(screen.getByTestId('chat-read-only-footer')).toHaveTextContent(copy);
+    expect(screen.queryByLabelText('Message')).toBeNull();
+  });
+
+  it('offers a read-only history retry without reopening terminal mutations', async () => {
+    const retryInitialLoad = jest.fn().mockResolvedValue(undefined);
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        tripStatus: 'COMPLETED',
+        isReadOnly: true,
+        initialLoadError: failure('Chat history could not be loaded.'),
+        retryInitialLoad,
+      }),
+    );
+    await render(<ChatScreen />);
+
+    expect(screen.getByTestId('chat-terminal-notice')).toBeTruthy();
+    expect(
+      screen.getByTestId('chat-terminal-history-error'),
+    ).toHaveTextContent(/Chat history could not be loaded\./);
+    expect(screen.queryByLabelText('Message')).toBeNull();
+    await fireEvent.press(screen.getByLabelText('Retry chat history'));
+    expect(retryInitialLoad).toHaveBeenCalledTimes(1);
+  });
+
+  it('replaces terminal history retry with an inline loading state', async () => {
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        tripStatus: 'COMPLETED',
+        isReadOnly: true,
+        isLoadingInitial: true,
+        initialLoadError: failure('Prior history request failed.'),
+      }),
+    );
+    await render(<ChatScreen />);
+
+    expect(screen.getByTestId('chat-terminal-history-loading')).toHaveTextContent(
+      'Loading chat history…',
+    );
+    expect(screen.queryByLabelText('Retry chat history')).toBeNull();
     expect(screen.queryByLabelText('Message')).toBeNull();
   });
 
@@ -316,7 +468,54 @@ describe('ChatScreen', () => {
     expect(screen.queryByTestId('chat-mutation-error')).toBeNull();
   });
 
-  it('uses native-stack-safe insets and an iOS keyboard-aware layout', async () => {
+  it('calculates the keyboard inset from the viewport intersection', () => {
+    const dockedFrame = { height: 291, screenY: 376 };
+    expect(chatKeyboardBottomInset(667, dockedFrame, 34)).toBe(257);
+    expect(
+      chatKeyboardBottomInset(667, { height: 200, screenY: 300 }, 34),
+    ).toBe(166);
+    expect(
+      chatKeyboardBottomInset(667, { height: 291, screenY: 600 }, 34),
+    ).toBe(33);
+    expect(
+      chatKeyboardBottomInset(667, { height: 291, screenY: 700 }, 34),
+    ).toBe(0);
+    expect(
+      chatKeyboardBottomInset(667, { height: 291, screenY: 0 }, 34),
+    ).toBe(0);
+    expect(chatKeyboardBottomInset(Number.NaN, dockedFrame, 34)).toBe(0);
+  });
+
+  it('retains the last stable keyboard frame during an iOS cross-fade', () => {
+    const current = { height: 291, screenY: 376 };
+    expect(stableChatKeyboardFrame(current, { height: 320, screenY: 0 })).toBe(
+      current,
+    );
+    expect(stableChatKeyboardFrame(current, undefined)).toBe(current);
+    expect(stableChatKeyboardFrame(current, { height: 0, screenY: 667 })).toBeNull();
+    expect(
+      stableChatKeyboardFrame(current, { height: 216, screenY: 451 }),
+    ).toEqual({ height: 216, screenY: 451 });
+  });
+
+  it('uses native-stack-safe insets and follows stable keyboard frame changes', async () => {
+    let onKeyboardFrameChange: ((event: KeyboardEvent) => void) | undefined;
+    let onKeyboardHide: ((event: KeyboardEvent) => void) | undefined;
+    const addKeyboardListener = Keyboard.addListener.bind(Keyboard);
+    const listenerSpy = jest
+      .spyOn(Keyboard, 'addListener')
+      .mockImplementation((eventType, listener) => {
+        if (eventType === 'keyboardWillChangeFrame') {
+          onKeyboardFrameChange = listener;
+        } else if (eventType === 'keyboardWillHide') {
+          onKeyboardHide = listener;
+        }
+        return addKeyboardListener(eventType, listener);
+      });
+    jest.spyOn(Keyboard, 'metrics').mockReturnValue(undefined);
+    jest
+      .spyOn(Keyboard, 'scheduleLayoutAnimation')
+      .mockImplementation(() => undefined);
     await render(<ChatScreen />);
 
     expect(screen.getByTestId('chat-safe-area').props.edges).toEqual({
@@ -325,7 +524,128 @@ describe('ChatScreen', () => {
       right: 'additive',
       bottom: 'additive',
     });
-    expect(CHAT_KEYBOARD_BEHAVIOR).toBe('padding');
+    expect(onKeyboardFrameChange).toBeDefined();
+    expect(onKeyboardHide).toBeDefined();
+
+    const viewportHeight = Dimensions.get('window').height;
+
+    await act(async () => {
+      onKeyboardFrameChange?.({
+        duration: 250,
+        easing: 'keyboard',
+        endCoordinates: {
+          height: 291,
+          screenX: 0,
+          screenY: viewportHeight - 291,
+          width: 375,
+        },
+      });
+    });
+
+    expect(
+      StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+    ).toMatchObject({ flex: 1, paddingBottom: 291 });
+
+    await act(async () => {
+      onKeyboardFrameChange?.({
+        duration: 100,
+        easing: 'keyboard',
+        endCoordinates: {
+          height: 320,
+          screenX: 0,
+          screenY: 0,
+          width: 375,
+        },
+      });
+    });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+    ).toMatchObject({ flex: 1, paddingBottom: 291 });
+
+    await act(async () => {
+      onKeyboardFrameChange?.({
+        duration: 250,
+        easing: 'keyboard',
+        endCoordinates: {
+          height: 216,
+          screenX: 0,
+          screenY: viewportHeight - 216,
+          width: 375,
+        },
+      });
+    });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+    ).toMatchObject({ flex: 1, paddingBottom: 216 });
+
+    await act(async () => {
+      onKeyboardHide?.({
+        duration: 250,
+        easing: 'keyboard',
+        endCoordinates: {
+          height: 0,
+          screenX: 0,
+          screenY: viewportHeight,
+          width: 375,
+        },
+      });
+    });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+    ).toMatchObject({ flex: 1, paddingBottom: 0 });
+    listenerSpy.mockRestore();
+  });
+
+  it('refreshes keyboard metrics after a viewport orientation change', async () => {
+    const originalWindow = Dimensions.get('window');
+    const originalScreen = Dimensions.get('screen');
+    const portrait = { width: 375, height: 667, scale: 2, fontScale: 1 };
+    const landscape = { width: 667, height: 375, scale: 2, fontScale: 1 };
+    let metrics = {
+      height: 291,
+      screenX: 0,
+      screenY: portrait.height - 291,
+      width: portrait.width,
+    };
+    const metricsSpy = jest
+      .spyOn(Keyboard, 'metrics')
+      .mockImplementation(() => metrics);
+    jest
+      .spyOn(Keyboard, 'scheduleLayoutAnimation')
+      .mockImplementation(() => undefined);
+
+    let view: Awaited<ReturnType<typeof render>> | null = null;
+    try {
+      await act(async () => {
+        Dimensions.set({ window: portrait, screen: portrait });
+      });
+      view = await render(<ChatScreen />);
+      expect(
+        StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+      ).toMatchObject({ flex: 1, paddingBottom: 291 });
+
+      metrics = {
+        height: 216,
+        screenX: 0,
+        screenY: landscape.height - 216,
+        width: landscape.width,
+      };
+      await act(async () => {
+        Dimensions.set({ window: landscape, screen: landscape });
+      });
+
+      expect(metricsSpy).toHaveBeenLastCalledWith();
+      expect(
+        StyleSheet.flatten(screen.getByTestId('chat-keyboard-layout').props.style),
+      ).toMatchObject({ flex: 1, paddingBottom: 216 });
+    } finally {
+      if (view !== null) {
+        await view.unmount();
+      }
+      await act(async () => {
+        Dimensions.set({ window: originalWindow, screen: originalScreen });
+      });
+    }
   });
 
   it('clears the composer for created and transient-failed outcomes', async () => {
@@ -378,6 +698,152 @@ describe('ChatScreen', () => {
     );
   });
 
+  it('maps only an AI-mention 429 to the explicit 20-per-hour quota and keeps Retry-After', async () => {
+    const sendMessage = jest.fn().mockResolvedValue({
+      kind: 'blocked',
+      error: failure('Generic throttle detail.', {
+        errorCode: 'THROTTLED',
+        status: 429,
+        retryAfterMs: 2500,
+      }),
+    });
+    mockUseTripChat.mockReturnValue(chatResult({ sendMessage }));
+    await render(<ChatScreen />);
+
+    const input = screen.getByLabelText('Message');
+    await fireEvent.changeText(input, '  @goplanai Keep my AI prompt  ');
+    await fireEvent.press(screen.getByLabelText('Send message'));
+    await act(async () => undefined);
+
+    expect(input.props.value).toBe('  @goplanai Keep my AI prompt  ');
+    expect(screen.getByTestId('chat-composer-feedback')).toHaveTextContent(
+      'GoPlanAI allows 20 prompts per hour. Your prompt was not sent; try again later. Try again in 3 seconds.',
+    );
+  });
+
+  it('does not call the chat send path for a bare GoPlanAI mention', async () => {
+    const sendMessage = jest.fn().mockResolvedValue({
+      kind: 'created',
+      clientMessageId: 'client-ai-bare',
+    });
+    mockUseTripChat.mockReturnValue(chatResult({ sendMessage }));
+    await render(<ChatScreen />);
+
+    await fireEvent.changeText(
+      screen.getByLabelText('Message'),
+      '@GoPlanAI   ',
+    );
+    await fireEvent.press(screen.getByLabelText('Send message'));
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(screen.getByTestId('goplan-ai-prompt-hint')).toBeTruthy();
+  });
+
+  it.each([
+    ['AI_BUSY', 409, 'The current GoPlanAI interaction is still active.'],
+    ['INVALID_AI_PROMPT', 400, 'Please include a concrete AI prompt.'],
+  ])(
+    'preserves backend detail and the local composer draft for %s',
+    async (errorCode, status, detail) => {
+      const sendMessage = jest.fn().mockResolvedValue({
+        kind: 'blocked',
+        error: failure(detail, { errorCode, status }),
+      });
+      mockUseTripChat.mockReturnValue(chatResult({ sendMessage }));
+      await render(<ChatScreen />);
+
+      const input = screen.getByLabelText('Message');
+      const localDraft = '  @GoPlanAI Preserve this draft  ';
+      await fireEvent.changeText(input, localDraft);
+      await fireEvent.press(screen.getByLabelText('Send message'));
+      await act(async () => undefined);
+
+      expect(input.props.value).toBe(localDraft);
+      expect(screen.getByTestId('chat-composer-feedback')).toHaveTextContent(
+        detail,
+      );
+    },
+  );
+
+  it('passes the correlated AI typing interaction to the transcript header', async () => {
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        aiTypingState: {
+          active: {
+            interactionId: 'interaction-screen',
+            requestedByUserId: 'user-me',
+            startedAtMs: 1,
+            visualExpiresAtMs: 120_001,
+          },
+        },
+      }),
+    );
+    await render(<ChatScreen />);
+
+    expect(
+      screen.getByTestId('goplan-ai-typing-interaction-screen'),
+    ).toBeTruthy();
+  });
+
+  it('plumbs a draft HTTP snapshot back through the resource-guarded hook callback', async () => {
+    const tripId = '11111111-1111-4111-8111-111111111111';
+    const source = makeDraftFixture();
+    const cancelled = makeDraftFixture({
+      status: 'CANCELLED',
+      can_confirm: false,
+      can_cancel: false,
+      updated_at: '2026-08-10T00:01:00.000Z',
+    });
+    const applyAIDraftSnapshot = jest.fn();
+    mockParams = { tripId };
+    mockGetAIActionDraft.mockResolvedValue({ draft: source });
+    mockCancelAIActionDraft.mockResolvedValue({ draft: cancelled });
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        applyAIDraftSnapshot,
+        messages: [
+          {
+            ...message('ai-message', 'Review this proposal.'),
+            trip_id: tripId,
+            sender: {
+              id: null,
+              display_name: 'GoPlanAI',
+              identify_tag: null,
+              avatar_url: null,
+            },
+            sender_kind: 'AI',
+            ai_status: 'SUCCESS',
+            action_drafts: [source],
+          },
+        ],
+      }),
+    );
+    await render(<ChatScreen />);
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Cancel' }));
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Cancel this draft' }),
+    );
+    await act(async () => undefined);
+
+    expect(mockGetAIActionDraft).toHaveBeenCalledWith(
+      tripId,
+      source.id,
+      expect.any(AbortSignal),
+    );
+    expect(mockCancelAIActionDraft).toHaveBeenCalledWith(
+      tripId,
+      source.id,
+      expect.any(AbortSignal),
+    );
+    expect(applyAIDraftSnapshot).toHaveBeenCalledWith({
+      messageId: 'ai-message',
+      draftId: source.id,
+      expectedSourceIdentity: aiActionDraftSourceIdentity(source),
+      draft: cancelled,
+    });
+  });
+
   it('surfaces catch-up, mutation, and older-page failures without hiding history', async () => {
     mockUseTripChat.mockReturnValue(
       chatResult({
@@ -401,6 +867,81 @@ describe('ChatScreen', () => {
     );
     expect(screen.getByText('Earlier messages could not be loaded.')).toBeTruthy();
     expect(screen.getByText('Content message-1')).toBeTruthy();
+  });
+
+  it('offers an accessible in-place retry for a failed message catch-up', async () => {
+    const retryCatchUp = jest.fn();
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        messages: [message('message-1')],
+        readSyncError: {
+          errorCode: 'CHAT_SYNC_FAILED',
+          detail: 'Missed messages could not be synchronized.',
+        },
+        retryCatchUp,
+      }),
+    );
+    await render(<ChatScreen />);
+
+    expect(screen.getByText('Missed messages could not be synchronized.')).toBeTruthy();
+    await fireEvent.press(screen.getByLabelText('Retry catching up'));
+    expect(retryCatchUp).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('Content message-1')).toBeTruthy();
+  });
+
+  it('keeps a read-sync warning but hides a no-op retry until live chat is subscribed', async () => {
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        connectionStatus: 'reconnecting',
+        subscriptionStatus: 'waiting',
+        messages: [message('message-1')],
+        readSyncError: {
+          errorCode: 'CHAT_SYNC_FAILED',
+          detail: 'Read history may be stale.',
+        },
+      }),
+    );
+    await render(<ChatScreen />);
+
+    expect(screen.getByText('Read history may be stale.')).toBeTruthy();
+    expect(screen.queryByLabelText('Retry catching up')).toBeNull();
+  });
+
+  it('shows terminal transport exhaustion and restarts the actual connection', async () => {
+    const retryConnection = jest.fn().mockReturnValue(true);
+    mockUseTripChat.mockReturnValue(
+      chatResult({
+        tripStatus: 'COMPLETED',
+        isReadOnly: true,
+        connectionStatus: 'disconnected',
+        subscriptionStatus: 'waiting',
+        connectionDiagnostics: {
+          phase: 'stopped',
+          reason: 'retry_exhausted',
+          category: 'retry',
+          terminal: true,
+          closeCode: null,
+          reconnectAttempt: 10,
+          retryDelayMs: null,
+          ticketPhase: null,
+          heartbeat: 'inactive',
+        },
+        retryConnection,
+      }),
+    );
+    jest.useFakeTimers();
+    try {
+      await render(<ChatScreen />);
+      await act(async () => {
+        jest.advanceTimersByTime(2_500);
+      });
+      expect(screen.getByText(/stopped after repeated connection failures/)).toBeTruthy();
+      await fireEvent.press(screen.getByLabelText('Retry live connection'));
+      expect(retryConnection).toHaveBeenCalledTimes(1);
+      expect(screen.queryByLabelText('Message')).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('surfaces an unknown room protocol error without disabling a healthy transcript', async () => {

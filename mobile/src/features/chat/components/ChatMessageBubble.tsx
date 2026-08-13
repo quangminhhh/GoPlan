@@ -1,5 +1,11 @@
-import { Ionicons } from '@expo/vector-icons';
-import { memo, useCallback, useMemo } from 'react';
+import { FontAwesome6, Ionicons } from '@expo/vector-icons';
+import {
+  type ComponentRef,
+  memo,
+  useCallback,
+  useMemo,
+  useRef,
+} from 'react';
 import {
   ActivityIndicator,
   type AccessibilityActionEvent,
@@ -11,6 +17,18 @@ import {
 } from 'react-native';
 import { UserAvatar } from '@/features/auth/components/UserAvatar';
 import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
+import { AIActionDraftCardController } from '../ai/components/AIActionDraftCardController';
+import {
+  GoPlanAIMentionMessageText,
+} from '../ai/components/AIMention';
+import { AIMessageContent } from '../ai/components/AIMessageContent';
+import {
+  aiActionDraftSourceIdentity,
+  parseAIActionDraft,
+  type AIActionDraft,
+} from '../ai/drafts';
+import { parseGoPlanAIMention } from '../ai/mention';
+import type { AccessibilityFocusTarget } from '../ai/accessibilityFocus';
 import type {
   AllowedReactionEmoji,
   ChatApiFailure,
@@ -28,6 +46,21 @@ const accessibleTimeFormatter = new Intl.DateTimeFormat(undefined, {
   timeStyle: 'short',
 });
 
+const EMPTY_DRAFT_ID_SET: ReadonlySet<string> = new Set();
+
+export interface ApplyMessageAIDraftSnapshotInput {
+  readonly messageId: string;
+  readonly draftId: string;
+  readonly expectedSourceIdentity: string;
+  readonly draft: AIActionDraft;
+}
+
+export type ApplyMessageAIDraftSnapshot = (
+  input: ApplyMessageAIDraftSnapshotInput,
+) => Promise<void>;
+
+export type ChatMessageActionFocusResolver = () => AccessibilityFocusTarget;
+
 interface ChatMessageBubbleProps {
   message: ChatMessage;
   currentUserId: string;
@@ -41,12 +74,18 @@ interface ChatMessageBubbleProps {
   deleting: boolean;
   reactionBusy: boolean;
   actionsEnabled: boolean;
+  showReactionAffordance?: boolean;
+  ambiguousAIDraftIds?: ReadonlySet<string>;
   selectionMode: boolean;
   selected: boolean;
-  onOpenActions: (messageId: string) => void;
+  onOpenActions: (
+    messageId: string,
+    resolveFocusTarget: ChatMessageActionFocusResolver,
+  ) => void;
   onToggleSelection: (messageId: string) => void;
   onRetry: (clientMessageId: string) => void;
   onToggleReaction: (messageId: string, emoji: AllowedReactionEmoji) => void;
+  onApplyAIDraftSnapshot: ApplyMessageAIDraftSnapshot;
 }
 
 function senderLabel(message: ChatMessage): string {
@@ -75,7 +114,9 @@ function messageAccessibilityLabel(
   const sender = isOwn ? 'You' : senderLabel(message);
   const content = message.is_deleted_for_everyone
     ? 'Message removed for everyone'
-    : message.content || 'Message with no text';
+    : message.sender_kind === 'AI' && message.ai_status === 'ERROR'
+      ? `GoPlanAI could not complete this request. ${message.content || 'No error detail was provided.'}`
+      : message.content || 'Message with no text';
   const time = formatMessageTime(message.created_at, true);
   const delivery = failed
     ? 'Not sent'
@@ -124,6 +165,47 @@ function SenderAvatar({ message }: { message: ChatMessage }) {
   );
 }
 
+interface AIDraftCardAdapterProps {
+  readonly draft: AIActionDraft;
+  readonly interactionDisabled: boolean;
+  readonly messageId: string;
+  readonly tripId: string;
+  readonly onApplyAIDraftSnapshot: ApplyMessageAIDraftSnapshot;
+}
+
+const AIDraftCardAdapter = memo(function AIDraftCardAdapter({
+  draft,
+  interactionDisabled,
+  messageId,
+  tripId,
+  onApplyAIDraftSnapshot,
+}: AIDraftCardAdapterProps) {
+  const expectedSourceIdentity = useMemo(
+    () => aiActionDraftSourceIdentity(draft),
+    [draft],
+  );
+  const applySnapshot = useCallback(
+    (nextDraft: AIActionDraft) =>
+      onApplyAIDraftSnapshot({
+        messageId,
+        draftId: draft.id,
+        expectedSourceIdentity,
+        draft: nextDraft,
+      }),
+    [draft.id, expectedSourceIdentity, messageId, onApplyAIDraftSnapshot],
+  );
+
+  return (
+    <AIActionDraftCardController
+      draft={draft}
+      interactionDisabled={interactionDisabled}
+      onDraftChanged={applySnapshot}
+      tripId={tripId}
+    />
+  );
+});
+AIDraftCardAdapter.displayName = 'AIDraftCardAdapter';
+
 function ChatMessageBubbleComponent({
   message,
   currentUserId,
@@ -137,18 +219,65 @@ function ChatMessageBubbleComponent({
   deleting,
   reactionBusy,
   actionsEnabled,
+  showReactionAffordance = false,
+  ambiguousAIDraftIds = EMPTY_DRAFT_ID_SET,
   selectionMode,
   selected,
   onOpenActions,
   onToggleSelection,
   onRetry,
   onToggleReaction,
+  onApplyAIDraftSnapshot,
 }: ChatMessageBubbleProps) {
+  const bubbleRef = useRef<ComponentRef<typeof Pressable>>(null);
+  const reactionAffordanceRef = useRef<ComponentRef<typeof Pressable>>(null);
   const canSelect = !pending && !failed && !deleting;
-  const canOpenActions = actionsEnabled && canSelect && !selectionMode;
+  const canOpenActions =
+    actionsEnabled && canSelect && !reactionBusy && !selectionMode;
   const canRetry = Boolean(actionsEnabled && failed && message.client_message_id);
   const time = formatMessageTime(message.created_at);
   const label = senderLabel(message);
+  const userHasAIMention = useMemo(
+    () =>
+      message.sender_kind === 'USER' &&
+      parseGoPlanAIMention(message.content).hasMention,
+    [message.content, message.sender_kind],
+  );
+  const parsedDrafts = useMemo(() => {
+    if (
+      message.sender_kind !== 'AI' ||
+      message.is_deleted_for_everyone
+    ) {
+      return { drafts: [] as readonly AIActionDraft[], malformedCount: 0 };
+    }
+    const parsedCandidates = message.action_drafts.map(parseAIActionDraft);
+    const idCounts = new Map<string, number>();
+    for (const parsed of parsedCandidates) {
+      if (parsed !== null) {
+        idCounts.set(parsed.id, (idCounts.get(parsed.id) ?? 0) + 1);
+      }
+    }
+    const drafts: AIActionDraft[] = [];
+    let malformedCount = 0;
+    for (const parsed of parsedCandidates) {
+      if (parsed === null) {
+        malformedCount += 1;
+      } else if (
+        (idCounts.get(parsed.id) ?? 0) !== 1 ||
+        ambiguousAIDraftIds.has(parsed.id)
+      ) {
+        malformedCount += 1;
+      } else {
+        drafts.push(parsed);
+      }
+    }
+    return { drafts, malformedCount };
+  }, [
+    ambiguousAIDraftIds,
+    message.action_drafts,
+    message.is_deleted_for_everyone,
+    message.sender_kind,
+  ]);
   const accessibilityActions = useMemo<AccessibilityActionInfo[]>(() => {
     if (selectionMode && canSelect) {
       return [
@@ -167,9 +296,18 @@ function ChatMessageBubbleComponent({
     return [];
   }, [canOpenActions, canRetry, canSelect, selected, selectionMode]);
 
-  const openActions = useCallback(() => {
+  const openBubbleActions = useCallback(() => {
     if (canOpenActions) {
-      onOpenActions(message.id);
+      onOpenActions(message.id, () => bubbleRef.current);
+    }
+  }, [canOpenActions, message.id, onOpenActions]);
+
+  const openReactionActions = useCallback(() => {
+    if (canOpenActions) {
+      onOpenActions(
+        message.id,
+        () => reactionAffordanceRef.current ?? bubbleRef.current,
+      );
     }
   }, [canOpenActions, message.id, onOpenActions]);
 
@@ -193,18 +331,41 @@ function ChatMessageBubbleComponent({
   const handleAccessibilityAction = useCallback(
     (event: AccessibilityActionEvent) => {
       if (event.nativeEvent.actionName === 'openMessageActions') {
-        openActions();
+        openBubbleActions();
       } else if (event.nativeEvent.actionName === 'toggleSelection') {
         toggleSelection();
       } else if (event.nativeEvent.actionName === 'retrySend') {
         retry();
       }
     },
-    [openActions, retry, toggleSelection],
+    [openBubbleActions, retry, toggleSelection],
+  );
+
+  const content = message.sender_kind === 'AI' ? (
+    <View style={styles.aiContent}>
+      {message.ai_status === 'ERROR' ? (
+        <Text
+          accessibilityLiveRegion="polite"
+          accessibilityRole="alert"
+          style={styles.aiErrorText}
+          testID={`chat-ai-error-${message.id}`}
+        >
+          GoPlanAI could not complete this request.
+        </Text>
+      ) : null}
+      <AIMessageContent content={message.content} />
+    </View>
+  ) : userHasAIMention ? (
+    <GoPlanAIMentionMessageText content={message.content} inverse={isOwn} />
+  ) : (
+    <Text style={[styles.messageText, isOwn ? styles.ownMessageText : null]}>
+      {message.content}
+    </Text>
   );
 
   const bubble = (
     <Pressable
+      ref={bubbleRef}
       accessible
       accessibilityRole={canOpenActions || (selectionMode && canSelect) ? 'button' : undefined}
       accessibilityLabel={messageAccessibilityLabel(message, isOwn, pending, failed, deleting)}
@@ -222,7 +383,7 @@ function ChatMessageBubbleComponent({
       accessibilityActions={accessibilityActions}
       delayLongPress={400}
       onAccessibilityAction={handleAccessibilityAction}
-      onLongPress={canOpenActions ? openActions : undefined}
+      onLongPress={canOpenActions ? openBubbleActions : undefined}
       onPress={selectionMode && canSelect ? toggleSelection : undefined}
       style={({ pressed }) => [
         styles.bubble,
@@ -238,12 +399,35 @@ function ChatMessageBubbleComponent({
       {message.is_deleted_for_everyone ? (
         <Text style={styles.tombstoneText}>Message removed for everyone</Text>
       ) : (
-        <Text style={[styles.messageText, isOwn ? styles.ownMessageText : null]}>
-          {message.content}
-        </Text>
+        content
       )}
     </Pressable>
   );
+
+  const actionDraftCards =
+    parsedDrafts.drafts.length > 0 || parsedDrafts.malformedCount > 0 ? (
+      <View style={styles.actionDrafts} testID={`chat-ai-drafts-${message.id}`}>
+        {parsedDrafts.drafts.map((draft) => (
+          <AIDraftCardAdapter
+            draft={draft}
+            interactionDisabled={!actionsEnabled || selectionMode}
+            key={draft.id}
+            messageId={message.id}
+            onApplyAIDraftSnapshot={onApplyAIDraftSnapshot}
+            tripId={message.trip_id}
+          />
+        ))}
+        {parsedDrafts.malformedCount > 0 ? (
+          <Text
+            accessibilityRole="alert"
+            style={styles.malformedDraftText}
+            testID={`chat-ai-draft-malformed-${message.id}`}
+          >
+            An AI action draft could not be displayed safely.
+          </Text>
+        ) : null}
+      </View>
+    ) : null;
 
   const meta = showMeta || pending || failed || deleting ? (
     <View style={[styles.metaRow, isOwn ? styles.metaRowOwn : null]}>
@@ -291,11 +475,65 @@ function ChatMessageBubbleComponent({
     />
   );
 
+  const reactionAffordance =
+    showReactionAffordance && actionsEnabled && canSelect && !selectionMode ? (
+      <Pressable
+        ref={reactionAffordanceRef}
+        accessibilityRole="button"
+        accessibilityLabel="React to this message"
+        accessibilityHint="Opens reactions and other message actions"
+        accessibilityState={{ disabled: reactionBusy, busy: reactionBusy }}
+        disabled={reactionBusy}
+        onPress={openReactionActions}
+        style={({ pressed }) => [
+          styles.reactionAffordance,
+          pressed && !reactionBusy ? styles.pressed : null,
+          reactionBusy ? styles.reactionAffordanceBusy : null,
+        ]}
+        testID={`chat-reaction-affordance-${message.id}`}
+      >
+        <FontAwesome6
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+          color={colors.textMuted}
+          name="face-smile"
+          size={17}
+          solid
+        />
+        <View
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+          style={styles.reactionAffordanceBadge}
+        >
+          <FontAwesome6
+            color={colors.background}
+            name="plus"
+            size={8}
+            solid
+          />
+        </View>
+      </Pressable>
+    ) : null;
+
+  const bubbleActionRow = (
+    <View
+      style={[styles.bubbleActionRow, isOwn ? styles.bubbleActionRowOwn : null]}
+      testID={`chat-bubble-action-row-${message.id}`}
+    >
+      {bubble}
+      {reactionAffordance}
+    </View>
+  );
+
   if (isOwn) {
     return (
       <View style={[styles.row, styles.ownRow, selected ? styles.selectedRow : null]}>
-        <View style={[styles.messageColumn, styles.ownColumn]}>
-          {bubble}
+        <View
+          style={[styles.messageColumn, styles.ownColumn]}
+          testID={`chat-column-${message.id}`}
+        >
+          {bubbleActionRow}
+          {actionDraftCards}
           {reactions}
           {meta}
         </View>
@@ -308,7 +546,14 @@ function ChatMessageBubbleComponent({
     <View style={[styles.row, styles.otherRow, selected ? styles.selectedRow : null]}>
       {selectionMode && canSelect ? <SelectionIndicator selected={selected} /> : null}
       <View style={styles.avatarGutter}>{showAvatar ? <SenderAvatar message={message} /> : null}</View>
-      <View style={[styles.messageColumn, styles.otherColumn]}>
+      <View
+        style={[
+          styles.messageColumn,
+          styles.otherColumn,
+          message.sender_kind === 'AI' ? styles.aiColumn : null,
+        ]}
+        testID={`chat-column-${message.id}`}
+      >
         {showSender ? (
           <View style={styles.senderRow}>
             <Text style={[styles.senderName, message.sender_kind === 'AI' ? styles.aiSender : null]}>
@@ -319,7 +564,8 @@ function ChatMessageBubbleComponent({
             ) : null}
           </View>
         ) : null}
-        {bubble}
+        {bubbleActionRow}
+        {actionDraftCards}
         {reactions}
         {meta}
       </View>
@@ -348,9 +594,10 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   selectedRow: { backgroundColor: colors.primarySoft },
-  messageColumn: { minWidth: 0, gap: spacing.xs },
-  ownColumn: { maxWidth: '82%', alignItems: 'flex-end' },
-  otherColumn: { maxWidth: '82%', alignItems: 'flex-start' },
+  messageColumn: { minWidth: 0, flexShrink: 1, gap: spacing.xs },
+  ownColumn: { maxWidth: '94%', alignItems: 'flex-end' },
+  otherColumn: { maxWidth: '88%', alignItems: 'flex-start' },
+  aiColumn: { maxWidth: '100%', flex: 1, alignItems: 'stretch' },
   avatarGutter: { width: 32, minHeight: 32, justifyContent: 'flex-end' },
   aiAvatar: {
     width: 32,
@@ -371,6 +618,7 @@ const styles = StyleSheet.create({
   senderTag: { ...typography.caption, color: colors.textMuted },
   aiSender: { color: colors.violet },
   bubble: {
+    flexShrink: 1,
     minHeight: 44,
     minWidth: 48,
     justifyContent: 'center',
@@ -398,8 +646,44 @@ const styles = StyleSheet.create({
   },
   pendingBubble: { opacity: 0.68 },
   pressed: { opacity: 0.58 },
+  reactionAffordance: {
+    position: 'relative',
+    width: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radii.full,
+    borderCurve: 'continuous',
+  },
+  reactionAffordanceBusy: { opacity: 0.55 },
+  reactionAffordanceBadge: {
+    position: 'absolute',
+    right: 7,
+    bottom: 7,
+    width: 14,
+    height: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radii.full,
+    borderCurve: 'continuous',
+    backgroundColor: colors.primary,
+  },
+  bubbleActionRow: {
+    maxWidth: '100%',
+    minHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  bubbleActionRowOwn: { flexDirection: 'row-reverse' },
   messageText: { ...typography.body, color: colors.text },
   ownMessageText: { color: colors.background },
+  aiContent: { minWidth: 0, gap: spacing.sm },
+  aiErrorText: { ...typography.label, color: colors.danger },
+  actionDrafts: { width: '100%', minWidth: 0, gap: spacing.sm },
+  malformedDraftText: {
+    ...typography.caption,
+    color: colors.danger,
+  },
   tombstoneText: { ...typography.caption, color: colors.textMuted, fontStyle: 'italic' },
   metaRow: {
     minHeight: 20,

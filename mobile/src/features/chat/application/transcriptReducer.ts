@@ -3,6 +3,11 @@ import type {
   ChatMessage,
   ReactionSummary,
 } from '../types';
+import {
+  aiActionDraftSourceIdentity,
+  parseAIActionDraft,
+  type AIActionDraft,
+} from '../ai/drafts';
 
 export type ChatRoomStatus = 'idle' | 'loading' | 'ready' | 'error' | 'kicked';
 
@@ -22,12 +27,36 @@ export interface TranscriptMutationError {
   readonly error: ChatApiFailure;
 }
 
+export interface TranscriptAIDraftOverlay {
+  readonly draft: AIActionDraft;
+  readonly projectedIdentity: string;
+  readonly priorSourceIdentities: ReadonlySet<string>;
+  readonly lastAuthoritativeSequence: number;
+}
+
+interface DeferredFullMessagePatch {
+  readonly message: ChatMessage;
+  readonly live: boolean;
+}
+
+interface DeferredReactionPatch {
+  readonly reactions: readonly ReactionSummary[];
+  readonly changeSequence: number;
+  readonly updatedAt: string;
+}
+
+interface DeferredAuthoritativePatch {
+  readonly fullMessage: DeferredFullMessagePatch | null;
+  readonly reaction: DeferredReactionPatch | null;
+}
+
 export interface TranscriptState {
   readonly resourceKey: string;
   /** Shared logical clock captured before starting REST requests. */
   readonly version: number;
   readonly roomStatus: ChatRoomStatus;
   readonly roomError: ChatApiFailure | null;
+  readonly isLoadingInitial: boolean;
   readonly confirmed: ReadonlyMap<string, ChatMessage>;
   /** Last transcript mutation version for each confirmed server id. */
   readonly messageVersions: ReadonlyMap<string, number>;
@@ -49,6 +78,20 @@ export interface TranscriptState {
   readonly reactionOverlays: ReadonlyMap<
     string,
     TranscriptReactionOverlay
+  >;
+  /**
+   * Immediate HTTP draft projections. Full chat rows remain authoritative and
+   * retain their server-authored change_sequence; this overlay is reconciled
+   * separately when a newer full row arrives.
+   */
+  readonly aiDraftOverlays: ReadonlyMap<
+    string,
+    ReadonlyMap<string, TranscriptAIDraftOverlay>
+  >;
+  /** Newer authority retained until an unloaded paginated row materializes. */
+  readonly deferredAuthoritativePatches: ReadonlyMap<
+    string,
+    DeferredAuthoritativePatch
   >;
   readonly hasMoreOlder: boolean;
   readonly nextOlderCursor: string | null;
@@ -104,6 +147,13 @@ export type TranscriptAction =
       readonly messages: readonly ChatMessage[];
       /** Required for REST data; omitted only for a live authoritative push. */
       readonly requestVersion?: number;
+    })
+  | (ResourceScopedAction & {
+      readonly type: 'AI_DRAFT_LOCAL_SNAPSHOT';
+      readonly messageId: string;
+      readonly draftId: string;
+      readonly expectedSourceIdentity: string;
+      readonly draft: AIActionDraft;
     })
   | (ResourceScopedAction & {
       readonly type: 'REACTION_PATCH';
@@ -215,6 +265,7 @@ export function createTranscriptState(resourceKey: string): TranscriptState {
     version: 0,
     roomStatus: 'idle',
     roomError: null,
+    isLoadingInitial: false,
     confirmed: new Map(),
     messageVersions: new Map(),
     reactionBaseVersions: new Map(),
@@ -227,6 +278,8 @@ export function createTranscriptState(resourceKey: string): TranscriptState {
     hidden: new Set(),
     reactionBase: new Map(),
     reactionOverlays: new Map(),
+    aiDraftOverlays: new Map(),
+    deferredAuthoritativePatches: new Map(),
     hasMoreOlder: false,
     nextOlderCursor: null,
     isLoadingOlder: false,
@@ -243,36 +296,211 @@ export function createTranscriptState(resourceKey: string): TranscriptState {
 
 type MergeMode = 'upsert' | 'patch-known';
 
+function shouldReplaceFullMessage(
+  current: ChatMessage,
+  incoming: ChatMessage,
+): boolean {
+  if (current.is_deleted_for_everyone && !incoming.is_deleted_for_everyone) {
+    return false;
+  }
+  return (
+    incoming.change_sequence > current.change_sequence ||
+    (incoming.change_sequence === current.change_sequence &&
+      incoming.is_deleted_for_everyone &&
+      !current.is_deleted_for_everyone)
+  );
+}
+
+/** Returns the deferred full row only when it will supersede this raw page row. */
+export function selectDeferredFullAuthorityForMaterialization(
+  state: TranscriptState,
+  incoming: ChatMessage,
+): ChatMessage | null {
+  const deferred = state.deferredAuthoritativePatches.get(incoming.id)
+    ?.fullMessage?.message;
+  return deferred !== undefined && shouldReplaceFullMessage(incoming, deferred)
+    ? deferred
+    : null;
+}
+
+function retainDeferredFullMessage(
+  current: DeferredAuthoritativePatch | undefined,
+  message: ChatMessage,
+  live: boolean,
+): DeferredAuthoritativePatch | null {
+  const currentFullMessage = current?.fullMessage?.message;
+  if (
+    currentFullMessage !== undefined &&
+    !shouldReplaceFullMessage(currentFullMessage, message)
+  ) {
+    return null;
+  }
+  return {
+    fullMessage: { message, live },
+    reaction: message.is_deleted_for_everyone ? null : current?.reaction ?? null,
+  };
+}
+
+function retainDeferredReaction(
+  current: DeferredAuthoritativePatch | undefined,
+  reaction: DeferredReactionPatch,
+): DeferredAuthoritativePatch | null {
+  if (
+    current?.fullMessage?.message.is_deleted_for_everyone ||
+    (current?.fullMessage !== null &&
+      current?.fullMessage !== undefined &&
+      current.fullMessage.message.change_sequence >= reaction.changeSequence) ||
+    (current?.reaction !== null &&
+      current?.reaction !== undefined &&
+      current.reaction.changeSequence >= reaction.changeSequence)
+  ) {
+    return null;
+  }
+  return {
+    fullMessage: current?.fullMessage ?? null,
+    reaction,
+  };
+}
+
+function materializeDeferredPatch(
+  message: ChatMessage,
+  deferred: DeferredAuthoritativePatch,
+): { readonly message: ChatMessage; readonly live: boolean } {
+  let resolved = message;
+  let live = false;
+  const fullMessage = deferred.fullMessage;
+  if (
+    fullMessage !== null &&
+    shouldReplaceFullMessage(resolved, fullMessage.message)
+  ) {
+    resolved = fullMessage.message;
+    live = fullMessage.live;
+  }
+  const reaction = deferred.reaction;
+  if (
+    reaction !== null &&
+    !resolved.is_deleted_for_everyone &&
+    reaction.changeSequence > resolved.change_sequence
+  ) {
+    resolved = {
+      ...resolved,
+      reactions: reaction.reactions,
+      change_sequence: reaction.changeSequence,
+      updated_at: reaction.updatedAt,
+    };
+    live = true;
+  }
+  return { message: resolved, live };
+}
+
+function parsedDraftById(
+  message: ChatMessage,
+  draftId: string,
+): AIActionDraft | null {
+  for (const candidate of message.action_drafts) {
+    const parsed = parseAIActionDraft(candidate);
+    if (parsed?.id === draftId) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function reconcileAIDraftOverlaysForFullMessage(
+  overlays: ReadonlyMap<string, TranscriptAIDraftOverlay>,
+  message: ChatMessage,
+): ReadonlyMap<string, TranscriptAIDraftOverlay> | null {
+  if (message.is_deleted_for_everyone) {
+    return null;
+  }
+
+  const next = new Map<string, TranscriptAIDraftOverlay>();
+  for (const [draftId, overlay] of overlays) {
+    const incomingDraft = parsedDraftById(message, draftId);
+    if (incomingDraft === null) {
+      continue;
+    }
+    const incomingIdentity = aiActionDraftSourceIdentity(incomingDraft);
+    if (incomingIdentity === overlay.projectedIdentity) {
+      continue;
+    }
+    if (overlay.priorSourceIdentities.has(incomingIdentity)) {
+      next.set(draftId, {
+        ...overlay,
+        lastAuthoritativeSequence: message.change_sequence,
+      });
+    }
+  }
+  return next.size > 0 ? next : null;
+}
+
 function mergeMessages(
   state: TranscriptState,
   messages: readonly ChatMessage[],
   mode: MergeMode,
   _requestVersion: number | undefined,
 ): TranscriptState {
-  const eligible = new Map<string, ChatMessage>();
+  const eligible = new Map<
+    string,
+    { readonly message: ChatMessage; readonly live: boolean }
+  >();
+  let deferredAuthoritativePatches = state.deferredAuthoritativePatches;
+  let deferredChanged = false;
 
-  for (const message of messages) {
-    if (state.hidden.has(message.id)) {
+  const mutableDeferredPatches = () => {
+    if (!deferredChanged) {
+      deferredAuthoritativePatches = new Map(deferredAuthoritativePatches);
+      deferredChanged = true;
+    }
+    return deferredAuthoritativePatches as Map<
+      string,
+      DeferredAuthoritativePatch
+    >;
+  };
+
+  for (const incoming of messages) {
+    if (state.hidden.has(incoming.id)) {
       continue;
     }
-    if (mode === 'patch-known' && !state.confirmed.has(message.id)) {
+    const current = state.confirmed.get(incoming.id);
+    if (mode === 'patch-known' && current === undefined) {
+      const retained = retainDeferredFullMessage(
+        deferredAuthoritativePatches.get(incoming.id),
+        incoming,
+        _requestVersion === undefined,
+      );
+      if (retained !== null) {
+        mutableDeferredPatches().set(incoming.id, retained);
+      }
       continue;
     }
 
-    const current = state.confirmed.get(message.id);
+    let message = incoming;
+    let live = _requestVersion === undefined;
+    const deferred = deferredAuthoritativePatches.get(message.id);
+    if (current === undefined && deferred !== undefined) {
+      const materialized = materializeDeferredPatch(message, deferred);
+      message = materialized.message;
+      live = live || materialized.live;
+      mutableDeferredPatches().delete(message.id);
+    }
     if (
       current !== undefined &&
-      (message.change_sequence <= current.change_sequence ||
-        (current.is_deleted_for_everyone &&
-          !message.is_deleted_for_everyone))
+      !shouldReplaceFullMessage(current, message)
     ) {
       continue;
     }
-    eligible.set(message.id, message);
+    eligible.set(message.id, { message, live });
   }
 
   if (eligible.size === 0) {
-    return state;
+    return deferredChanged
+      ? {
+          ...state,
+          version: state.version + 1,
+          deferredAuthoritativePatches,
+        }
+      : state;
   }
 
   const nextVersion = state.version + 1;
@@ -287,22 +515,36 @@ function mergeMessages(
   const failedByClientId = new Map(state.failedByClientId);
   const reactionBase = new Map(state.reactionBase);
   const reactionOverlays = new Map(state.reactionOverlays);
+  const aiDraftOverlays = new Map(state.aiDraftOverlays);
   const pendingReactionMessageIds = new Set(
     state.pendingReactionMessageIds,
   );
 
-  for (const message of eligible.values()) {
+  for (const { message, live } of eligible.values()) {
     confirmed.set(message.id, message);
     messageVersions.set(message.id, nextVersion);
     reactionBase.set(message.id, message.reactions);
     reactionBaseVersions.set(message.id, nextVersion);
-    if (_requestVersion === undefined) {
+    if (live) {
       reactionLiveVersions.set(message.id, nextVersion);
     }
 
     if (message.is_deleted_for_everyone) {
       reactionOverlays.delete(message.id);
       pendingReactionMessageIds.delete(message.id);
+    }
+
+    const messageDraftOverlays = aiDraftOverlays.get(message.id);
+    if (messageDraftOverlays !== undefined) {
+      const reconciled = reconcileAIDraftOverlaysForFullMessage(
+        messageDraftOverlays,
+        message,
+      );
+      if (reconciled === null) {
+        aiDraftOverlays.delete(message.id);
+      } else {
+        aiDraftOverlays.set(message.id, reconciled);
+      }
     }
 
     const cid = message.client_message_id;
@@ -329,6 +571,8 @@ function mergeMessages(
     failedByClientId,
     reactionBase,
     reactionOverlays,
+    aiDraftOverlays,
+    deferredAuthoritativePatches,
     pendingReactionMessageIds,
   };
 }
@@ -461,7 +705,18 @@ export function transcriptReducer(
 
   switch (action.type) {
     case 'INIT_START':
-      return { ...state, roomStatus: 'loading', roomError: null };
+      if (state.isLoadingInitial) {
+        return state;
+      }
+      if (state.terminalLocked) {
+        return { ...state, isLoadingInitial: true, roomError: null };
+      }
+      return {
+        ...state,
+        roomStatus: 'loading',
+        roomError: null,
+        isLoadingInitial: true,
+      };
 
     case 'INIT_RESOLVED': {
       const merged = mergeMessages(
@@ -474,15 +729,32 @@ export function transcriptReducer(
         ...merged,
         roomStatus: 'ready',
         roomError: null,
+        isLoadingInitial: false,
         nextOlderCursor: action.nextCursor,
         hasMoreOlder: action.nextCursor !== null,
       };
     }
 
     case 'INIT_FAILED':
-      return { ...state, roomStatus: 'error', roomError: action.error };
+      if (state.terminalLocked) {
+        return {
+          ...state,
+          roomStatus: 'ready',
+          roomError: action.error,
+          isLoadingInitial: false,
+        };
+      }
+      return {
+        ...state,
+        roomStatus: 'error',
+        roomError: action.error,
+        isLoadingInitial: false,
+      };
 
     case 'OLDER_START':
+      if (state.isLoadingOlder) {
+        return state;
+      }
       return {
         ...state,
         isLoadingOlder: true,
@@ -528,10 +800,82 @@ export function transcriptReducer(
         action.requestVersion,
       );
 
-    case 'REACTION_PATCH': {
+    case 'AI_DRAFT_LOCAL_SNAPSHOT': {
       const message = state.confirmed.get(action.messageId);
       if (
         message === undefined ||
+        message.sender_kind !== 'AI' ||
+        message.is_deleted_for_everyone ||
+        state.hidden.has(action.messageId) ||
+        action.draft.id !== action.draftId
+      ) {
+        return state;
+      }
+
+      const messageOverlays = state.aiDraftOverlays.get(action.messageId);
+      const currentOverlay = messageOverlays?.get(action.draftId);
+      const currentDraft =
+        currentOverlay?.draft ?? parsedDraftById(message, action.draftId);
+      if (
+        currentDraft === null ||
+        aiActionDraftSourceIdentity(currentDraft) !==
+          action.expectedSourceIdentity
+      ) {
+        return state;
+      }
+
+      const nextVersion = state.version + 1;
+      const priorSourceIdentities = new Set(
+        currentOverlay?.priorSourceIdentities ?? [],
+      );
+      priorSourceIdentities.add(action.expectedSourceIdentity);
+      const nextMessageOverlays = new Map(messageOverlays ?? []);
+      nextMessageOverlays.set(action.draftId, {
+        draft: action.draft,
+        projectedIdentity: aiActionDraftSourceIdentity(action.draft),
+        priorSourceIdentities,
+        lastAuthoritativeSequence: message.change_sequence,
+      });
+      const aiDraftOverlays = new Map(state.aiDraftOverlays);
+      aiDraftOverlays.set(action.messageId, nextMessageOverlays);
+      const messageVersions = new Map(state.messageVersions);
+      messageVersions.set(action.messageId, nextVersion);
+      return {
+        ...state,
+        version: nextVersion,
+        messageVersions,
+        aiDraftOverlays,
+      };
+    }
+
+    case 'REACTION_PATCH': {
+      const message = state.confirmed.get(action.messageId);
+      if (message === undefined) {
+        if (state.hidden.has(action.messageId)) {
+          return state;
+        }
+        const retained = retainDeferredReaction(
+          state.deferredAuthoritativePatches.get(action.messageId),
+          {
+            reactions: action.reactions,
+            changeSequence: action.changeSequence,
+            updatedAt: action.updatedAt,
+          },
+        );
+        if (retained === null) {
+          return state;
+        }
+        const deferredAuthoritativePatches = new Map(
+          state.deferredAuthoritativePatches,
+        );
+        deferredAuthoritativePatches.set(action.messageId, retained);
+        return {
+          ...state,
+          version: state.version + 1,
+          deferredAuthoritativePatches,
+        };
+      }
+      if (
         message.is_deleted_for_everyone ||
         state.hidden.has(action.messageId) ||
         action.changeSequence <= message.change_sequence
@@ -674,6 +1018,10 @@ export function transcriptReducer(
       const hidden = new Set(state.hidden);
       const reactionBase = new Map(state.reactionBase);
       const reactionOverlays = new Map(state.reactionOverlays);
+      const aiDraftOverlays = new Map(state.aiDraftOverlays);
+      const deferredAuthoritativePatches = new Map(
+        state.deferredAuthoritativePatches,
+      );
       const pendingReactionMessageIds = new Set(
         state.pendingReactionMessageIds,
       );
@@ -687,6 +1035,8 @@ export function transcriptReducer(
         reactionLiveVersions.delete(messageId);
         reactionBase.delete(messageId);
         reactionOverlays.delete(messageId);
+        aiDraftOverlays.delete(messageId);
+        deferredAuthoritativePatches.delete(messageId);
         pendingReactionMessageIds.delete(messageId);
         pendingDeleteMessageIds.delete(messageId);
 
@@ -717,6 +1067,8 @@ export function transcriptReducer(
         hidden,
         reactionBase,
         reactionOverlays,
+        aiDraftOverlays,
+        deferredAuthoritativePatches,
         pendingReactionMessageIds,
         pendingDeleteMessageIds,
         mutationError: null,
@@ -735,6 +1087,7 @@ export function transcriptReducer(
     case 'TERMINAL_LOCK': {
       if (
         state.terminalLocked &&
+        state.roomStatus === 'ready' &&
         state.pending.size === 0 &&
         state.reactionOverlays.size === 0 &&
         state.pendingDeleteMessageIds.size === 0 &&
@@ -758,9 +1111,11 @@ export function transcriptReducer(
         failedClientIds: new Set(),
         failedByClientId: new Map(),
         reactionOverlays: new Map(),
+        roomStatus: 'ready',
         terminalLocked: true,
         pendingReactionMessageIds: new Set(),
         pendingDeleteMessageIds: new Set(),
+        olderLoadError: null,
         isHidingMessages: false,
         mutationError: null,
       };
@@ -779,6 +1134,7 @@ export function transcriptReducer(
       const hadBusyState =
         activeSendClientIds.length > 0 ||
         interruptedMutation ||
+        state.isLoadingInitial ||
         state.isLoadingOlder ||
         state.isGapFilling ||
         state.isUpdating;
@@ -815,6 +1171,7 @@ export function transcriptReducer(
         reactionOverlays: new Map(),
         pendingReactionMessageIds: new Set(),
         pendingDeleteMessageIds: new Set(),
+        isLoadingInitial: false,
         isLoadingOlder: false,
         isGapFilling: false,
         isUpdating: false,
@@ -910,6 +1267,7 @@ export function transcriptReducer(
       const reactionLiveVersions = new Map(state.reactionLiveVersions);
       const reactionBase = new Map(state.reactionBase);
       const reactionOverlays = new Map(state.reactionOverlays);
+      const aiDraftOverlays = new Map(state.aiDraftOverlays);
       const pendingReactionMessageIds = new Set(
         state.pendingReactionMessageIds,
       );
@@ -927,6 +1285,9 @@ export function transcriptReducer(
       reactionLiveVersions.delete(message.id);
       reactionBase.set(message.id, authoritative.reactions);
       reactionOverlays.delete(message.id);
+      if (authoritative.is_deleted_for_everyone) {
+        aiDraftOverlays.delete(message.id);
+      }
       pendingReactionMessageIds.delete(message.id);
       pendingDeleteMessageIds.delete(message.id);
 
@@ -939,6 +1300,7 @@ export function transcriptReducer(
         reactionLiveVersions,
         reactionBase,
         reactionOverlays,
+        aiDraftOverlays,
         pendingReactionMessageIds,
         pendingDeleteMessageIds,
         mutationError: null,
@@ -1013,6 +1375,42 @@ function withEffectiveReactions(
   return message;
 }
 
+function withEffectiveAIDrafts(
+  state: TranscriptState,
+  message: ChatMessage,
+): ChatMessage {
+  const overlays = state.aiDraftOverlays.get(message.id);
+  if (
+    overlays === undefined ||
+    overlays.size === 0 ||
+    message.is_deleted_for_everyone
+  ) {
+    return message;
+  }
+
+  let changed = false;
+  const actionDrafts = message.action_drafts.map((candidate) => {
+    const parsed = parseAIActionDraft(candidate);
+    if (parsed === null) {
+      return candidate;
+    }
+    const overlay = overlays.get(parsed.id);
+    if (overlay === undefined) {
+      return candidate;
+    }
+    changed = true;
+    return overlay.draft;
+  });
+  return changed ? { ...message, action_drafts: actionDrafts } : message;
+}
+
+function withEffectiveMessage(
+  state: TranscriptState,
+  message: ChatMessage,
+): ChatMessage {
+  return withEffectiveAIDrafts(state, withEffectiveReactions(state, message));
+}
+
 /** Confirmed and optimistic messages ordered by `(created_at, id)` ascending. */
 export function selectTranscriptMessages(
   state: TranscriptState,
@@ -1024,7 +1422,7 @@ export function selectTranscriptMessages(
     if (state.hidden.has(message.id)) {
       continue;
     }
-    messages.push(withEffectiveReactions(state, message));
+    messages.push(withEffectiveMessage(state, message));
     if (message.client_message_id !== null) {
       confirmedClientIds.add(message.client_message_id);
     }
@@ -1049,7 +1447,7 @@ export function selectMessageById(
 ): ChatMessage | null {
   const confirmed = state.confirmed.get(id);
   if (confirmed !== undefined && !state.hidden.has(id)) {
-    return withEffectiveReactions(state, confirmed);
+    return withEffectiveMessage(state, confirmed);
   }
   for (const message of state.pending.values()) {
     if (message.id === id && !state.hidden.has(id)) {

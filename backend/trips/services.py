@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone as dt_timezone
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone as dt_timezone
+from decimal import Decimal
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from django.contrib.auth import get_user_model
@@ -8,6 +11,7 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Count, Prefetch, Q, Subquery
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime, parse_time
 from rest_framework import serializers as drf_serializers
 
 from friends.models import Friendship
@@ -931,13 +935,6 @@ def delete_section(trip_id, section_id, *, actor) -> None:
 
 # -------- Activity mutations --------
 
-def _assert_active_member(trip, user_id):
-    if not TripMember.objects.filter(
-        trip=trip, user_id=user_id, status=MemberStatus.ACTIVE
-    ).exists():
-        raise TimelineInvalidAssigneeError("Assignee must be an active member of this trip.")
-
-
 def _clear_activity_assignees_for_user(*, trip: Trip, user_id, updated_by) -> None:
     TimelineActivity.objects.filter(
         trip=trip,
@@ -1111,33 +1108,23 @@ def create_timeline_activity(trip_id, section_id, *, actor, data: dict) -> Timel
         except TimelineSection.DoesNotExist:
             raise TimelineSectionNotFoundError("Section not found.")
 
-        _apply_activity_create_invariants(data)
-
-        custom_type = None
-        if data.get("custom_type_id") is not None:
-            custom_type = _resolve_custom_type(trip, data["custom_type_id"])
-
-        assignee_scope = data.get(
-            "assignee_scope",
-            TimelineActivityAssigneeScope.USER
-            if data.get("assignee_user_id") is not None
-            else TimelineActivityAssigneeScope.NONE,
+        plan = plan_timeline_activity_create(
+            trip=trip,
+            section=section,
+            section_id=section.id,
+            data=data,
         )
+        data = plan.apply_data
+        custom_type = plan.final_custom_type
+        assignee_scope = data["assignee_scope"]
         assignee_user_id = (
-            data.get("assignee_user_id")
-            if assignee_scope == TimelineActivityAssigneeScope.USER
+            plan.final_assignee_user.id
+            if plan.final_assignee_user is not None
             else None
         )
 
-        if assignee_user_id is not None:
-            _assert_active_member(trip, assignee_user_id)
-
         place = data.get("place") or {}
         location_mode = data.get("location_mode", TimelineLocationMode.MANUAL)
-        _validate_activity_reminder_offsets_allowed(
-            data["time_mode"],
-            data.get("reminder_offsets_minutes"),
-        )
 
         activity = TimelineActivity.objects.create(
             trip=trip,
@@ -1205,69 +1192,569 @@ def _validate_activity_final_invariants(
     _validate_activity_location(location_mode, place)
 
 
-def _apply_activity_create_invariants(data: dict) -> None:
-    """Validate service-level create invariants before persistence."""
-    _validate_activity_final_invariants(
-        time_mode=data.get("time_mode"),
-        start_time=data.get("start_time"),
-        end_time=data.get("end_time"),
-        system_type=data.get("system_type", ""),
-        custom_type_id=data.get("custom_type_id"),
-        location_mode=data.get("location_mode", TimelineLocationMode.MANUAL),
-        place=data.get("place"),
-        reminder_offsets=data.get("reminder_offsets_minutes", []),
+_LEGACY_TIMELINE_SYSTEM_TYPES = {
+    "DINING": "FOOD",
+    "TRANSPORT": "TRANSPORTATION",
+    "NIGHTLIFE": "OTHER",
+}
+
+_LEGACY_TIMELINE_TIME_MODES = {
+    "ANCHOR": "AT_TIME",
+}
+
+_LEGACY_TIMELINE_ASSIGNEE_SCOPES = {
+    "GROUP": "EVERYONE",
+}
+
+
+@dataclass(frozen=True)
+class TimelineActivityCreateReferences:
+    """Trip-scoped references resolved without writing timeline state."""
+
+    section: TimelineSection | None
+    custom_type: TimelineCustomType | None
+    assignee_user: object | None
+
+
+@dataclass(frozen=True)
+class TimelineActivityCreatePlan:
+    """Pure, executable create plan shared by AI review and the service."""
+
+    data: dict
+    apply_data: dict
+    final_data: dict
+    section: TimelineSection | None
+    final_custom_type: TimelineCustomType | None
+    final_assignee_user: object | None
+
+
+@dataclass(frozen=True)
+class TimelineActivityPatchPlan:
+    """Pure, validated plan shared by AI review and the mutation service."""
+
+    data: dict
+    apply_data: dict
+    final_data: dict
+    final_time_mode: str
+    final_start_time: object
+    final_end_time: object
+    final_custom_type: TimelineCustomType | None
+    final_assignee_user: object | None
+    final_location_mode: str
+    final_place: dict | None
+    final_reminder_offsets: list[int]
+
+
+def _normalize_timeline_patch_clock(value):
+    if value is None or isinstance(value, time):
+        return value
+    if isinstance(value, datetime):
+        return value.time().replace(tzinfo=None, microsecond=0)
+    if not isinstance(value, str):
+        return value
+    parsed_datetime = parse_datetime(value)
+    if parsed_datetime is not None:
+        return parsed_datetime.time().replace(tzinfo=None, microsecond=0)
+    parsed = parse_time(value)
+    return parsed.replace(tzinfo=None, microsecond=0) if parsed is not None else value
+
+
+def normalize_timeline_activity_input(data: dict) -> dict:
+    """Normalize legacy timeline values before schema or domain validation."""
+    normalized = dict(data)
+    system_type = normalized.get("system_type")
+    if system_type in _LEGACY_TIMELINE_SYSTEM_TYPES:
+        normalized["system_type"] = _LEGACY_TIMELINE_SYSTEM_TYPES[system_type]
+    time_mode = normalized.get("time_mode")
+    if time_mode in _LEGACY_TIMELINE_TIME_MODES:
+        normalized["time_mode"] = _LEGACY_TIMELINE_TIME_MODES[time_mode]
+    assignee_scope = normalized.get("assignee_scope")
+    if assignee_scope in _LEGACY_TIMELINE_ASSIGNEE_SCOPES:
+        normalized["assignee_scope"] = _LEGACY_TIMELINE_ASSIGNEE_SCOPES[
+            assignee_scope
+        ]
+    for field in ("start_time", "end_time"):
+        if field in normalized:
+            normalized[field] = _normalize_timeline_patch_clock(normalized[field])
+    return normalized
+
+
+def timeline_json_value(value):
+    """Convert normalized timeline values into JSON-safe canonical values."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, time):
+        return value.replace(tzinfo=None, microsecond=0).isoformat()
+    if isinstance(value, (Decimal, UUID)):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: timeline_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [timeline_json_value(item) for item in value]
+    return value
+
+
+def _activity_structured_place(activity: TimelineActivity) -> dict | None:
+    if (
+        activity.location_mode != TimelineLocationMode.STRUCTURED
+        or not activity.place_provider_id
+    ):
+        return None
+    return {
+        "provider": activity.place_provider,
+        "provider_id": activity.place_provider_id,
+        "title": activity.place_title,
+        "address": activity.place_address,
+        "lat": activity.place_lat,
+        "lng": activity.place_lng,
+    }
+
+
+def _timeline_assignee_label(user) -> str:
+    return user.display_name or user.identify_tag or "Trip member"
+
+
+def resolve_timeline_activity_create_references(
+    *,
+    trip: Trip,
+    data: dict,
+    section_id=None,
+    section: TimelineSection | None = None,
+    lock_section: bool = False,
+    require_section: bool = True,
+) -> TimelineActivityCreateReferences:
+    """Resolve only allowlisted create references inside the locked trip.
+
+    This function performs no writes and intentionally returns domain objects,
+    never provider-supplied identifiers or cross-trip metadata.
+    """
+    resolved_section = section
+    if resolved_section is not None:
+        if resolved_section.trip_id != trip.id or (
+            section_id is not None
+            and str(resolved_section.id) != str(section_id)
+        ):
+            raise TimelineSectionNotFoundError("Section not found.")
+    elif section_id is not None:
+        section_queryset = TimelineSection.objects
+        if lock_section:
+            section_queryset = section_queryset.select_for_update(of=("self",))
+        try:
+            resolved_section = section_queryset.get(pk=section_id, trip=trip)
+        except (
+            TimelineSection.DoesNotExist,
+            ValidationError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise TimelineSectionNotFoundError("Section not found.") from exc
+    elif require_section:
+        raise TimelineSectionNotFoundError("Section not found.")
+
+    custom_type = None
+    custom_type_id = data.get("custom_type_id")
+    if custom_type_id is not None:
+        try:
+            custom_type = _resolve_custom_type(
+                trip,
+                custom_type_id,
+                require_active=True,
+            )
+        except TimelineInvalidCustomTypeError:
+            raise
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise TimelineInvalidCustomTypeError(
+                "Custom type does not belong to this trip."
+            ) from exc
+
+    assignee_user = None
+    assignee_user_id = data.get("assignee_user_id")
+    assignee_scope = data.get("assignee_scope")
+    if assignee_scope is None and assignee_user_id is not None:
+        assignee_scope = TimelineActivityAssigneeScope.USER
+    if (
+        assignee_scope == TimelineActivityAssigneeScope.USER
+        and assignee_user_id is not None
+    ):
+        try:
+            membership = (
+                TripMember.objects.select_related("user")
+                .filter(
+                    trip=trip,
+                    user_id=assignee_user_id,
+                    status=MemberStatus.ACTIVE,
+                )
+                .first()
+            )
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise TimelineInvalidAssigneeError(
+                "Assignee must be an active member of this trip."
+            ) from exc
+        if membership is None:
+            raise TimelineInvalidAssigneeError(
+                "Assignee must be an active member of this trip."
+            )
+        assignee_user = membership.user
+
+    return TimelineActivityCreateReferences(
+        section=resolved_section,
+        custom_type=custom_type,
+        assignee_user=assignee_user,
     )
 
 
-def _apply_activity_patch_invariants(activity: TimelineActivity, data: dict) -> None:
-    """Validate that the merged final state still satisfies cross-field invariants."""
-    final_time_mode = data.get("time_mode", activity.time_mode)
+def plan_timeline_activity_create(
+    *,
+    trip: Trip,
+    data: dict,
+    section_id=None,
+    section: TimelineSection | None = None,
+    lock_section: bool = False,
+    require_section: bool = True,
+) -> TimelineActivityCreatePlan:
+    """Return the canonical create payload and authoritative review state.
+
+    The function performs no writes. A mutation caller must hold the Trip lock;
+    confirmation callers may additionally request a section row lock.
+    """
+    from trips.serializers import CreateTimelineActivitySerializer
+
+    if not isinstance(data, dict):
+        raise drf_serializers.ValidationError(
+            {"data": "Activity data must be an object."}
+        )
+
+    normalized = normalize_timeline_activity_input(data)
+    explicit_fields = set(normalized)
+    serializer = CreateTimelineActivitySerializer(data=normalized)
+    serializer.is_valid(raise_exception=True)
+    apply_data = dict(serializer.validated_data)
+    references = resolve_timeline_activity_create_references(
+        trip=trip,
+        data=apply_data,
+        section_id=section_id,
+        section=section,
+        lock_section=lock_section,
+        require_section=require_section,
+    )
+
+    custom_type = references.custom_type
+    assignee_user = references.assignee_user
+    time_mode = apply_data["time_mode"]
+    location_mode = apply_data.get(
+        "location_mode",
+        TimelineLocationMode.MANUAL,
+    )
+    place = (
+        apply_data.get("place")
+        if location_mode == TimelineLocationMode.STRUCTURED
+        else None
+    )
+    reminder_offsets = list(apply_data.get("reminder_offsets_minutes", []))
+    system_type = (
+        "" if custom_type is not None else apply_data.get("system_type", "")
+    )
+    _validate_activity_final_invariants(
+        time_mode=time_mode,
+        start_time=apply_data.get("start_time"),
+        end_time=apply_data.get("end_time"),
+        system_type=system_type,
+        custom_type_id=(custom_type.id if custom_type is not None else None),
+        location_mode=location_mode,
+        place=place,
+        reminder_offsets=reminder_offsets,
+    )
+
+    canonical_data = {
+        field: apply_data[field]
+        for field in explicit_fields
+        if field in apply_data
+    }
+    if (
+        "assignee_user_id" in explicit_fields
+        and "assignee_scope" not in explicit_fields
+    ):
+        canonical_data["assignee_scope"] = apply_data["assignee_scope"]
+
+    final_data = {
+        "title": apply_data["title"],
+        "system_type": system_type,
+        "custom_type_label": (
+            custom_type.name if custom_type is not None else None
+        ),
+        "time_mode": time_mode,
+        "start_time": apply_data.get("start_time"),
+        "end_time": apply_data.get("end_time"),
+        "assignee_scope": apply_data["assignee_scope"],
+        "assignee_label": (
+            _timeline_assignee_label(assignee_user)
+            if assignee_user is not None
+            else None
+        ),
+        "location_mode": location_mode,
+        "location_label": apply_data.get("location_label", ""),
+        "place": place,
+        "location_note": apply_data.get("location_note", ""),
+        "note": apply_data.get("note", ""),
+        "meeting_point": apply_data.get("meeting_point", ""),
+        "contact_name": apply_data.get("contact_name", ""),
+        "contact_phone": apply_data.get("contact_phone", ""),
+        "booking_reference": apply_data.get("booking_reference", ""),
+        "external_link": apply_data.get("external_link", ""),
+        "reminder_offsets_minutes": reminder_offsets,
+    }
+    return TimelineActivityCreatePlan(
+        data=timeline_json_value(canonical_data),
+        apply_data=apply_data,
+        final_data=final_data,
+        section=references.section,
+        final_custom_type=custom_type,
+        final_assignee_user=assignee_user,
+    )
+
+
+def plan_timeline_activity_patch(
+    *,
+    trip: Trip,
+    activity: TimelineActivity,
+    data: dict,
+) -> TimelineActivityPatchPlan:
+    """Return the exact executable patch and authoritative merged final state.
+
+    The function performs no writes. Callers that mutate must lock ``trip`` and
+    ``activity`` first, then execute ``apply_data`` from this plan.
+    """
+    from trips.serializers import PatchTimelineActivitySerializer
+
+    if activity.trip_id != trip.id:
+        raise TimelineActivityNotFoundError("Activity not found.")
+    if not isinstance(data, dict):
+        raise drf_serializers.ValidationError(
+            {"data": "Activity patch must be an object."}
+        )
+
+    normalized = normalize_timeline_activity_input(data)
+    explicit_fields = set(normalized)
+    serializer_input = dict(normalized)
+
+    if {"assignee_scope", "assignee_user_id"} & explicit_fields:
+        merged_assignee_scope = normalized.get(
+            "assignee_scope",
+            activity.assignee_scope,
+        )
+        serializer_input["assignee_scope"] = merged_assignee_scope
+        serializer_input["assignee_user_id"] = normalized.get(
+            "assignee_user_id",
+            (
+                activity.assignee_user_id
+                if merged_assignee_scope
+                == TimelineActivityAssigneeScope.USER
+                else None
+            ),
+        )
+
+    serializer = PatchTimelineActivitySerializer(data=serializer_input)
+    serializer.is_valid(raise_exception=True)
+    validated = serializer.validated_data
+    apply_data = {
+        field: validated[field]
+        for field in explicit_fields
+        if field in validated
+    }
+
+    if (
+        "system_type" in apply_data
+        and not apply_data["system_type"]
+        and apply_data.get("custom_type_id") is None
+    ):
+        raise drf_serializers.ValidationError(
+            {"system_type": "system_type cannot be empty."}
+        )
+    if (
+        apply_data.get("system_type")
+        and apply_data.get("custom_type_id") is not None
+    ):
+        raise drf_serializers.ValidationError(
+            {
+                "system_type": (
+                    "Provide exactly one of system_type or custom_type_id."
+                )
+            }
+        )
+
+    final_time_mode = apply_data.get("time_mode", activity.time_mode)
+    if "time_mode" in apply_data:
+        if final_time_mode in (
+            TimelineActivityTimeMode.ALL_DAY,
+            TimelineActivityTimeMode.FLEXIBLE,
+        ):
+            apply_data.setdefault("start_time", None)
+            apply_data.setdefault("end_time", None)
+            apply_data.setdefault("reminder_offsets_minutes", [])
+        elif final_time_mode == TimelineActivityTimeMode.AT_TIME:
+            apply_data.setdefault("end_time", None)
+
+    if apply_data.get("custom_type_id") is not None:
+        apply_data.setdefault("system_type", "")
+    elif apply_data.get("system_type"):
+        apply_data.setdefault("custom_type_id", None)
+
+    final_location_mode = apply_data.get(
+        "location_mode",
+        activity.location_mode,
+    )
+    if (
+        "location_mode" in apply_data
+        and final_location_mode == TimelineLocationMode.MANUAL
+    ):
+        apply_data.setdefault("place", None)
+
+    final_assignee_scope = apply_data.get(
+        "assignee_scope",
+        activity.assignee_scope,
+    )
+    if (
+        "assignee_scope" in apply_data
+        and final_assignee_scope != TimelineActivityAssigneeScope.USER
+    ):
+        apply_data.setdefault("assignee_user_id", None)
+
     if final_time_mode in (
         TimelineActivityTimeMode.ALL_DAY,
         TimelineActivityTimeMode.FLEXIBLE,
     ):
-        final_start = data["start_time"] if "start_time" in data else None
-        final_end = data["end_time"] if "end_time" in data else None
+        final_start_time = (
+            apply_data["start_time"] if "start_time" in apply_data else None
+        )
+        final_end_time = (
+            apply_data["end_time"] if "end_time" in apply_data else None
+        )
     else:
-        final_start = data["start_time"] if "start_time" in data else activity.start_time
-        final_end = data["end_time"] if "end_time" in data else activity.end_time
+        final_start_time = apply_data.get("start_time", activity.start_time)
+        final_end_time = apply_data.get("end_time", activity.end_time)
 
-    explicit_system_type = "system_type" in data
-    final_system_type = data.get("system_type", activity.system_type)
-    if "custom_type_id" in data:
-        final_custom_type_id = data["custom_type_id"]
+    explicit_system_type = "system_type" in apply_data
+    final_system_type = apply_data.get("system_type", activity.system_type)
+    if "custom_type_id" in apply_data:
+        custom_type_id = apply_data["custom_type_id"]
+        if custom_type_id is None:
+            final_custom_type = None
+        elif (
+            activity.custom_type_id is not None
+            and str(activity.custom_type_id) == str(custom_type_id)
+        ):
+            # Existing inactive types remain reusable on their current activity;
+            # only selecting a different inactive type is forbidden.
+            final_custom_type = activity.custom_type
+        else:
+            final_custom_type = _resolve_custom_type(
+                trip,
+                custom_type_id,
+                require_active=True,
+            )
     elif explicit_system_type and final_system_type:
-        final_custom_type_id = None
+        final_custom_type = None
     else:
-        final_custom_type_id = activity.custom_type_id
-    if final_custom_type_id is not None and not (explicit_system_type and final_system_type):
+        final_custom_type = activity.custom_type
+    if final_custom_type is not None and not (
+        explicit_system_type and final_system_type
+    ):
         final_system_type = ""
 
-    final_location_mode = data.get("location_mode", activity.location_mode)
-    if final_location_mode == TimelineLocationMode.MANUAL:
-        # Switching to or staying in MANUAL implicitly clears any existing place.
-        final_place = data.get("place")
-    elif "place" in data:
-        final_place = data["place"]
+    if final_assignee_scope == TimelineActivityAssigneeScope.USER:
+        final_assignee_user_id = apply_data.get(
+            "assignee_user_id",
+            activity.assignee_user_id,
+        )
+        membership = (
+            TripMember.objects.select_related("user")
+            .filter(
+                trip=trip,
+                user_id=final_assignee_user_id,
+                status=MemberStatus.ACTIVE,
+            )
+            .first()
+        )
+        if membership is None:
+            raise TimelineInvalidAssigneeError(
+                "Assignee must be an active member of this trip."
+            )
+        final_assignee_user = membership.user
     else:
-        if activity.place_provider_id:
-            final_place = {
-                "provider": activity.place_provider,
-                "provider_id": activity.place_provider_id,
-                "title": activity.place_title,
-            }
-        else:
-            final_place = None
+        final_assignee_user_id = None
+        final_assignee_user = None
+
+    if final_location_mode == TimelineLocationMode.MANUAL:
+        final_place = apply_data.get("place")
+    elif "place" in apply_data:
+        final_place = apply_data["place"]
+    else:
+        final_place = _activity_structured_place(activity)
+
+    final_reminder_offsets = (
+        list(apply_data["reminder_offsets_minutes"])
+        if "reminder_offsets_minutes" in apply_data
+        else _configured_reminder_offsets(activity)
+    )
 
     _validate_activity_final_invariants(
         time_mode=final_time_mode,
-        start_time=final_start,
-        end_time=final_end,
+        start_time=final_start_time,
+        end_time=final_end_time,
         system_type=final_system_type,
-        custom_type_id=final_custom_type_id,
+        custom_type_id=(
+            final_custom_type.id if final_custom_type is not None else None
+        ),
         location_mode=final_location_mode,
         place=final_place,
-        reminder_offsets=data.get("reminder_offsets_minutes"),
+        reminder_offsets=final_reminder_offsets,
+    )
+
+    final_data = {
+        "title": apply_data.get("title", activity.title),
+        "system_type": final_system_type,
+        "custom_type_label": (
+            final_custom_type.name if final_custom_type is not None else None
+        ),
+        "time_mode": final_time_mode,
+        "start_time": final_start_time,
+        "end_time": final_end_time,
+        "assignee_scope": final_assignee_scope,
+        "assignee_label": (
+            _timeline_assignee_label(final_assignee_user)
+            if final_assignee_user is not None
+            else None
+        ),
+        "location_mode": final_location_mode,
+        "location_label": apply_data.get(
+            "location_label",
+            activity.location_label,
+        ),
+        "place": final_place,
+        "location_note": apply_data.get("location_note", activity.location_note),
+        "note": apply_data.get("note", activity.note),
+        "meeting_point": apply_data.get("meeting_point", activity.meeting_point),
+        "contact_name": apply_data.get("contact_name", activity.contact_name),
+        "contact_phone": apply_data.get("contact_phone", activity.contact_phone),
+        "booking_reference": apply_data.get(
+            "booking_reference",
+            activity.booking_reference,
+        ),
+        "external_link": apply_data.get("external_link", activity.external_link),
+        "reminder_offsets_minutes": final_reminder_offsets,
+    }
+    return TimelineActivityPatchPlan(
+        data=timeline_json_value(apply_data),
+        apply_data=apply_data,
+        final_data=final_data,
+        final_time_mode=final_time_mode,
+        final_start_time=final_start_time,
+        final_end_time=final_end_time,
+        final_custom_type=final_custom_type,
+        final_assignee_user=final_assignee_user,
+        final_location_mode=final_location_mode,
+        final_place=final_place,
+        final_reminder_offsets=final_reminder_offsets,
     )
 
 
@@ -1281,26 +1768,21 @@ def patch_timeline_activity(trip_id, activity_id, *, actor, data: dict) -> Timel
         except TimelineActivity.DoesNotExist:
             raise TimelineActivityNotFoundError("Activity not found.")
 
-        existing_offsets = _configured_reminder_offsets(activity)
+        plan = plan_timeline_activity_patch(
+            trip=trip,
+            activity=activity,
+            data=data,
+        )
+        data = plan.apply_data
         should_regenerate_reminders = bool(
             {"time_mode", "start_time", "reminder_offsets_minutes"} & set(data.keys())
         )
-
-        try:
-            _apply_activity_patch_invariants(activity, data)
-        except drf_serializers.ValidationError:
-            raise
 
         if "custom_type_id" in data:
             if data["custom_type_id"] is None:
                 activity.custom_type = None
             else:
-                preserves_existing_custom_type = (
-                    activity.custom_type_id is not None
-                    and str(activity.custom_type_id) == str(data["custom_type_id"])
-                )
-                if not preserves_existing_custom_type:
-                    activity.custom_type = _resolve_custom_type(trip, data["custom_type_id"])
+                activity.custom_type = plan.final_custom_type
                 activity.system_type = ""
 
         if "system_type" in data:
@@ -1313,9 +1795,7 @@ def patch_timeline_activity(trip_id, activity_id, *, actor, data: dict) -> Timel
         if "assignee_scope" in data or "assignee_user_id" in data:
             assignee_scope = data.get("assignee_scope", activity.assignee_scope)
             if assignee_scope == TimelineActivityAssigneeScope.USER:
-                assignee_user_id = data.get("assignee_user_id", activity.assignee_user_id)
-                _assert_active_member(trip, assignee_user_id)
-                activity.assignee_user_id = assignee_user_id
+                activity.assignee_user = plan.final_assignee_user
             else:
                 activity.assignee_user_id = None
             activity.assignee_scope = assignee_scope
@@ -1365,8 +1845,10 @@ def patch_timeline_activity(trip_id, activity_id, *, actor, data: dict) -> Timel
         activity.updated_by = actor
         activity.save()
         if should_regenerate_reminders:
-            offsets = data.get("reminder_offsets_minutes", existing_offsets)
-            replace_unsent_activity_reminders(activity, offsets)
+            replace_unsent_activity_reminders(
+                activity,
+                plan.final_reminder_offsets,
+            )
     return activity
 
 

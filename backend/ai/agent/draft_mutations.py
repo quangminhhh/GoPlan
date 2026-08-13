@@ -4,20 +4,26 @@ from django.db import transaction
 from django.utils import timezone
 
 from ai.action_types import (
+    AI_ACTION_EXPENSE_CREATE,
     AI_ACTION_TIMELINE_ACTIVITY_CREATE,
     AI_ACTION_TIMELINE_ACTIVITY_UPDATE,
 )
-from ai.agent.display import build_display
 from ai.agent.draft_fields import (
     build_missing_fields_for_action,
     normalize_missing_fields,
     normalize_missing_field_names,
+)
+from ai.agent.draft_presentation import build_action_draft_presentation
+from ai.agent.timeline_draft_validation import (
+    plan_timeline_create_draft,
+    plan_timeline_update_draft,
 )
 from ai.agent.drafts import (
     can_cancel_action_draft,
     can_edit_action_draft,
 )
 from ai.agent.draft_validation import (
+    AIActionDraftFieldValidationError,
     validate_action_draft_patch_payload,
     validate_action_draft_patch_shape,
 )
@@ -40,7 +46,8 @@ from ai.chat_changes import (
     mark_ai_response_message_changed,
 )
 from ai.models import AIActionDraft, AIActionDraftStatus
-from trips.models import Trip, TripMember
+from trips.models import Trip, TripMember, TripStatus
+from trips.services import TripTerminalError
 
 
 class AIActionDraftPatchFieldNotAllowedError(Exception):
@@ -79,19 +86,32 @@ def _apply_draft_patch_payload(draft: AIActionDraft, patch_payload: dict) -> dic
         AI_ACTION_TIMELINE_ACTIVITY_UPDATE,
     }:
         existing_data = next_payload.get("data")
-        data = dict(existing_data) if isinstance(existing_data, dict) else {}
+        legacy_data = {
+            key: next_payload.pop(key)
+            for key in tuple(next_payload)
+            if key in TIMELINE_ACTIVITY_DATA_FIELDS
+        }
+        data = {
+            **legacy_data,
+            **(dict(existing_data) if isinstance(existing_data, dict) else {}),
+        }
         data_overridden = False
         for key, value in patch_payload.items():
             if key == "data":
-                if isinstance(value, dict):
-                    data.update(value)
-                else:
-                    next_payload["data"] = value
-                    data_overridden = True
-            elif key in TIMELINE_ACTIVITY_DATA_FIELDS:
+                continue
+            if key in TIMELINE_ACTIVITY_DATA_FIELDS:
                 data[key] = value
             else:
                 next_payload[key] = value
+        if "data" in patch_payload:
+            nested_patch = patch_payload["data"]
+            if isinstance(nested_patch, dict):
+                # The canonical wrapper wins when a legacy client submits both
+                # representations, independent of JSON object key order.
+                data.update(nested_patch)
+            else:
+                next_payload["data"] = nested_patch
+                data_overridden = True
         if not data_overridden:
             next_payload["data"] = data
         return next_payload
@@ -127,7 +147,12 @@ def _disallowed_patch_fields(draft: AIActionDraft, patch_payload: dict) -> list[
     )
 
 
-def _refresh_missing_fields(draft: AIActionDraft, payload: dict) -> list[dict]:
+def _refresh_missing_fields(
+    draft: AIActionDraft,
+    payload: dict,
+    *,
+    currency_code: str,
+) -> list[dict]:
     current_missing_names = normalize_missing_field_names(
         draft.missing_fields,
         strict=False,
@@ -136,11 +161,13 @@ def _refresh_missing_fields(draft: AIActionDraft, payload: dict) -> list[dict]:
         action_type=draft.action_type,
         payload=payload,
         provider_missing_names=current_missing_names,
+        currency_code=currency_code,
     )
     return build_missing_fields_for_action(
         action_type=draft.action_type,
         payload=payload,
         missing=missing_names,
+        trip_id=draft.trip_id,
     )
 
 
@@ -170,10 +197,27 @@ def _touch_response_message(*, draft: AIActionDraft, locked_trip: Trip) -> None:
     )
 
 
+def _ensure_locked_trip_allows_draft_mutation(locked_trip: Trip) -> None:
+    if locked_trip.status in {TripStatus.COMPLETED, TripStatus.CANCELLED}:
+        raise TripTerminalError("Completed or cancelled trips are read-only.")
+
+
 def _expire_draft(*, draft: AIActionDraft, locked_trip: Trip) -> None:
     draft.status = AIActionDraftStatus.EXPIRED
     draft.save(update_fields=["status", "updated_at"])
     _touch_response_message(draft=draft, locked_trip=locked_trip)
+
+
+def _timeline_activity_preconditions(activity) -> dict:
+    return {
+        "target": {
+            "type": "timeline_activity",
+            "id": str(activity.id),
+            "updated_at": activity.updated_at.isoformat(),
+            "title": activity.title,
+            "status": activity.status,
+        }
+    }
 
 
 def patch_action_draft(
@@ -190,6 +234,7 @@ def patch_action_draft(
             locked_trip=locked_trip,
             actor=actor,
         )
+        _ensure_locked_trip_allows_draft_mutation(locked_trip)
         draft = (
             AIActionDraft.objects.select_for_update(of=("self",))
             .select_related("response_message")
@@ -207,6 +252,7 @@ def patch_action_draft(
         validate_action_draft_patch_payload(
             draft=draft,
             patch_payload=patch_payload,
+            currency_code=locked_trip.currency_code,
             candidate_payload=next_payload,
         )
 
@@ -231,40 +277,111 @@ def patch_action_draft(
             if not patch_payload:
                 return draft
 
+            expense_currency_changed = (
+                draft.action_type == AI_ACTION_EXPENSE_CREATE
+                and next_payload.get("currency_code")
+                != locked_trip.currency_code
+            )
+            if draft.action_type == AI_ACTION_EXPENSE_CREATE:
+                # Expense persistence is trip-currency-only. A draft can wait
+                # for input while the trip currency changes, so restamp the
+                # locked authoritative value on every explicit edit.
+                next_payload["currency_code"] = locked_trip.currency_code
+
             if next_payload == draft.payload:
                 return draft
 
-            still_missing = _refresh_missing_fields(draft, next_payload)
-            try:
-                next_preconditions = (
-                    build_backend_preconditions(
-                        action_type=draft.action_type,
-                        trip_id=draft.trip_id,
-                        payload=next_payload,
-                        required=not still_missing,
-                    )
-                    if action_requires_stale_precondition(draft.action_type)
-                    else {}
+            timeline_create_result = plan_timeline_create_draft(
+                action_type=draft.action_type,
+                trip=locked_trip,
+                payload=next_payload,
+                lock_section=True,
+            )
+            patched_field_names = set(patch_payload)
+            nested_patch = patch_payload.get("data")
+            if isinstance(nested_patch, dict):
+                patched_field_names.update(nested_patch)
+            blocking_create_errors = {
+                field: message
+                for field, message
+                in timeline_create_result.blocking_field_errors.items()
+                if field in patched_field_names
+            }
+            if blocking_create_errors:
+                raise AIActionDraftFieldValidationError(
+                    blocking_create_errors
                 )
+            next_payload = timeline_create_result.payload
+
+            timeline_result = plan_timeline_update_draft(
+                action_type=draft.action_type,
+                trip=locked_trip,
+                payload=next_payload,
+                lock_target=True,
+            )
+            if timeline_result.field_errors:
+                raise AIActionDraftFieldValidationError(
+                    timeline_result.field_errors
+                )
+            next_payload = timeline_result.payload
+
+            still_missing = _refresh_missing_fields(
+                draft,
+                next_payload,
+                currency_code=locked_trip.currency_code,
+            )
+            existing_missing_names = set(
+                normalize_missing_field_names(still_missing, strict=False)
+            )
+            create_planner_missing = [
+                field
+                for field in timeline_create_result.field_errors
+                if field not in existing_missing_names
+            ]
+            if create_planner_missing:
+                still_missing.extend(
+                    build_missing_fields_for_action(
+                        action_type=draft.action_type,
+                        payload=next_payload,
+                        missing=create_planner_missing,
+                        trip_id=draft.trip_id,
+                    )
+                )
+            try:
+                if timeline_result.activity is not None:
+                    next_preconditions = _timeline_activity_preconditions(
+                        timeline_result.activity
+                    )
+                else:
+                    next_preconditions = (
+                        build_backend_preconditions(
+                            action_type=draft.action_type,
+                            trip_id=draft.trip_id,
+                            payload=next_payload,
+                            required=not still_missing,
+                        )
+                        if action_requires_stale_precondition(draft.action_type)
+                        else {}
+                    )
             except ValueError as exc:
                 raise AIActionDraftTargetNotFoundError(
                     "Draft target could not be resolved."
                 ) from exc
-            draft.payload = next_payload
-            draft.preview = _build_patch_preview(
+            next_preview, next_display = build_action_draft_presentation(
                 action_type=draft.action_type,
                 payload=next_payload,
-            )
-            if not still_missing:
-                trip_context = {
-                    "timezone": locked_trip.timezone,
-                    "currency_code": locked_trip.currency_code,
-                }
-                draft.display = build_display(
+                trip=locked_trip,
+                preview_base=_build_patch_preview(
                     action_type=draft.action_type,
                     payload=next_payload,
-                    trip_context=trip_context,
-                )
+                ),
+                timeline_plan=timeline_result.plan,
+                timeline_create_plan=timeline_create_result.plan,
+            )
+            draft.payload = next_payload
+            draft.preview = next_preview
+            if not still_missing or expense_currency_changed:
+                draft.display = next_display
             draft.missing_fields = still_missing
             draft.preconditions = next_preconditions
             if not still_missing:
@@ -302,6 +419,15 @@ def cancel_action_draft(*, draft_id, trip_id, actor) -> AIActionDraft:
             .get(pk=draft_id, trip_id=trip_id)
         )
 
+        if draft.status in {
+            AIActionDraftStatus.CONFIRMED,
+            AIActionDraftStatus.CANCELLED,
+            AIActionDraftStatus.EXPIRED,
+            AIActionDraftStatus.FAILED,
+        }:
+            return draft
+        _ensure_locked_trip_allows_draft_mutation(locked_trip)
+
         if (
             draft.status in {
                 AIActionDraftStatus.NEEDS_INFO,
@@ -311,13 +437,6 @@ def cancel_action_draft(*, draft_id, trip_id, actor) -> AIActionDraft:
         ):
             _expire_draft(draft=draft, locked_trip=locked_trip)
             expired = True
-        elif draft.status in {
-            AIActionDraftStatus.CONFIRMED,
-            AIActionDraftStatus.CANCELLED,
-            AIActionDraftStatus.EXPIRED,
-            AIActionDraftStatus.FAILED,
-        }:
-            return draft
         elif not can_cancel_action_draft(draft, viewer=actor):
             raise AIActionDraftForbiddenError("You cannot cancel this draft.")
         else:

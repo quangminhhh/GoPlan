@@ -8,6 +8,7 @@ from ai.agent.presets import presets_for
 MISSING_FIELD_DEFINITIONS = {
     "activity_id": {"label": "Activity"},
     "amount": {"label": "Amount", "type": "money"},
+    "assignee_user_id": {"label": "Assigned member"},
     "collector_id": {"label": "Collector", "type": "select"},
     "contributions": {"label": "Contributions", "type": "json"},
     "custom_type_id": {"label": "Custom activity type", "type": "select"},
@@ -120,6 +121,7 @@ def build_missing_fields_for_action(
     action_type: str,
     payload: dict,
     missing: Iterable[str],
+    trip_id=None,
 ) -> list[dict]:
     missing_names = list(dict.fromkeys(missing))
     if action_type != AI_ACTION_TIMELINE_ACTIVITY_CREATE:
@@ -131,16 +133,20 @@ def build_missing_fields_for_action(
         time_mode=str(data.get("time_mode") or ""),
         missing=missing_names,
         system_type=data.get("system_type"),
+        trip_id=trip_id,
     )
 
 
 # -------- Section Context Resolver --------
 
-def _resolve_section_context(section_id) -> dict:
+def _resolve_section_context(section_id, *, trip_id=None) -> dict:
     from trips.models import TimelineSection
 
     try:
-        section = TimelineSection.objects.select_related("trip").get(pk=section_id)
+        sections = TimelineSection.objects.select_related("trip")
+        if trip_id is not None:
+            sections = sections.filter(trip_id=trip_id)
+        section = sections.get(pk=section_id)
     except (TimelineSection.DoesNotExist, ValueError, TypeError):
         return {}
     sections = list(
@@ -167,6 +173,7 @@ def build_missing_fields_for_create_activity(
     time_mode: str,
     missing: list[str],
     system_type: str | None = None,
+    trip_id=None,
 ) -> list[dict]:
     """Build missing_fields list for a timeline.activity.create draft,
     pairing start_time/end_time into a synthetic time_range field with
@@ -176,7 +183,7 @@ def build_missing_fields_for_create_activity(
     fields: list[dict] = []
 
     if time_mode == "TIME_RANGE" and {"start_time", "end_time"} <= missing_set:
-        section_ctx = _resolve_section_context(section_id)
+        section_ctx = _resolve_section_context(section_id, trip_id=trip_id)
         fields.append({
             "name": "time_range",
             "label": "Time",

@@ -54,6 +54,15 @@ describe('ChatReactionBar', () => {
     const chip = screen.getByLabelText('Thumbs up, 2 reactions, you reacted');
     expect(chip.props.accessibilityState.selected).toBe(true);
     expect(chip.props.accessibilityHint).toBe('Removes your reaction');
+    expect(
+      screen.getByTestId('chat-reaction-icon-👍', { includeHiddenElements: true }),
+    ).toBeTruthy();
+    expect(
+      screen.getByTestId('chat-reaction-selected-👍', {
+        includeHiddenElements: true,
+      }),
+    ).toBeTruthy();
+    expect(screen.queryByText('👍')).toBeNull();
     await fireEvent.press(chip);
     expect(onToggle).toHaveBeenCalledWith('👍');
   });

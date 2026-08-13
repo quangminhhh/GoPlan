@@ -1,8 +1,15 @@
-import { Ionicons } from '@expo/vector-icons';
-import { type ComponentProps, memo, useCallback } from 'react';
+import { FontAwesome6, Ionicons } from '@expo/vector-icons';
+import {
+  type ComponentProps,
+  memo,
+  useCallback,
+  useEffect,
+  useRef,
+} from 'react';
 import {
   Alert,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -15,6 +22,7 @@ import {
   ALLOWED_REACTION_EMOJIS,
   type AllowedReactionEmoji,
 } from '../types';
+import { ChatReactionIcon } from './ChatReactionIcon';
 import { REACTION_ACCESSIBILITY_LABELS } from './ChatReactionBar';
 
 interface ChatMessageActionsModalProps {
@@ -26,6 +34,8 @@ interface ChatMessageActionsModalProps {
   canSelect: boolean;
   busy?: boolean;
   onClose: () => void;
+  onCloseWithoutFocus?: () => void;
+  onDismiss?: () => void;
   onReact: (emoji: AllowedReactionEmoji) => void;
   onHide: () => void;
   onDeleteForEveryone: () => void;
@@ -50,6 +60,9 @@ const ReactionOption = memo(function ReactionOption({
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={`React with ${REACTION_ACCESSIBILITY_LABELS[emoji].toLowerCase()}`}
+      accessibilityHint={
+        selected ? 'Removes your reaction' : 'Adds this reaction'
+      }
       accessibilityState={{ selected, disabled }}
       disabled={disabled}
       onPress={select}
@@ -61,7 +74,22 @@ const ReactionOption = memo(function ReactionOption({
       ]}
       testID={`chat-reaction-option-${emoji}`}
     >
-      <Text style={styles.reactionEmoji}>{emoji}</Text>
+      <ChatReactionIcon emoji={emoji} size={22} />
+      {selected ? (
+        <View
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+          style={styles.reactionSelectedBadge}
+          testID={`chat-reaction-option-selected-${emoji}`}
+        >
+          <FontAwesome6
+            color={colors.background}
+            name="check"
+            size={9}
+            solid
+          />
+        </View>
+      ) : null}
     </Pressable>
   );
 });
@@ -75,52 +103,145 @@ export function ChatMessageActionsModal({
   canSelect,
   busy = false,
   onClose,
+  onCloseWithoutFocus,
+  onDismiss,
   onReact,
   onHide,
   onDeleteForEveryone,
   onSelect,
 }: ChatMessageActionsModalProps) {
-  const selectReaction = useCallback(
-    (emoji: AllowedReactionEmoji) => {
-      onClose();
-      onReact(emoji);
-    },
-    [onClose, onReact],
+  const reactionSelectionLockedRef = useRef(false);
+  const dismissHandoffRef = useRef<(() => void) | null>(null);
+  const dismissHandoffTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const androidDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
   );
 
-  const confirmHide = useCallback(() => {
+  useEffect(() => {
+    if (!visible) {
+      reactionSelectionLockedRef.current = false;
+      return;
+    }
+    if (androidDismissTimerRef.current !== null) {
+      clearTimeout(androidDismissTimerRef.current);
+      androidDismissTimerRef.current = null;
+    }
+  }, [visible]);
+
+  useEffect(
+    () => () => {
+      if (dismissHandoffTimerRef.current !== null) {
+        clearTimeout(dismissHandoffTimerRef.current);
+        dismissHandoffTimerRef.current = null;
+      }
+      if (androidDismissTimerRef.current !== null) {
+        clearTimeout(androidDismissTimerRef.current);
+        androidDismissTimerRef.current = null;
+      }
+      dismissHandoffRef.current = null;
+    },
+    [],
+  );
+
+  const closeWithFocusRestore = useCallback(() => {
     onClose();
-    Alert.alert(
-      'Hide this message?',
-      'It will disappear only from your chat history. This cannot be undone.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Hide', style: 'destructive', onPress: onHide },
-      ],
+    if (
+      Platform.OS === 'android' &&
+      androidDismissTimerRef.current === null
+    ) {
+      // Android does not publish Modal.onDismiss. Wait until the visibility
+      // update has removed the native modal host before handing focus back.
+      androidDismissTimerRef.current = setTimeout(() => {
+        androidDismissTimerRef.current = null;
+        onDismiss?.();
+      }, 0);
+    }
+  }, [onClose, onDismiss]);
+
+  const selectReaction = useCallback(
+    (emoji: AllowedReactionEmoji) => {
+      if (!canReact || busy || reactionSelectionLockedRef.current) {
+        return;
+      }
+      reactionSelectionLockedRef.current = true;
+      closeWithFocusRestore();
+      onReact(emoji);
+    },
+    [busy, canReact, closeWithFocusRestore, onReact],
+  );
+
+  const closeWithDismissHandoff = useCallback(
+    (handoff: () => void) => {
+      if (Platform.OS === 'ios') {
+        dismissHandoffRef.current = handoff;
+      }
+      (onCloseWithoutFocus ?? onClose)();
+
+      // React Native only exposes Modal.onDismiss on iOS. Android must not
+      // wait for a callback that will never arrive.
+      if (Platform.OS !== 'ios') {
+        handoff();
+      }
+    },
+    [onClose, onCloseWithoutFocus],
+  );
+
+  const handleDismiss = useCallback(() => {
+    const handoff = dismissHandoffRef.current;
+    dismissHandoffRef.current = null;
+    onDismiss?.();
+    if (handoff) {
+      if (dismissHandoffTimerRef.current !== null) {
+        clearTimeout(dismissHandoffTimerRef.current);
+      }
+      // Fabric emits onDismiss immediately before completing its native focus
+      // restoration. Move the alert to the next task so VoiceOver stays on the
+      // confirmation instead of being pulled back to the old sheet trigger.
+      dismissHandoffTimerRef.current = setTimeout(() => {
+        dismissHandoffTimerRef.current = null;
+        handoff();
+      }, 0);
+    }
+  }, [onDismiss]);
+
+  const confirmHide = useCallback(() => {
+    closeWithDismissHandoff(
+      () => Alert.alert(
+        'Hide this message?',
+        'It will disappear only from your chat history. This cannot be undone.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Hide', style: 'destructive', onPress: onHide },
+        ],
+      ),
     );
-  }, [onClose, onHide]);
+  }, [closeWithDismissHandoff, onHide]);
 
   const confirmDeleteForEveryone = useCallback(() => {
-    onClose();
-    Alert.alert(
-      'Remove this message for everyone?',
-      'Its content will be replaced with a removal notice for every trip member.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Remove', style: 'destructive', onPress: onDeleteForEveryone },
-      ],
+    closeWithDismissHandoff(
+      () => Alert.alert(
+        'Remove this message for everyone?',
+        'Its content will be replaced with a removal notice for every trip member.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Remove', style: 'destructive', onPress: onDeleteForEveryone },
+        ],
+      ),
     );
-  }, [onClose, onDeleteForEveryone]);
+  }, [closeWithDismissHandoff, onDeleteForEveryone]);
 
   const startSelection = useCallback(() => {
-    onClose();
+    closeWithFocusRestore();
     onSelect();
-  }, [onClose, onSelect]);
+  }, [closeWithFocusRestore, onSelect]);
 
   return (
     <Modal
       animationType="slide"
-      onRequestClose={onClose}
+      onDismiss={handleDismiss}
+      onRequestClose={closeWithFocusRestore}
       presentationStyle="pageSheet"
       visible={visible}
     >
@@ -141,7 +262,7 @@ export function ChatMessageActionsModal({
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Close message actions"
-              onPress={onClose}
+              onPress={closeWithFocusRestore}
               style={({ pressed }) => [
                 styles.closeButton,
                 pressed ? styles.pressed : null,
@@ -288,6 +409,7 @@ const styles = StyleSheet.create({
     rowGap: spacing.xs,
   },
   reactionOption: {
+    position: 'relative',
     minWidth: 44,
     minHeight: 44,
     alignItems: 'center',
@@ -297,8 +419,23 @@ const styles = StyleSheet.create({
     borderRadius: radii.full,
     borderCurve: 'continuous',
   },
-  reactionOptionSelected: { backgroundColor: colors.primarySoft },
-  reactionEmoji: { ...typography.heading },
+  reactionOptionSelected: {
+    borderWidth: 2,
+    borderColor: colors.primary,
+    backgroundColor: colors.primarySoft,
+  },
+  reactionSelectedBadge: {
+    position: 'absolute',
+    right: -2,
+    bottom: -2,
+    width: 18,
+    height: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radii.full,
+    borderCurve: 'continuous',
+    backgroundColor: colors.primary,
+  },
   actions: {
     overflow: 'hidden',
     borderWidth: 1,

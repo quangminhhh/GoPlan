@@ -66,6 +66,8 @@ describe('RealtimeProvider', () => {
     });
 
     expect(transports).toHaveLength(1);
+    expect(transports[0]?.retryConnection()).toBe(true);
+    expect(manager.retryConnectionCalls).toBe(1);
     await waitFor(() => {
       expect(snapshots.at(-1)).toEqual({ status: 'connected', connectionEpoch: 1 });
     });

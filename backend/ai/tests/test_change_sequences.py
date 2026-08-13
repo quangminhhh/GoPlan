@@ -379,7 +379,11 @@ class AIActionDraftChangeSequenceTests(TestCase):
             response_message=self.response_message,
             user=self.user,
             status=AIActionDraftStatus.NEEDS_INFO,
-            payload={"title": "Lunch", "total_amount": "500000"},
+            payload={
+                "title": "Lunch",
+                "total_amount": "500000",
+                "currency_code": self.trip.currency_code,
+            },
             missing_fields=[
                 {"name": "total_amount", "label": "Amount", "type": "money"}
             ],
@@ -865,7 +869,8 @@ class AIActionDraftSequenceAccessTests(APITestCase):
         response = self.client.post(self.cancel_url, {}, format="json")
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.data["error_code"], "AI_DRAFT_NOT_FOUND")
+        self.assertEqual(response.data["error_code"], "TRIP_NOT_FOUND")
+        self.assertEqual(response.data["detail"], "Trip not found.")
         self.trip.refresh_from_db()
         self.response_message.refresh_from_db()
         self.draft.refresh_from_db()

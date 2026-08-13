@@ -9,6 +9,15 @@ import {
   View,
 } from 'react-native';
 import { colors, radii, spacing, typography } from '@/shared/theme/tokens';
+import {
+  GoPlanAIComposerIntent,
+  GoPlanAIMentionCommandMenu,
+} from '../ai/components/AIMention';
+import {
+  insertGoPlanAIMention,
+  parseGoPlanAIMention,
+  shouldOfferGoPlanAICommand,
+} from '../ai/mention';
 
 export const CHAT_MESSAGE_MAX_LENGTH = 2000;
 
@@ -37,7 +46,13 @@ export function ChatComposer({
   const [feedback, setFeedback] = useState<string | null>(null);
   const trimmedDraft = draft.trim();
   const busy = sending || localSending;
-  const canSend = !disabled && !busy && trimmedDraft.length > 0;
+  const parsedAIMention = parseGoPlanAIMention(draft);
+  const hasAIMention = parsedAIMention.hasMention;
+  const missingAIPrompt = hasAIMention && parsedAIMention.prompt.length === 0;
+  const canSend =
+    !disabled && !busy && trimmedDraft.length > 0 && !missingAIPrompt;
+  const showAIMentionMenu =
+    !disabled && !busy && shouldOfferGoPlanAICommand(draft);
 
   useEffect(() => {
     if (hidden) {
@@ -49,6 +64,20 @@ export function ChatComposer({
     setDraft(value);
     setFeedback(null);
   }, []);
+
+  const insertAIMention = useCallback(() => {
+    const inserted = insertGoPlanAIMention(draft).displayContent;
+    if (inserted.length > CHAT_MESSAGE_MAX_LENGTH) {
+      setFeedback(
+        'GoPlanAI mention cannot be inserted because this message would exceed 2,000 characters.',
+      );
+      inputRef.current?.focus();
+      return;
+    }
+    setDraft(inserted);
+    setFeedback(null);
+    inputRef.current?.focus();
+  }, [draft]);
 
   const submit = useCallback(async () => {
     if (!canSend || submittingRef.current) {
@@ -79,6 +108,12 @@ export function ChatComposer({
       style={[styles.shell, hidden ? styles.hidden : null]}
       testID="chat-composer"
     >
+      <GoPlanAIMentionCommandMenu
+        disabled={disabled || busy}
+        onSelect={insertAIMention}
+        open={showAIMentionMenu}
+      />
+      {hasAIMention ? <GoPlanAIComposerIntent /> : null}
       <View style={styles.composerRow}>
         <TextInput
           ref={inputRef}
@@ -131,6 +166,16 @@ export function ChatComposer({
           {feedback}
         </Text>
       ) : null}
+      {missingAIPrompt ? (
+        <Text
+          accessibilityLiveRegion="polite"
+          accessibilityRole="alert"
+          style={styles.promptHint}
+          testID="goplan-ai-prompt-hint"
+        >
+          Add a prompt for GoPlanAI before sending.
+        </Text>
+      ) : null}
     </View>
   );
 }
@@ -176,5 +221,6 @@ const styles = StyleSheet.create({
   sendButtonPressed: { backgroundColor: colors.primaryPressed },
   sendButtonDisabled: { opacity: 0.38 },
   feedback: { ...typography.caption, color: colors.danger },
+  promptHint: { ...typography.caption, color: colors.warning },
   hidden: { display: 'none' },
 });

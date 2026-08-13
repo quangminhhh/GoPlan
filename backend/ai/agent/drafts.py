@@ -4,9 +4,13 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.utils import timezone
 
 from ai.action_types import (
+    AI_ACTION_EXPENSE_CREATE,
+    AI_ACTION_TIMELINE_ACTIVITY_CREATE,
+    AI_ACTION_TIMELINE_ACTIVITY_UPDATE,
     AI_ACTION_SETTLEMENT_TRANSFER_CONFIRM_RECEIVED,
     AI_CONFIRMATION_CAPTAIN,
     AI_CONFIRMATION_TIMELINE_ACTIVITY_STATUS,
@@ -17,12 +21,17 @@ from ai.action_types import (
     TRANSFER_PAYER_ACTIONS,
     TRANSFER_RECIPIENT_ACTIONS,
 )
-from ai.agent.display import build_display
 from ai.agent.draft_fields import (
     build_missing_fields_for_action,
     normalize_missing_fields,
+    normalize_missing_field_names,
 )
+from ai.agent.draft_presentation import build_action_draft_presentation
 from ai.agent.payload_validation import missing_payload_field_names
+from ai.agent.timeline_draft_validation import (
+    plan_timeline_create_draft,
+    plan_timeline_update_draft,
+)
 from ai.models import AIActionDraft, AIActionDraftStatus
 from expenses.models import SettlementStatus, SettlementTransfer
 from trips.models import (
@@ -35,6 +44,7 @@ from trips.models import (
     TimelineLocationMode,
     TimelineSection,
     TimelineSystemType,
+    Trip,
     TripMember,
     TripRole,
     TripStatus,
@@ -82,55 +92,108 @@ def create_action_draft(
     """Persist a single AIActionDraft row from a tool handler."""
     from ai.lifecycle import summarize_draft  # avoid circular import at module level
 
-    if missing_fields is None:
-        missing_names = missing_payload_field_names(
+    with transaction.atomic():
+        # Keep the global AI/chat mutation order at Trip -> draft. The caller's
+        # Trip instance may be stale while a worker is preparing provider output.
+        locked_trip = Trip.objects.select_for_update().get(pk=trip.pk)
+        payload = dict(payload)
+        if action_type == AI_ACTION_EXPENSE_CREATE:
+            # Expense persistence is trip-currency-only. Resolve provider input
+            # before validation/display so confirmation restates the actual write.
+            payload["currency_code"] = locked_trip.currency_code
+
+        timeline_create_result = plan_timeline_create_draft(
             action_type=action_type,
+            trip=locked_trip,
             payload=payload,
+            lock_section=action_type == AI_ACTION_TIMELINE_ACTIVITY_CREATE,
         )
-        missing = build_missing_fields_for_action(
+        payload = timeline_create_result.payload
+        timeline_result = plan_timeline_update_draft(
             action_type=action_type,
+            trip=locked_trip,
             payload=payload,
-            missing=missing_names,
+            lock_target=action_type == AI_ACTION_TIMELINE_ACTIVITY_UPDATE,
         )
-    else:
-        missing = missing_fields
-    effective_status = status or (
-        AIActionDraftStatus.NEEDS_INFO if missing else AIActionDraftStatus.READY
-    )
-    expires_at = timezone.now() + timedelta(
-        seconds=settings.GOPLAN_AI_ACTION_DRAFT_TTL_SECONDS
-    )
-    trip_context = {
-        "timezone": trip.timezone,
-        "currency_code": trip.currency_code,
-    }
-    return AIActionDraft.objects.create(
-        trip=trip,
-        interaction=interaction,
-        response_message=response_message,
-        requested_by=interaction.requested_by,
-        action_type=action_type,
-        status=effective_status,
-        payload=payload,
-        preview=payload,
-        display=build_display(
+        payload = timeline_result.payload
+        timeline_field_errors = {
+            **timeline_create_result.field_errors,
+            **timeline_result.field_errors,
+        }
+
+        if missing_fields is None:
+            missing_names = missing_payload_field_names(
+                action_type=action_type,
+                payload=payload,
+                currency_code=locked_trip.currency_code,
+            )
+            missing_names = list(
+                dict.fromkeys(
+                    [*missing_names, *timeline_field_errors.keys()]
+                )
+            )
+            missing = build_missing_fields_for_action(
+                action_type=action_type,
+                payload=payload,
+                missing=missing_names,
+                trip_id=locked_trip.id,
+            )
+        else:
+            missing = list(missing_fields)
+            existing_missing_names = set(
+                normalize_missing_field_names(missing, strict=False)
+            )
+            planner_missing_names = [
+                name
+                for name in timeline_field_errors
+                if name not in existing_missing_names
+            ]
+            if planner_missing_names:
+                missing.extend(
+                    build_missing_fields_for_action(
+                        action_type=action_type,
+                        payload=payload,
+                        missing=planner_missing_names,
+                        trip_id=locked_trip.id,
+                    )
+                )
+        if missing and status in {None, AIActionDraftStatus.READY}:
+            effective_status = AIActionDraftStatus.NEEDS_INFO
+        else:
+            effective_status = status or AIActionDraftStatus.READY
+        expires_at = timezone.now() + timedelta(
+            seconds=settings.GOPLAN_AI_ACTION_DRAFT_TTL_SECONDS
+        )
+        preview, display = build_action_draft_presentation(
             action_type=action_type,
             payload=payload,
-            trip_context=trip_context,
-        ),
-        summary=summarize_draft(
+            trip=locked_trip,
+            timeline_plan=timeline_result.plan,
+            timeline_create_plan=timeline_create_result.plan,
+        )
+        return AIActionDraft.objects.create(
+            trip=locked_trip,
+            interaction=interaction,
+            response_message=response_message,
+            requested_by=interaction.requested_by,
             action_type=action_type,
-            payload=payload,
             status=effective_status,
-        ),
-        missing_fields=missing,
-        preconditions=preconditions or {},
-        required_confirmation=(
-            required_confirmation
-            or required_confirmation_for_action_type(action_type)
-        ),
-        expires_at=expires_at,
-    )
+            payload=payload,
+            preview=preview,
+            display=display,
+            summary=summarize_draft(
+                action_type=action_type,
+                payload=payload,
+                status=effective_status,
+            ),
+            missing_fields=missing,
+            preconditions=preconditions or {},
+            required_confirmation=(
+                required_confirmation
+                or required_confirmation_for_action_type(action_type)
+            ),
+            expires_at=expires_at,
+        )
 
 
 def _effective_draft_status(draft: AIActionDraft) -> str:
@@ -274,7 +337,7 @@ def _active_member_options(*, trip_id) -> list[dict]:
             TripMember.objects
             .select_related("user")
             .filter(trip_id=trip_id, status=MemberStatus.ACTIVE)
-            .order_by("role", "created_at")
+            .order_by("role", "joined_at")
         )
     ]
 
